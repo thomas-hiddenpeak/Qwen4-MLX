@@ -1,6 +1,6 @@
-# ANE Model Runner
+# Qwen4-MLX
 
-独立的 Swift 推理工程，已实现 Qwen3.8 Flash-Next 的完整 **48 层文本生成**。原始 Q4 专家与 BF16 主干常驻统一内存，51.2B n-gram 表通过 SSD 按需读取；主计算使用 MLX C / Metal，Swift 负责分词、状态、读取和生成循环。推理无需 Python 进程或作者 HTTP 服务。
+面向 Apple Silicon 的独立 Swift 推理工程，当前适配 Qwen3.8 Flash-Next，已实现完整 **48 层文本生成**。原始 Q4 专家与 BF16 主干常驻统一内存，51.2B n-gram 表通过 SSD 按需读取；主计算使用 MLX C / Metal，Swift 负责分词、状态、读取和生成循环。推理无需 Python 进程或作者 HTTP 服务。
 
 本目录作为独立 Git 仓库管理，提交源码、测试、脚本、文档及文本测试样本。模型权重、大型张量样本、`results/` 实验结果和构建产物仅保留在本机；文档中的本地结果链接不会随克隆一起提供。构建依赖外部 MLX，默认位置为 `../qwen38-ssd/runtime/mlx-serve/lib/mlx`，可通过 `ANERUNNER_MLX_ROOT` 指定兼容构建；具体步骤见 [GPU runner 使用与验证](GPU_RUNNER.md)。
 
