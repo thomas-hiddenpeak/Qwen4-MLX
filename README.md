@@ -22,9 +22,9 @@ Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配�
 
 [MTP 请求成本摘要](docs/MTP_COST_SUMMARY.md)已接入 JSON 与库结果，区分实际输出、起草轮次和预算收尾；[调度延迟分析](docs/SCHEDULER_LATENCY_EXPERIMENT.md)可从原始 callback 时钟报告 p50/p95/max，并比较既有 decodeBurst 参数。它们补足统计，不改变生成策略和默认内核。
 
-新增[两个独立长任务的 MTP 回归](docs/MTP_AGENT_EXPANSION.md)：冻结工具 JSON 与项目事实检索输入，24轮完整输入/输出 token 和功能答案通过。实际自然结束于85/110输出token；128/256预算分别保留，性能仍须独立时间窗口复测，MTP保持可选。
+新增[两个独立长任务的 MTP 回归](docs/MTP_AGENT_EXPANSION.md)：冻结工具 JSON 与项目事实检索输入，24轮完整输入/输出 token 和功能答案通过。实际自然结束于85/110输出token；128/256预算分别保留。[两窗口性能复测](docs/MTP_RELEASE_WINDOWS.md)按固定配对和漂移门槛执行，MTP保持可选。
 
-实验性 [HTTP/SSE 服务](docs/HTTP_SERVER_EXPERIMENT.md)已通过29项相关CPU测试、首轮19项与补充15项真实网络检查。仅监听本机，支持文本聊天、greedy、AR默认，以及显式 `mtp_depth: 2`（最多256输出预算）；工具调用协议、采样和完整OpenAI兼容尚未实现。网络队列与固定推理线程分离，有界连接、排队和输出；prefill/decode独立计时。启动示例：
+实验性 [HTTP/SSE 服务](docs/HTTP_SERVER_EXPERIMENT.md)已通过29项相关CPU测试、首轮19项与补充15项真实网络检查，以及12轮重复断连恢复的46项检查。后者持续约13分29秒，不代表长时间运行稳定性已经验收。仅监听本机，支持文本聊天、greedy、AR默认，以及显式 `mtp_depth: 2`（最多256输出预算）；工具调用协议、采样和完整OpenAI兼容尚未实现。网络队列与固定推理线程分离，有界连接、排队和输出；prefill/decode独立计时。启动示例：
 
 ```bash
 .build/release/ane-runner serve-gpu \

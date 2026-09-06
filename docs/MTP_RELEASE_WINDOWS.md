@@ -1,6 +1,6 @@
 # MTP 两窗口配对的执行记录
 
-2026-09-07。此批使用已冻结的原11k、工具JSON与项目事实检索三项输入，落实既有[MTP发布条件](MTP_RELEASE_CRITERIA.md)的性能复测；不引入新内核或改变默认。当前仅完成计划、离线分析器和CPU复核，GPU窗口尚未执行，不能据此认定发布门槛通过。
+2026-09-07。此批使用已冻结的原11k、工具JSON与项目事实检索三项输入，落实既有[MTP发布条件](MTP_RELEASE_CRITERIA.md)的性能复测；不引入新内核或改变默认。计划、离线分析器和CPU复核已完成；窗口A于北京时间07:41启动，窗口B尚未执行，当前不能认定发布门槛通过。
 
 ## 预先固定的工作量
 
@@ -25,7 +25,7 @@
 
 ## 正式启动与接续
 
-本机草案位于`results/mtp-release-window-a/plan-draft.json`，它是**嵌套的分析计划，不能直接传入实验控制器**。正式启动时由当前GPU所有者执行：
+本机草案位于`results/mtp-release-window-a/plan-draft.json`，它是**嵌套的分析计划，不能直接传入实验控制器**。窗口A已经生成正式`plan.json`与扁平`controller-plan.json`：UTC23:41:14.942275冻结，91份源码/库/元数据文件身份核对通过，采用控制器中断恢复smoke后的参考PID13611及其ledger。正式分析计划SHA256为`9c56790c0d6dfe0d09fc8459d725d65ad3691e069353d6619e5f90a02f37f2a6`。窗口B仍须单独冻结。启动与接续由当前GPU所有者执行：
 
 1. 等当前controller退出并恢复参考服务，核对最新ledger/PID和空闲身份；替换分析计划的predecessor，检查当前source/library/metadata指纹与权重payload stat。
 2. 保存新的`plan.json`，设`status=frozen`、真实freeze UTC与已确认的ledger；不在生成后改输入、golden、阈值或分组。

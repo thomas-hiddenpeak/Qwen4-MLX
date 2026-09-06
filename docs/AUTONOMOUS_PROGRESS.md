@@ -15,7 +15,9 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新参考服务：PID12832，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/http-service-soak-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新已验证参考服务：PID13611，`http://127.0.0.1:11235`，MTP/drafter关闭，核对时刻为北京时间07:35:54。最新恢复ledger为`results/controller-interrupt-v1/run-ledger.json`。这是控制器中断smoke结束时的快照；执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+
+北京时间07:41，参考13611已交由窗口A控制器接管。当前唯一GPU任务是`results/mtp-release-window-a/controller-plan.json`，controller PID13960，exec session33813，ledger启动UTC23:41:19。首个`original-128-part1`（PID/PGID13990）已于07:44:49完成，控制器继续`original-128-part2`。分析计划为同目录`plan.json`，运行状态以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -24,8 +26,8 @@
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
 3. 固定AR命令缓冲诊断及GPU档位/系统热压力采样已完成。两个独立长任务的24轮AR/MTP回归通过；初轮性能单窗口且一组AR漂移超5%，尚未通过MTP稳定性能发布门槛。
-4. loopback实验HTTP服务通过29项CPU、首轮19项live、补充15项网络边界及固定12周期的46项短soak检查。controller2249已退出，参考12832 ready，无GPU实验在跑。[两窗口分析计划](MTP_RELEASE_WINDOWS.md)及分析器已完成CPU审阅并推送`c30b699`，尚未启动窗口A。
-5. 下一步先补控制器的安全中断：当前5秒仅kill wrapper可能早于HTTP子进程30+10秒清理，且controller默认SIGTERM未转finally。redis_runner_research准备自有process group清理与stop flag安全点；root用CPU-only case做一次真实controller中断/恢复smoke，再将该新ledger用于正式冻结窗口A。不要直接执行嵌套分析plan；须另生成12case扁平controller-plan。生产Swift二进制维持f95565c，未经窗口结束不得重建。
+4. loopback实验HTTP服务通过29项CPU、首轮19项live、补充15项网络边界及固定12周期的46项短soak检查。controller2249已退出，随后控制器中断smoke也完成并恢复参考13611。[两窗口分析计划](MTP_RELEASE_WINDOWS.md)及分析器已完成CPU审阅并推送`c30b699`。窗口A于北京时间07:41正式冻结并启动，12进程96请求，预估约50分钟；不能把旧窗口分析控制算作这次发布结果。
+5. 控制器安全中断已完成：每个case使用自有进程组，TERM宽限45秒、必要时KILL后等10秒，确认整组清空才恢复参考；SIGTERM/INT只置flag，在安全点转入finally。4项CPU控制与真实controller中断smoke通过，详见[控制器合同](EXPERIMENT_CONTROLLER.md)。窗口A以`results/controller-interrupt-v1/run-ledger.json`作为predecessor；91文件preflight通过。嵌套分析plan仅用于分析，实际执行为12case扁平controller-plan。生产Swift二进制维持f95565c，推理源码及controller/helper身份冻结；窗口A/B完成或root明确解除冻结前不得修改这些代码或构建。
 
 ## 接续记录
 
@@ -46,3 +48,9 @@
 - 07:00左右：两个独立长任务24轮通过并已提交推送`cb23860`，见MTP_AGENT_EXPANSION.md；GPU状态出现nominal→fair及档位分布变化，仅作关联。HTTP release构建49.66s、29项CPU与19项live全部通过，controller已退出并恢复参考PID9437。新入口保持实验性、AR默认、MTP2最多256预算。下一批由vllm_sglang_research准备网络边界脚本（无GPU权），gdn_pipeline_probe准备既定MTP性能窗口分析与草案（无GPU权），redis_runner_research只读设计完整prefix checkpoint（不接生产）。root持有唯一GPU启动/构建/Git权。
 
 - 07:03：HTTP主提交`0f89393`已推送并核对远程SHA。补充网络边界15项全部通过：4连接上限与回收、header/body约15.185s接收408、截断body400、AR/MTP预算1/2/4的length/usage、MTP收到两个content后的RST（日志同ID明确decode）及新AR请求恢复。取消清理本次观测0.109s，不承诺最大延迟；未命中verify内部取消。controller exit0、实验服务graceful退出，参考PID11001 ready。MTP窗口A草案正在做CPU审阅，禁止先启动；实际运行前root确认冻结。后续窗口B反转case顺序。服务12周期soak由agent准备CPU脚本，不与窗口并行加载模型。前缀设计发现MTP跨chunk next-token及full-prompt长度依赖，必须显式处理，不能直接共享decoder。
+
+- 07:35：控制器自有进程组清理已通过4项CPU控制与一次真实SIGTERM恢复smoke。controller13573收到TERM后进入finally；case leader13605先退出，子进程13606保留6秒清理，整组6.0846秒后消失，未发KILL。随后才创建参考13611，07:35:54核对精确argv、11235监听者和MTP/drafter关闭；总中断到退出22.333秒。controller exit1及InterruptedError是这次预期中断结果，恢复成功另由smoke/ledger确认。原始证据为`results/controller-interrupt-v1/smoke.json`、`run-ledger.json`；独立只读复核通过。没有运行实验模型推理或重建Swift二进制，root下一步准备冻结MTP窗口。
+
+- 07:41：root完成窗口A冻结（UTC2026-09-06 23:41:14）与91文件preflight，启动唯一controller PID13960，exec session33813。`results/mtp-release-window-a/plan.json`保存分析合同，SHA256为`9c56790c0d6dfe0d09fc8459d725d65ad3691e069353d6619e5f90a02f37f2a6`；`controller-plan.json`保存平铺执行计划。共12进程96请求、每case三组、全窗口18组，gdn agent已独立只读核对参数与路径。预估约50分钟；参考13611由controller接管，后续恢复PID以新ledger为准。当前禁止并行GPU、修改被冻结源码/controller/helper或重建二进制。
+
+- 07:44:49：窗口A首进程10轮完整输出ID通过。root独立手算前两测量组：G1 AR30.4056/MTP35.4031 tokens/s，倍率1.16436，AR漂移2.4416%，该组通过；G2 AR27.9262/MTP35.8636，倍率1.28423，AR漂移12.3403%，按冻结门槛应为无法判定。保留该组，不重划或补换；这是首进程局部观察，不能作为整窗或发布结论。
