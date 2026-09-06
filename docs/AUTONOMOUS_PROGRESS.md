@@ -24,7 +24,7 @@
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
 3. 固定AR命令缓冲诊断及GPU档位/系统热压力采样已完成。两个独立长任务的24轮AR/MTP回归通过；初轮性能单窗口且一组AR漂移超5%，尚未通过MTP稳定性能发布门槛。
-4. loopback实验HTTP服务通过29项CPU、首轮19项live及补充15项网络边界；MTP生成中RST、连接上限、接收期限、length均通过，原服务已恢复。下一步按既定门槛做MTP性能窗口，再跑固定12周期短服务soak；真实send期限/输出overflow等未覆盖项仍单列。
+4. loopback实验HTTP服务通过29项CPU、首轮19项live及补充15项网络边界。当前唯一GPU实验是`results/http-service-soak-v1/plan.json`，controller exec session2249、实验服务PID11935，固定12周期；参考PID11001已由controller暂停，须等待其finally恢复，禁止重建/另起模型。利用这段时间完成了[两窗口分析计划](MTP_RELEASE_WINDOWS.md)的CPU审阅，soak后才冻结并运行窗口A；真实send期限/输出overflow等未覆盖项仍单列。
 
 ## 接续记录
 
