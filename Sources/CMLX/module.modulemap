@@ -1,0 +1,6 @@
+module CMLX [system] {
+    header "shim.h"
+    link "mlxc"
+    link "mlx"
+    export *
+}

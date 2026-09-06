@@ -1,0 +1,36 @@
+{
+  "created_at_utc": "2026-09-05T07:11:42.427857+00:00",
+  "source_fixture": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/results/coreml-ple-probe/fixture_s1_actual_rows.npz",
+  "source_fixture_sha256": "69b08a931e72985daaba85a0e738a1b49a11b2b9cd8185987ba3d806bd3595bf",
+  "exported_fixture": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/ple-s1-actual-rows.json",
+  "exported_fixture_sha256": "ed7b5170eab5a26a597ba7f2de93a019b617ae4fd340abd921f230d7aa156451",
+  "model_package": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/results/coreml-ple-probe/ple_scale64_minimal_s1.mlpackage",
+  "package_file_sha256": {
+    "Manifest.json": "971b1a488ece075e102765b25ef28ba3388e8971539ae49b52fe70db9b4b3742",
+    "Data/com.apple.CoreML/model.mlmodel": "fd3b7b246654b2672ff25213c1f182b5477d95c005f5b1a1ab3eadd9f1cb03bf",
+    "Data/com.apple.CoreML/weights/weight.bin": "cadda4efc536861a14748433180dfc4fdca87a37b1bfabd3f578944ef8c4938f"
+  },
+  "python_coremltools": "9.0",
+  "macOS": "26.6.2",
+  "python_input_bridge": "coremltools 9.0 replaces float16 arrays with float32 arrays in the dictionary passed to predict. A shallow dictionary copy preserves the exported float16 inputs; widening preserves every FP16 input value exactly.",
+  "compute_units": "CPU_AND_NE",
+  "python_prediction_calls": 1,
+  "conversion": "Source BSH embedding/residual/mask are transposed to BC1S. History BCH becomes BC1H. Embedding is multiplied by 64 in float32 before casting to float16. Values serialize in logical row-major order.",
+  "reference": "expectedOutputs are fresh Python Core ML predictions of the same three-output package, not the FP32 mathematical oracle.",
+  "scope": "16 actual sampled n-gram rows form the embedding; residual and history are synthetic. No full embedding table or decoder is loaded.",
+  "hardware_evidence": "Prediction configured for CPU_AND_NE; no hardware trace collected.",
+  "previous_source_shard_verification": [
+    {
+      "file": "model-00005.safetensors",
+      "size": 550018496,
+      "sha256": "9b3ab4ba052d7cca9b7246274649fb7a33d35af40fc9569f4da6e82ffb5385b2",
+      "verified": true
+    },
+    {
+      "file": "model-00006.safetensors",
+      "size": 142339256,
+      "sha256": "050f797cb74a5893c1af2586b83ee730027eb808b715f4e8212a142d030c4b66",
+      "verified": true
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "created_utc": "2026-09-05T18:15:36.160740+00:00",
+  "kind": "synthetic_agent_system_contract_with_real_repository_documentation",
+  "system_tokens": 10993,
+  "total_input_tokens": 11057,
+  "source_documents": [
+    {
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/GPU_RUNNER.md",
+      "sha256": "f49d9a124b563f195d3724fa17fc7440cbc74e76759ee4ed663a2d6c3a2e6cfb",
+      "bytes": 30152,
+      "included_section_characters": 17868
+    },
+    {
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/TELEMETRY.md",
+      "sha256": "1f531fbcb7a2d03a54ea805ba4d665761d9a3f9f5ecda2b52223300608fefc4f",
+      "bytes": 16528,
+      "included_section_characters": 3656
+    },
+    {
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/GPU_BOTTLENECK.md",
+      "sha256": "f053b8cb61ebba57aad1cb9ce57d3d33d437f45ee98ebe63eb541f79e07cfe00",
+      "bytes": 10501,
+      "included_section_characters": 0
+    },
+    {
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/BACKEND_PLAN.md",
+      "sha256": "d68f63cf16eeef307b71523627b861de65675ec675722b4221574eaaafccac77",
+      "bytes": 5625,
+      "included_section_characters": 0
+    }
+  ],
+  "retained_document_prefix_characters": 21524,
+  "documents_repeated": false,
+  "target_tokens": 11000,
+  "chat_roles": [
+    "system",
+    "user"
+  ],
+  "thinking_enabled": false,
+  "tools_executed": false,
+  "prompt_sha256": "7b863fbeae55a017828d9dc2ca72814bfc6d64d52c0a561f6334050a1babf5db",
+  "note": "Standalone authored agent/tool instructions, not the host assistant system prompt. Real repository documents retained as one contiguous prefix, cut at a paragraph boundary. Prefix cache is not implemented by this runner."
+}

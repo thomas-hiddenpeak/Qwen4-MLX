@@ -1,0 +1,9 @@
+{
+  "created_utc": "2026-09-05T11:11:35.248517+00:00",
+  "source_fixture": "fixtures/gpu-long-context/source-provenance.json",
+  "source_excerpt_sha256": "621f5348fecd3863c89e9ed58fb5b61df22f39667811f57d440d4c74fa1351b7",
+  "prompt_sha256": "79302170e73be2179331ea87da1ae0a0c0b703c1c7dd3300450f02bff577879a",
+  "body_is_contiguous_real_project_documentation": true,
+  "requested_output_budget": 256,
+  "purpose": "Sustained no-MTP decode window for paired telemetry overhead and phase attribution; output budget is a truncation bound, not a forced stop override."
+}

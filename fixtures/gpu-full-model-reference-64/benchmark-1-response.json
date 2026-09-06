@@ -1,0 +1,1 @@
+{"id":"cmpl-1788604576745","object":"text_completion","created":1788604576,"model":"Qwen3.8-Flash-Next-MLX-SSD-Stream","system_fingerprint":"mlx-serve","choices":[{"index":0,"text":"太阳发光的核心原因是其内部持续进行的氢核聚变反应，将巨大的质量转化为能量并以光和热的形式释放出来。","logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":19,"completion_tokens":26,"total_tokens":45}}

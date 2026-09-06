@@ -1,0 +1,19 @@
+{
+  "name": "benchmark-3-models-before",
+  "endpoint": "/v1/models",
+  "generation": false,
+  "started_at_utc": "2026-09-05T10:36:17.588845+00:00",
+  "completed": true,
+  "status": 200,
+  "wall_seconds": 0.0058173749999999025,
+  "body_bytes": 708,
+  "url": "http://127.0.0.1:11235/v1/models",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "708",
+    "Connection": "close",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  }
+}

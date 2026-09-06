@@ -1,0 +1,19 @@
+{
+  "name": "prompt-tokenize",
+  "endpoint": "/tokenize",
+  "generation": false,
+  "started_at_utc": "2026-09-05T10:36:13.731891+00:00",
+  "completed": true,
+  "status": 200,
+  "wall_seconds": 0.010232209000000006,
+  "body_bytes": 121,
+  "url": "http://127.0.0.1:11235/tokenize",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "121",
+    "Connection": "close",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  }
+}

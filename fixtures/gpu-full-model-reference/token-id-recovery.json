@@ -1,0 +1,146 @@
+[
+  {
+    "position": 0,
+    "id": 99519,
+    "text": "太阳",
+    "utf8_hex": "e5a4aae998b3",
+    "text_offset": 0,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.007874
+  },
+  {
+    "position": 1,
+    "id": 111810,
+    "text": "发光",
+    "utf8_hex": "e58f91e58589",
+    "text_offset": 6,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -1.023438
+  },
+  {
+    "position": 2,
+    "id": 109446,
+    "text": "的核心",
+    "utf8_hex": "e79a84e6a0b8e5bf83",
+    "text_offset": 12,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -1.007813
+  },
+  {
+    "position": 3,
+    "id": 105154,
+    "text": "原因是",
+    "utf8_hex": "e58e9fe59ba0e698af",
+    "text_offset": 21,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.24707
+  },
+  {
+    "position": 4,
+    "id": 96041,
+    "text": "其",
+    "utf8_hex": "e585b6",
+    "text_offset": 30,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.003906
+  },
+  {
+    "position": 5,
+    "id": 98866,
+    "text": "内部",
+    "utf8_hex": "e58685e983a8",
+    "text_offset": 33,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.324219
+  },
+  {
+    "position": 6,
+    "id": 97709,
+    "text": "持续",
+    "utf8_hex": "e68c81e7bbad",
+    "text_offset": 39,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.5625
+  },
+  {
+    "position": 7,
+    "id": 110824,
+    "text": "进行的",
+    "utf8_hex": "e8bf9be8a18ce79a84",
+    "text_offset": 45,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.574219
+  },
+  {
+    "position": 8,
+    "id": 100309,
+    "text": "氢",
+    "utf8_hex": "e6b0a2",
+    "text_offset": 54,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.597656
+  },
+  {
+    "position": 9,
+    "id": 96648,
+    "text": "核",
+    "utf8_hex": "e6a0b8",
+    "text_offset": 57,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.031738
+  },
+  {
+    "position": 10,
+    "id": 96974,
+    "text": "聚",
+    "utf8_hex": "e8819a",
+    "text_offset": 60,
+    "unique_inverse_candidate_count": 1,
+    "logprob": 0.0
+  },
+  {
+    "position": 11,
+    "id": 96229,
+    "text": "变",
+    "utf8_hex": "e58f98",
+    "text_offset": 63,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.003906
+  },
+  {
+    "position": 12,
+    "id": 98658,
+    "text": "反应",
+    "utf8_hex": "e58f8de5ba94",
+    "text_offset": 66,
+    "unique_inverse_candidate_count": 1,
+    "logprob": 0.0
+  },
+  {
+    "position": 13,
+    "id": 3709,
+    "text": "，",
+    "utf8_hex": "efbc8c",
+    "text_offset": 72,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.208008
+  },
+  {
+    "position": 14,
+    "id": 96123,
+    "text": "将",
+    "utf8_hex": "e5b086",
+    "text_offset": 75,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.488281
+  },
+  {
+    "position": 15,
+    "id": 108675,
+    "text": "巨大的",
+    "utf8_hex": "e5b7a8e5a4a7e79a84",
+    "text_offset": 78,
+    "unique_inverse_candidate_count": 1,
+    "logprob": -0.761719
+  }
+]

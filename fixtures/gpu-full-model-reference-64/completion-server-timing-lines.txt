@@ -1,0 +1,1 @@
+  <- 19+26 tokens (1825ms) [prefill: 17.3 tok/s, decode: 35.9 tok/s] [stop]

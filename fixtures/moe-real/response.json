@@ -1,0 +1,36 @@
+{
+  "id": "chatcmpl-1788593422778",
+  "object": "chat.completion",
+  "created": 1788593422,
+  "model": "Qwen3.8-Flash-Next-MLX-SSD-Stream",
+  "system_fingerprint": "mlx-serve",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "因为自然语言"
+      },
+      "logprobs": null,
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 27,
+    "completion_tokens": 3,
+    "total_tokens": 30,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "prompt_n": 27,
+    "cached_n": 0,
+    "prompt_ms": 235.336,
+    "prompt_per_second": 114.73,
+    "predicted_n": 3,
+    "predicted_ms": 75.406,
+    "predicted_per_second": 39.785,
+    "tokenize_ms": 0.921
+  }
+}

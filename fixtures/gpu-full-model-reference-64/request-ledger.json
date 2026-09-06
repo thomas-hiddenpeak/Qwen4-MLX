@@ -1,0 +1,240 @@
+[
+  {
+    "name": "models-before",
+    "endpoint": "/v1/models",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:13.720245+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.010804458000000003,
+    "body_bytes": 708
+  },
+  {
+    "name": "prompt-tokenize",
+    "endpoint": "/tokenize",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:13.731891+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.010232209000000006,
+    "body_bytes": 121
+  },
+  {
+    "name": "completion",
+    "endpoint": "/v1/completions",
+    "generation": true,
+    "started_at_utc": "2026-09-05T10:36:14.073656+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 1.8342437919999999,
+    "body_bytes": 1600,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 6746
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7172
+      },
+      "raw_segment_sha256": "0fe58774bf29658ddbae6f5e24101b1d944a1f843b6d3911aaa134f0e4aba5d0",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (1825ms) [prefill: 17.3 tok/s, decode: 35.9 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 1825,
+        "prefill_tokens_per_second": 17.3,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 35.9,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    }
+  },
+  {
+    "name": "output-detokenize",
+    "endpoint": "/detokenize",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:15.909165+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.006480917000000197,
+    "body_bytes": 161
+  },
+  {
+    "name": "benchmark-1-models-before",
+    "endpoint": "/v1/models",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:15.923517+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.003821124999999981,
+    "body_bytes": 708
+  },
+  {
+    "name": "benchmark-1",
+    "endpoint": "/v1/completions",
+    "generation": true,
+    "started_at_utc": "2026-09-05T10:36:15.927938+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.8174699589999999,
+    "body_bytes": 442,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7172
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7422
+      },
+      "raw_segment_sha256": "ce5d182bfc12289d841726d5d6c494f639ecc83ffd504e9541ea79944f6ac714",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (805ms) [prefill: 162.1 tok/s, decode: 39.2 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 805,
+        "prefill_tokens_per_second": 162.1,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 39.2,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    }
+  },
+  {
+    "name": "benchmark-2-models-before",
+    "endpoint": "/v1/models",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:16.754181+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.004768416000000109,
+    "body_bytes": 708
+  },
+  {
+    "name": "benchmark-2",
+    "endpoint": "/v1/completions",
+    "generation": true,
+    "started_at_utc": "2026-09-05T10:36:16.759751+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.8210594999999996,
+    "body_bytes": 442,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7422
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7672
+      },
+      "raw_segment_sha256": "216d23e2398a2c5c1c55c59dc03e5da556d79ddfba7a02d8e984b184273924ae",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (814ms) [prefill: 160.0 tok/s, decode: 38.7 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 814,
+        "prefill_tokens_per_second": 160.0,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 38.7,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    }
+  },
+  {
+    "name": "benchmark-3-models-before",
+    "endpoint": "/v1/models",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:17.588845+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.0058173749999999025,
+    "body_bytes": 708
+  },
+  {
+    "name": "benchmark-3",
+    "endpoint": "/v1/completions",
+    "generation": true,
+    "started_at_utc": "2026-09-05T10:36:17.595430+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.8283897919999998,
+    "body_bytes": 442,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7672
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7922
+      },
+      "raw_segment_sha256": "2ac03c6cbbdbace3b2f4058518a288b7f833b001a28fe61c7b188048dbfb0316",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (820ms) [prefill: 162.3 tok/s, decode: 38.4 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 820,
+        "prefill_tokens_per_second": 162.3,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 38.4,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    }
+  },
+  {
+    "name": "models-after",
+    "endpoint": "/v1/models",
+    "generation": false,
+    "started_at_utc": "2026-09-05T10:36:18.426414+00:00",
+    "completed": true,
+    "status": 200,
+    "wall_seconds": 0.004593041000000575,
+    "body_bytes": 708
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "model": "Qwen3.8-Flash-Next-MLX-SSD-Stream",
+  "prompt": "<|im_start|>user\n请用一句话解释太阳为什么发光。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "max_tokens": 64,
+  "temperature": 0,
+  "top_p": 1,
+  "top_k": 1,
+  "repeat_penalty": 1,
+  "presence_penalty": 0,
+  "seed": 42,
+  "stream": false,
+  "logprobs": 1,
+  "enable_mtp": false,
+  "enable_drafter": false,
+  "enable_pld": false
+}

@@ -1,0 +1,20 @@
+{
+  "runs": 3,
+  "warmup": "The preceding same-prompt reference generation; it requests logprobs and is excluded from benchmark statistics.",
+  "request_wall_seconds": [
+    0.8174699589999999,
+    0.8210594999999996,
+    0.8283897919999998
+  ],
+  "median_request_wall_seconds": 0.8210594999999996,
+  "server_decode_tokens_per_second": [
+    39.2,
+    38.7,
+    38.4
+  ],
+  "median_server_decode_tokens_per_second": 38.7,
+  "all_texts_match_reference": true,
+  "physical_dram_bytes": null,
+  "physical_dram_bandwidth_gbps": null,
+  "timing_scope": "HTTP wall includes transport and server work. Server decode tok/s comes only from unambiguously scoped exact log lines and uses the author's completion-token/time convention. No DRAM counters or inferred physical bandwidth."
+}

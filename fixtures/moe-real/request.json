@@ -1,0 +1,15 @@
+{
+  "model": "Qwen3.8-Flash-Next-MLX-SSD-Stream",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请用一句中文解释为什么大模型的专家路由需要根据每个词动态选择。"
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 3,
+  "stream": false,
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  }
+}

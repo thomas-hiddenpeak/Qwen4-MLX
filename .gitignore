@@ -1,0 +1,31 @@
+# Swift and Python build caches
+.build/
+.swiftpm/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local experiment outputs and captured tensors
+/results/
+*.safetensors
+*.npz
+*.npy
+*.bin
+*.trace/
+
+# Generated Core ML and native libraries
+*.mlpackage/
+*.mlmodel
+*.mlmodelc/
+*.dylib
+*.metallib
+*.air
+*.o
+
+# Machine-local settings and credentials
+.DS_Store
+._*
+.env
+.env.*
+!.env.example

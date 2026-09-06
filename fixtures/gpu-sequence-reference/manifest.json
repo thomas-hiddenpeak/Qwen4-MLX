@@ -1,0 +1,311 @@
+{
+  "schema": "qwen38-gpu-sequence-reference-v1",
+  "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1",
+  "reference_script_sha256": "1d63bc004acba1a61676e13689d02d1619aab205f32367e7d6ed45d9d3427015",
+  "mlx_version": "0.32.2",
+  "input_provenance": [
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/prefill.safetensors",
+      "key": "x",
+      "dtype": "BF16",
+      "shape": [
+        1,
+        26,
+        2560
+      ],
+      "bytes": 133120,
+      "tensor_sha256": "622246390285acfa1c829decae67a2f8c406dce3158b9955afdc80dce74f3462"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/decode.safetensors",
+      "key": "x",
+      "dtype": "BF16",
+      "shape": [
+        1,
+        1,
+        2560
+      ],
+      "bytes": 5120,
+      "tensor_sha256": "0b09f7ee1b6ede4bf47c8c07ddab706991b2fad5c50ed4795c42f15cf9b37bc8"
+    }
+  ],
+  "weight_provenance": [
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        2560
+      ],
+      "bytes": 52428800,
+      "tensor_sha256": "888098eea25ace0873f7af3fb8a923060016296e7ccddd27a532fe650af1e795"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.in_proj_z.weight",
+      "dtype": "BF16",
+      "shape": [
+        6144,
+        2560
+      ],
+      "bytes": 31457280,
+      "tensor_sha256": "6b00c7036d08bb999e29bc9177f7373fe8f5774fe244a116d680ef4079f370c4"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+      "dtype": "BF16",
+      "shape": [
+        48,
+        2560
+      ],
+      "bytes": 245760,
+      "tensor_sha256": "ec10ca960d290d70340b9434f0b985ec04f063611a2c5a3953d2fe49ba1411ec"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.in_proj_b.weight",
+      "dtype": "BF16",
+      "shape": [
+        48,
+        2560
+      ],
+      "bytes": 245760,
+      "tensor_sha256": "62c86d7c3add11380399b53389e2206a310501fa5fd20a0e07aab76424c8dbf8"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.out_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        6144
+      ],
+      "bytes": 31457280,
+      "tensor_sha256": "61faf46f03e25a68c83cd45860b97bb50d834b30a200474b1a4d3de1aae5bcfe"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.conv1d.weight",
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        4,
+        1
+      ],
+      "bytes": 81920,
+      "tensor_sha256": "03ed6a7d743e9f51badcc42abbf17a1c078472ca00960da23eb9774370e7c3de"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.A_log",
+      "dtype": "BF16",
+      "shape": [
+        48
+      ],
+      "bytes": 96,
+      "tensor_sha256": "70321a473849317d44b1d1f3a97b85dffb29212f0311cf271ba99ee385a69aa5"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.dt_bias",
+      "dtype": "BF16",
+      "shape": [
+        48
+      ],
+      "bytes": 96,
+      "tensor_sha256": "e7e2aaccdf79b62e05bc72c88fe044ac389bcb61b9d70cbf9d93956919dfefb9"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00001.safetensors",
+      "key": "language_model.model.layers.0.linear_attn.norm.weight",
+      "dtype": "BF16",
+      "shape": [
+        128
+      ],
+      "bytes": 256,
+      "tensor_sha256": "ba3568fc54135876bd054177a12d0742fd3fbab5689633a775d0740c834725c2"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.q_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        12288,
+        2560
+      ],
+      "bytes": 62914560,
+      "tensor_sha256": "a9c357cbf04d7d5a5fc3fd1cfc90930b3beb2f60697570c1ad1e7345f9bacd77"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.k_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ],
+      "bytes": 2621440,
+      "tensor_sha256": "d35e481191fceeac6b12c10ffcd135488880580f533de44f2441a58522e4228a"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.v_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ],
+      "bytes": 2621440,
+      "tensor_sha256": "47fe0446b1127b03a7f8b65e17e6c35ff2e0716f51bbeb3f60148883faa1358e"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.o_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        6144
+      ],
+      "bytes": 31457280,
+      "tensor_sha256": "96af396edce353b4e99bd6d6c56c2a0b3eeb19a624be5e4c9e36bd05f4f3eeb4"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.q_norm.weight",
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "bytes": 512,
+      "tensor_sha256": "5ef162e396b939394cce28b919569d27b47c0d5a73dcca543d9e3b92d3e84796"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.k_norm.weight",
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "bytes": 512,
+      "tensor_sha256": "88fc6b6584fdde8ba186a544b55890b2d6e922c4fe96c20ccc4e5be97b951a3a"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.indexer.index_qk_proj.weight",
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ],
+      "bytes": 3276800,
+      "tensor_sha256": "741d5d2a31a217b922a9d4fb2dee1bdf015ca451d11c668b11b8e6afd00569d2"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.indexer.q_layernorm.weight",
+      "dtype": "BF16",
+      "shape": [
+        128
+      ],
+      "bytes": 256,
+      "tensor_sha256": "e1e4f775b1c87674474e3e564f615104ece7327e7d1b12191ec6621d68f303fc"
+    },
+    {
+      "source_file": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/model-00051.safetensors",
+      "key": "language_model.model.layers.3.self_attn.indexer.k_layernorm.weight",
+      "dtype": "BF16",
+      "shape": [
+        128
+      ],
+      "bytes": 256,
+      "tensor_sha256": "6504415cba1f0ac88e97574b562205d1e8644603c1c8654623cb3ff3dc548774"
+    }
+  ],
+  "notes": [
+    "MoE activation replay, not native attention-layer input/state capture.",
+    "QSA long input repeats the capture and is only a mask/state coverage test.",
+    "No performance benchmark or whole-model correctness claim.",
+    "GDN uses BF16 inter-call state and FP32 intra-chunk accumulation like the pinned runtime."
+  ],
+  "cases": [
+    {
+      "id": "gdn-continuous",
+      "kind": "gdn",
+      "layer": 0,
+      "steps": [
+        {
+          "file": "gdn-continuous-0-prefill.safetensors",
+          "sha256": "f48c4503f2aff6aef53b62a0974d85eb4b583e9c11df1105f10ecb951bcc11df",
+          "phase": "prefill",
+          "offset_before": 0,
+          "offset_after": 26,
+          "qsa_expected": false
+        },
+        {
+          "file": "gdn-continuous-1-decode.safetensors",
+          "sha256": "a99ad8d4542ca06617a419d3d66f27530247273db932e2e2c99a4d14fd0a5777",
+          "phase": "decode",
+          "offset_before": 26,
+          "offset_after": 27,
+          "qsa_expected": false
+        }
+      ]
+    },
+    {
+      "id": "attention-continuous",
+      "kind": "attention",
+      "layer": 3,
+      "steps": [
+        {
+          "file": "attention-continuous-0-prefill.safetensors",
+          "sha256": "45e1b2f2969c6cb40b091fb5946840a328205a065ce9ca62e1505973a7bd959a",
+          "phase": "prefill",
+          "offset_before": 0,
+          "offset_after": 26,
+          "qsa_expected": false
+        },
+        {
+          "file": "attention-continuous-1-decode.safetensors",
+          "sha256": "7d22de9eaeaa6ca5bb14ddaa469ae514d02028a9a4382da0edd25c02cf60aff8",
+          "phase": "decode",
+          "offset_before": 26,
+          "offset_after": 27,
+          "qsa_expected": false
+        }
+      ]
+    },
+    {
+      "id": "qsa-threshold",
+      "kind": "attention",
+      "layer": 3,
+      "steps": [
+        {
+          "file": "qsa-threshold-0-prefill.safetensors",
+          "sha256": "9bb5d622abb0d696c61479f43f1e83bdb265a3d0e232d005659d6767621071f5",
+          "phase": "prefill",
+          "offset_before": 0,
+          "offset_after": 2051,
+          "qsa_expected": false
+        },
+        {
+          "file": "qsa-threshold-1-decode.safetensors",
+          "sha256": "dd877b8f4798ec66d5bfa28c263abfbf33b7457f601cec21f9dfef11d446e059",
+          "phase": "decode",
+          "offset_before": 2051,
+          "offset_after": 2052,
+          "qsa_expected": true
+        },
+        {
+          "file": "qsa-threshold-2-decode.safetensors",
+          "sha256": "e4930a4a7e6703f5ce5c2b108d8dabe906dbdca1a77fb9ad5e18585d92532477",
+          "phase": "decode",
+          "offset_before": 2052,
+          "offset_after": 2053,
+          "qsa_expected": true
+        }
+      ]
+    }
+  ]
+}

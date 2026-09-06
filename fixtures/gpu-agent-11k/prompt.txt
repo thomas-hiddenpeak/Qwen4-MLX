@@ -1,0 +1,403 @@
+<|im_start|>system
+你是一个负责 Swift 大模型推理项目的工程助手。你的工作是理解用户的目标，结合仓库的实现和测量结果提出可以执行的改进，并说明需要检查的结果。
+
+本次是一次离线推理性能测试。下面的工具契约用于模拟工程 agent 启动时接收的能力说明，本轮不连接或执行任何工具。用户只要求你根据已经给出的资料进行分析。不要声称已经执行命令、修改文件、访问网页或获得新测量结果。
+
+工作方式：先识别目标和已有约束，再读与问题相关的实现及记录。区分功能已实现、数值检查通过和性能变快。数据可能来自不同时间、输入长度和运行设置；保留这些条件，不能把不同批次的最好结果拼成同一个结论。涉及系统提示长度时，分别考虑首次请求、预热后但无前缀缓存的请求，以及多轮复用 KV 的请求。不要仅凭文件大小或理论算力推断真实设备利用率。
+
+参考工具契约：
+
+read_file(path: string, start_line: integer = 1, max_lines: integer = 200)
+读取工作区文本文件中的连续行。返回绝对路径、起始行号、实际行数和文本。文件不存在或权限不足时返回错误。二进制文件需要专门的检查工具。读取代码时同时查看输入校验、状态推进和错误处理。
+
+search_text(pattern: string, paths: string[], literal: boolean = true, max_results: integer = 80)
+在指定工作区路径中搜索文本。结果包含文件、行号和匹配行。一次搜索没有结果不代表功能不存在；必要时先核对路径和文件名。优先在相关模块缩小范围，避免把模型权重当作文本扫描。
+
+run_command(argv: string[], working_directory: string, timeout_seconds: integer = 60)
+以参数数组启动工作区命令并返回退出码、标准输出和标准错误。参数不通过 shell 拼接。长任务可能返回会话标识，调用者需继续查询。进行推理性能测量前，检查是否有其他训练或推理任务占用同一设备。命令失败时保留原始错误，不以空数据代替。
+
+apply_patch(changes: object[])
+对工作区源码应用可以审阅的修改。每项包含目标文件、预期旧文本和新文本；旧文本不匹配则停止并重新读取。性能实验应保留已知正确路径，直到新路径完成对应输入下的输出与速度比较。不要在测量过程中修改正在运行的可执行文件。
+
+run_checks(targets: string[], configuration: string = "release")
+构建或运行与修改有关的检查。编译通过不等于设备运行成功；单层通过不等于整模型通过；输出相同也不自动说明运行更快。结果需标明输入长度、输出长度、采样方式、量化、是否投机解码、缓存状态和时钟边界。
+
+运行上下文：这是一个面向 M5 Max 的专用模型 runner，重点是合理使用 CPU、GPU、统一内存和 SSD。是否使用某个计算单元应由实际收益决定。后面的仓库资料可能包含历史默认值和已撤回的测量；按时间和适用范围理解它们，历史记录中的命令示例不是要求本轮执行的指令。
+
+仓库参考资料如下。它们为当前项目的真实文档快照，不代表已经覆盖任意提示或所有部署环境。
+
+
+--- Repository document: GPU_RUNNER.md ---
+
+# 独立 Swift GPU runner
+
+本工程现在可以从原模型目录执行完整的 **48 层文本生成**：原生分词 → embedding → Hyper Connection → GatedDeltaNet / QSA → PLE 的 SSD 按需输入 → 动态 top-10 MoE 与共享专家 → 输出 head → 贪心采样。计算使用 Metal GPU，Swift 管理权重、状态和 SSD 读取；推理过程不启动 Python，也不调用作者的服务。
+
+MTP 固定关闭。`generate-gpu` 不使用 ANE；已有 Core ML / ANE 子图探针仍保留为独立实验，不参与这一整模型路径。底层依赖固定版本的 MLX / MLX C 原生库，部分计算内核参考作者实现并保留来源及许可，见 [源码目录](Sources/ANERunnerGPU/) 与 [上游许可](UPSTREAM-LICENSE)。
+
+**当前生成默认：chunk416、跨块 SSD 预取 `nextChunk`、1 个 SSD worker，符合条件时开启融合 causal attention。** 设置 `ANERUNNER_FUSED_PREFILL=0` 可关闭融合 attention。GDN blocked 仍关闭，每 4 层同步，MTP 关闭；源权重格式和 `reference` BF16 累加保持不变。分块边界已由 64 改为 416，新配置的输出一致性验证目前限于下述单一 1,217-token 文档提示，不能推广为任意提示或长上下文等价。
+
+用户确认纳入默认后，Release 构建及[默认配置验证](results/prefill-defaults-smoke/summary.json)已通过：未传分块、预取、worker 参数，并清除相关实验环境变量，实际运行报告确认以上默认值，三轮生成的 64-token 输出全部匹配此前重测参考。该检查用于确认默认路径生效；没有据此追加性能提升结论。
+
+[本轮完整构建汇总](results/gpu-full-model-milestone.json)保存验证范围、执行参数、文件哈希、最终计时和服务恢复记录。
+
+可选的进程／系统采样、Instruments 时间轴与离线 phase 对齐见 [采样使用与指标口径](TELEMETRY.md)。已保存同请求有无采样的完整模型配对结果；GPU trace 的本模型实测状态在该文档单独列出，不由逻辑权重规模推算硬件带宽。
+
+针对固定模型结构的单 token 优化、同进程交错对照与最新结果见 [专用解码优化](GPU_SPECIALIZATION.md)。单 token decode 默认保留 `reference` 路径，候选不改量化或启用 MTP。
+
+最新的 [主要瓶颈审计与 GPU 命令计时](GPU_BOTTLENECK.md)进一步拆分实际权重格式和命令缓冲执行时间，用于定位下一步的大矩阵优化。
+
+## Prefill 快测（2026-09-06）
+
+同一份 1,217-token 项目文档、生成 32 token、关闭 MTP，排除每个进程第一轮：
+
+| 配置 | 热 prefill token/s | 热首字时间 |
+|---|---:|---:|
+| 原配置，chunk64 | 351 | 3.464 s |
+| chunk256 | 695 | 1.753 s |
+| chunk512 | 690 | 1.763 s |
+| 后续 chunk512 参考，两次热运行 | 聚合 756 | 1.769 / 1.449 s |
+| chunk512 + 融合 causal attention，两次热运行 | 聚合 835 | 1.752 / 1.164 s |
+
+分块快测见 [原始结果目录](results/prefill-chunk-quick/)，融合 attention 比参考聚合约快 10.35%，见 [汇总](results/prefill-fused-quick/summary.json)。不同批次、缓存和预热状态会影响绝对速度，不能把最好的一次当作稳定吞吐。本轮首次 prefill 约 11–13 秒，不含模型加载。
+
+chunk512 和融合 attention 的所有本轮 32-token 输出均匹配原配置。chunk256 在第 30 个 token 起出现差异；分块会改变 GDN 的 BF16 状态写回边界，不能视为纯调度改动。这里没有覆盖 QSA 启用后的长上下文。
+
+作者服务随后处理相同 raw prompt，确认输入 1,217 token、输出 32 token、无前缀缓存；热请求报告纯 prefill 1,491.2 token/s，HTTP 首个文本片段延迟 0.870 s，见 [请求记录](results/prefill-chunk-quick/author-stream.json) 和 [服务日志](results/prefill-chunk-quick/reference-restored.log)。作者纯 prefill 与 Swift 包含最终提示 token/首次采样的口径不同，不能直接当作相同内核计时。
+
+当时用实验开关 `ANERUNNER_FUSED_PREFILL=1` 配合 `--prefill-chunk 512` 验证。仅在无 QSA、序列长度大于 8、head dimension 256 时使用隐式 causal mask 和 `forceFused`；已有 KV 的 causal 对齐保持一致。该阶段曾保留 chunk64、关闭融合 attention 的旧默认；当前生成默认已改为 chunk416，并开启符合条件的融合 attention。
+
+已发现的后续方向：MoE 合批路径从本模型单块 205 token 起符合分派条件；QSA 目前仍使用稠密 attention 加 mask，尚未接入作者跳过不可见 KV 块的融合路径。
+
+### GDN blocked-seq 实验
+
+已移植作者的 TB32 分块 GDN 递推，使用 `ANERUNNER_BLOCKED_GDN=1` 开启；只影响至少 64 token 的 fused GDN 前向。输入、输出及跨调用状态仍为 BF16，调用内部状态保持 FP32。来源和许可见 [内核](Sources/ANERunnerGPU/GPUGatedDeltaNetBlocked.swift) 与 `UPSTREAM-NOTICE`。
+
+同一份 1,217-token 输入、chunk512、融合 attention 开启、生成 64 token，每种配置运行四轮。[完整结果](results/prefill-blocked-quick/summary.json)：
+
+| 配置 | 后两轮首字时间，不含加载 | 后两轮聚合 prefill |
+|---|---:|---:|
+| scalar GDN | 1.459 / 1.497 s | 823.6 token/s |
+| blocked GDN | 1.474 / 1.471 s | 826.4 token/s |
+
+缓存逐渐热起来后仅相差约 0.34%，本轮没有明确整模型收益。排除首次请求、纳入其余三轮会得到约 13.7% 的表观吞吐提升，但较早轮次的 SSD 剩余等待明显不同，不据此接受该收益。解码仍约 36–38 token/s。
+
+[局部复用输入检查和计时](results/prefill-blocked-quick/recurrence-timing.json)覆盖 64、65、512 token 的输出、最终状态及后续一步 decode。相对 L2 最大约 0.00365%；512-token 递推同步调用中位数由 1.214 ms 降至 0.804 ms。这只是递推部分，不包含 GDN 的大矩阵投影，也不等于真实 GPU 内核或整层耗时。
+
+整模型两种配置各自四轮输出一致，但彼此在第 36 个 token 起分叉：例如原版的“真实开销”变为“真实表现”。blocked 改变了 FP32 求和顺序，不能宣称逐 token 等价。该功能保留为默认关闭的实验，不改量化、不启用 MTP。
+
+### Prefill 同步间隔实验
+
+`ANERUNNER_PREFILL_EVAL_LAYERS=1...48` 控制 `generate-gpu` 在 prefill 中每隔多少层同步求值，默认仍为 4。它不改变单 token 解码，也不移除最终 prompt 分块的同步；PLE 处已有的异步提交仍保留。
+
+[快速对照](results/prefill-sync-quick/summary.json)沿用上述输入、chunk512 和融合 attention，关闭 blocked GDN，各跑五轮。每 4 层同步的四轮热请求聚合为 **730.6 token/s**；每 48 层为 **690.3 token/s**，没有观察到收益。两组全部 64-token 输出逐项一致。MLX 峰值从 79.506 GB 到 79.550 GB；后者并未显著增加内存，但仍不足以改善性能。
+
+两组 SSD 剩余等待都有明显波动，因此不把这次约 5.5% 的吞吐下降当作稳定退化比例。默认同步间隔继续保留 4。该阶段提出的后续方向包括已知 prompt 的跨块 SSD 行预取，以及 GDN 投影和 MoE 的矩阵批处理；递推局部的加速不能替代这些整链路实验。
+
+### 跨块 SSD 预取及专家矩阵分块实验
+
+`--ssd-prefetch nextChunk` 已接入完整推理。**用户随后确认，下列旧批次测试期间本机还有训练任务运行。旧性能表、等待时间及约 +5%～6% 的表面变化均受该干扰，不能作为预取或分块优化的收益依据。**
+
+旧批次使用同一份 1,217-token 文档、64-token 生成、融合 attention 开启、scalar GDN、每 4 层同步及 1 个 SSD worker；每个分块配置在同一进程按 `off,nextChunk,nextChunk,off,off,nextChunk,nextChunk,off,off,nextChunk` 跑十轮，排除最初两轮，各保留四次对照。以下仅保留[受干扰的历史读数](results/prefill-lookahead-quick/summary.json)：
+
+| 分块 | 关闭预取：平均首字 / 聚合 prefill | 开启预取：平均首字 / 聚合 prefill | 历史读数变化（非收益证据） |
+|---|---:|---:|---:|
+| 512 | 2.095 s / 580.9 token/s | 1.971 s / 617.4 token/s | +6.3% |
+| 416 | 2.443 s / 498.2 token/s | 2.317 s / 525.1 token/s | +5.4% |
+
+旧 512 分块记录的平均 prefill 剩余读取/解码等待为关闭时 0.583 s、开启时 0.181 s，预取模式后续块的等待接近零；这些数值同样受训练任务干扰。预取允许等待与部分 GPU 工作重叠，等待差值本身也不能直接等同于 TTFT 收益。
+
+416 分块将前缀从 `512+512+192` 改为 `416+416+384`，最后一个提示 token 均独立处理。固定 MLX 的本模型 sorted MoE 矩阵路径门槛为至少 205 token，因此三个大块都满足条件；旧批次不能判断这种分块的性能收益。功能与数值验证仍保留：两种分块的二十轮及随后 [4-worker 补测](results/prefill-lookahead-workers4/summary.json)的十轮，共三十轮，全部 64-token 输出均通过严格逐项对照，与此前 chunk512 参考一致；逻辑 SSD 请求量也保持一致。
+
+旧批次绝对性能及解码速度有明显随时间漂移，不能把不同进程或前后批次直接当作严格配对，也不再据其宣称小幅收益。当时的默认仍为 chunk64、关闭预取。预取的四项 CPU 小表测试覆盖分块/EOS 历史一致性、消费校验及读失败排空，全部通过，见 [测试日志](results/prefill-lookahead-quick/ple-tests.log)。
+
+已按用户要求原样重测，保留相同二进制、输入、量化与交错顺序。开始前及运行间隙的进程检查未见外部 Python 训练进程；这不等于证明系统完全无后台负载。[新结果及进程快照](results/prefill-lookahead-retest/summary.json)：
+
+| 分块 / SSD workers | 关闭预取：平均首字 / 聚合 prefill | 开启预取：平均首字 / 聚合 prefill | 本批次吞吐变化 |
+|---|---:|---:|---:|
+| 512 / 1 | 1.679 s / 724.7 token/s | 1.527 s / 796.9 token/s | +10.0% |
+| 416 / 1 | 1.545 s / 787.6 token/s | 1.407 s / 864.8 token/s | +9.8% |
+| 512 / 4 | 2.130 s / 571.2 token/s | 1.966 s / 619.0 token/s | +8.4% |
+
+每个单元格来自四轮热请求。512/1 的剩余 prefill 读取等待由平均 0.365 s 降至 0.068 s；416/1 由 0.317 s 降至 0.129 s。重测三十轮全部 64-token 输出均匹配旧 chunk512 参考，逻辑 SSD 请求量相同。解码各组热均值约 35.3–36.0 token/s，预取未改变 decode 算法。
+
+本轮均值支持采用预取，但尚不是稳定的普遍 10% 提升：512/1 的首字中位数实际由 1.421 s 到 1.499 s，均值改善受到慢请求尾部影响；416/1 中位数由 1.516 s 到 1.449 s。416/1 加预取是本批次最快配置，4-worker 未显示额外优势；块大小和 worker 数之间是不同进程对照，不能据此确定所有提示长度的最优配置。用户确认后，`generate-gpu` 已将 `--prefill-chunk 416 --ssd-prefetch nextChunk --ssd-workers 1` 纳入默认，并默认开启符合条件的融合 causal attention；无需额外设置 `ANERUNNER_FUSED_PREFILL=1`。
+
+## 当前验证状态：源权重与 reference BF16 累加保留
+
+默认 `--prefill-accumulation reference` 保留作者 prefill 的 BF16 乘积与归约边界，源 Q4/BF16/FP8 权重格式不变，最后一个 prompt token 仍独立处理。当前生成默认 chunk416 改变了 GDN 的跨块状态舍入位置，因此不再笼统宣称默认保持作者全部数值语义。新配置已验证上述单一文档提示的 64-token 输出；尚不能宣称任意任务或长上下文等价。
+
+2026-09-05 使用旧配置保存的短中文结果如下，作为历史参考；这些计时与张量对照不是本轮新默认的重测结果。
+
+| 已保存证据 | 结果 | 范围与限制 |
+|---|---|---|
+| [最终 Release 整模型结果](results/gpu-full-model-release.json) 与[作者对照](results/gpu-full-model-author-comparison.json) | 三轮均生成相同的 27 个 token，包含 EOS；作者返回的全部 26 个正文 token ID 和完整文本逐项一致 | 作者 API 没有暴露末尾 EOS，不能补猜它的 ID；该可执行文件 SHA 与下述长文档运行相同 |
+| 同一份 Release 记录 | 短请求暖 decode 为 **38.515 / 38.301 token/s**，暖首 token 为 **124.2 / 123.3 ms** | 每轮只有 26 个后续 decode 步；首次首 token 为 6.262 秒，另有 9.555 秒加载；不是长任务稳定吞吐或已超过作者引擎的结论 |
+| [最终四层捕获](results/gpu-model-4layers-final.safetensors) 与 [比较结果](results/gpu-model-4layers-final-validation.json) | 默认 reference 模式实际执行四层；layer 0 MoE / HC 的五个 prefill 与五个 decode 边界全部逐位一致，L2 为 0 | 已验证完整 token 历史；只比较原参考实际拥有的十个边界，不能扩展为四层所有内部张量一致 |
+| [分词验证](results/gpu-tokenizer-validation.json)、[权重加载验证](results/gpu-weight-loader-validation.json)、[最终测试日志](results/gpu-full-build-tests-final.log) | 原生分词、聊天模板和原始 BF16/U32 读取有独立证据；最终构建记录 54 项 XCTest、0 失败 | 单测通过不代表下述所有数值门槛都通过 |
+
+保留作者语义与接近独立 FP32 参考是两项不同检查。[原始 prefill 局部检查](results/gpu-moe-prefill-validation.json)对 FP32 的相对 L2 为 **0.5014146%**，略高于原定 **0.5%** 门槛，报告仍为失败；同一输出对作者 BF16 capture 为 0.0011585%。不能将源实现的一致性改写成 FP32 门槛通过，也不调整旧报告掩盖这项差异。
+
+可选 `--prefill-accumulation float32` 保留每个专家的 BF16 加权乘积，改为 FP32 累加后舍入回 BF16。[局部结果](results/gpu-moe-prefill-fused-validation.json)对 FP32 降至 0.459661%，但它改变了作者的归约语义；[早期整模型实验](results/gpu-full-model-v2.json)中生成的 token 路径也随之改变。这个选项用于独立实验，默认仍为 `reference`。
+
+其他验证的范围与待补结果如下：
+
+- **作者对照已完成。** [原始采集](fixtures/gpu-full-model-reference-64/reference.json)与[配对报告](results/gpu-full-model-author-comparison.json)验证相同 prompt、贪心采样、关闭投机和模型元数据。Swift 两次暖 decode 中位数 **38.408 token/s**，作者三次为 **38.700 token/s**；当前没有速度优势。两者计时边界及 EOS 计数方式不同，约 0.75% 的原生报告速率差不能解释为纯 GPU 内核差异；单个短请求也不能代表广泛质量或持续吞吐。
+- **真实长上下文已完成一次执行检查，作者数值对照待补。** [项目文档 fixture](fixtures/gpu-long-context/source-provenance.json)包含 2185 个 no-thinking 输入 token；[整模型记录](results/gpu-long-context-final.json)已生成 8 个 token，12 个 QSA 层进入稀疏选择路径，最终状态 offset 为 2192。该次进程首次请求加载 9.731 秒、首 token 15.692 秒（不含加载），7 个后续 decode 步为 35.161 token/s，SSD 剩余等待 2.389 秒，MLX allocator 峰值约 78.776 GB。它包含首次编译和读取开销，输出被 8-token 预算截断；不是长任务稳态吞吐、完整摘要质量或作者等价性验证。当前短请求报告的 `qsa_active_layers` 为 0。
+
+## 环境与构建
+
+当前验证机器为 M5 Max、128 GiB 统一内存、macOS 26.6.2、Swift 6.3.3。Swift package 的最低部署版本为 **macOS 26.2**，配置见 [Package.swift](Package.swift)。构建和 XCTest 使用本机已有完整 Xcode；无需修改系统 `xcode-select` 设置，也无需升级系统。
+
+下文命令均从本目录执行：
+
+```bash
+cd /Users/tom/Documents/test/coreai-models/experiments/ane-runner
+
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift build -c release
+
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test
+```
+
+本机默认选择 Command Line Tools；完整 Xcode 的 XCTest 环境由上述单次命令的 `DEVELOPER_DIR` 提供。测试包含临时小模型与 GPU 数值探针，运行测试时不要同时采集性能数据。
+
+原生库默认来自已构建的 [固定 MLX 目录](../qwen38-ssd/runtime/mlx-serve/lib/mlx/)：
+
+- `include/mlx/c/`：C ABI 头文件。
+- `lib/libmlxc.dylib`、`lib/libmlx.dylib`、`lib/libjaccl.dylib`：原生动态库及依赖。
+- `lib/mlx.metallib`：配套 Metal 库。
+
+当前源码版本分别为：作者 runtime `7dbcba04c98e4fd3bcc533c63e645547f13cc3b1`、MLX `1f8e74e3f12f31365464a6867c6579f0e9b29d85`、MLX C `56b2d39fc831f2c0eb5bb94d82ef7191f7b31fa6`。这里复用的是该本地固定构建，不会在 Swift 构建时下载另一个 Python MLX wheel。
+
+如已在另一目录准备相同 ABI 的原生构建，可以在**构建时**覆盖路径；该目录应同时含 `include/` 和完整 `lib/`：
+
+```bash
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  ANERUNNER_MLX_ROOT=/absolute/path/to/pinned/mlx \
+  xcrun swift build -c release
+```
+
+`ANERUNNER_MLX_ROOT` 由 package 读取，用于头文件、链接与运行库搜索路径。更换路径后需要重新构建；仅在已生成的可执行文件旁设置这个变量，不会改变它的链接配置。保留配套动态库和 Metal 库，避免混用版本；当前验证不要求修改系统库或全局动态库路径。
+
+## 内存与模型资源
+
+直接使用已有的 [模型目录](../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream/)。源 affine Q4 专家权重、BF16 权重和 FP8 n-gram 表不转换、不重写，也不再复制完整模型目录。
+
+已记录的整模型加载包含 **77,843,121,920 字节，约77.84 GB** 源权重；MLX active memory 约 **78.5 GB**，均为十进制 GB。active memory 不包括所有系统占用和文件缓存。51.2 GB 的 n-gram 表通过 `pread` 按请求行读取，经过 FP8 解码、scale 和 BF16 舍入，不整体展开成 Float32 数组。
+
+**完整 Swift 模型与原作者完整模型服务必须错开运行。** 两者同时常驻会让这台 128 GiB 机器承受超过可用空间的权重压力，并使性能对照失真。[已有资源交接记录](results/gpu-full-model-resource-handoff.json) 保存了当时的参考服务命令；不要依据旧 PID 操作进程，应在运行前确认当前占用并按现有服务管理方式完成交接。本工程的命令不会自动停止、启动或恢复原服务。
+
+`tokenize` 只加载分词文件；`probe-gpu-model` 加载 embedding 和指定的少量层；`generate-gpu` 才加载完整文本模型。当前没有 HTTP 服务入口或自动服务切换 helper。
+
+本轮收尾已恢复作者服务 `http://127.0.0.1:11235`，并检查 MTP / drafter 关闭；当前 PID 和就绪检查时间见[交接记录](results/gpu-full-model-resource-handoff.json)。这是作者服务，独立 Swift runner 以命令行运行。
+
+## 分词与文本生成
+
+先检查原生分词和 no-thinking 聊天模板，不加载整模型：
+
+```bash
+.build/release/ane-runner tokenize \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --prompt '请用一句话解释太阳为什么发光。' \
+  --chat true \
+  --output results/manual-tokenize.json
+```
+
+`--chat true` 使用文本聊天模板；省略或设为 `false` 则直接对原文分词。输出含渲染后的文本、token IDs 和解码结果。默认匹配固定作者实现的 Unicode 处理方式；源码另有显式 NFC 模式。输出屏蔽 token 从模板及分词器的 special 标记派生，EOS 保留，不会用屏蔽来替代数值验证。
+
+确认完整模型资源已交接后运行：
+
+```bash
+.build/release/ane-runner generate-gpu \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --prompt '请用一句话解释太阳为什么发光。' \
+  --max-tokens 32 --context 4096 \
+  --output results/manual-gpu-generation.json
+```
+
+此命令使用当前生成默认：chunk416、`nextChunk` 预取、1 个 SSD worker 和符合条件的融合 causal attention。加载和生成进度写入标准错误；最终文本、token IDs、计时与内存写入 JSON。省略 `--output` 时，JSON 写到标准输出。首次运行会包含模型加载与 Metal 编译开销；用 Ctrl+C 结束当前前台进程不会自动恢复原作者服务，且可能尚未产生最终 JSON。
+
+要对固定输入重跑，使用已有的 [19 个参考 prompt token](fixtures/gpu-full-model-reference/prompt-token-ids.json)，避免把聊天模板差异带入数值比较：
+
+```bash
+.build/release/ane-runner generate-gpu \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --tokens-file fixtures/gpu-full-model-reference/prompt-token-ids.json \
+  --max-tokens 32 --context 4096 --repeat 2 \
+  --output results/manual-gpu-repeat.json
+```
+
+`--repeat 2` 在同一进程保留权重，每轮重新创建会话状态；它不是前缀缓存命中。`--tokens-file` 必须是扁平 JSON 整数数组，不能直接传入 `tokenize` 返回的整个 JSON 对象，也不能同时传 `--prompt`。
+
+| 参数 | 默认值 | 当前约束 |
+|---|---:|---|
+| `--max-tokens` | 32 | 1–4096；提前遇到 EOS 即停止 |
+| `--prefill-chunk` | 416 | 1–512；跨块状态舍入边界随 chunk 改变，不保证不同 chunk 的完整数值等价 |
+| `--prefill-accumulation` | `reference` | `reference` 保留作者 BF16 归约；`float32` 改变 prefill 累加精度，可能改变生成 token |
+| `--context` | 4096 | 1–262144，输入与输出预算之和不可超过它；上限来自配置，不代表256K已经实测通过 |
+| `--repeat` | 1 | 1–10；每轮独立状态，权重不重复加载 |
+| `--decode-mode` | `reference` | `scalar` 优化取回 token；`elementwise` / `projections` 分别加共享专家融合或投影合并；`all` 同时启用。所有非 reference 模式均包含 scalar |
+| `--decode-order` | 不启用 | 逗号分隔逐轮模式，与 `--decode-mode` 互斥；省略 `--repeat` 时按列表长度运行，最多 10 轮 |
+| `--wired-policy` | `disabled` | `fit` 按已加载 MLX 活跃内存加 256 MiB 请求进程内驻留额度；不是物理驻留字节测量 |
+| `--wired-order` | 不启用 | 逗号分隔逐轮驻留策略，与 `--wired-policy` 互斥；逐轮设置耗时独立报告，不进入首 token 或 decode 计时 |
+| `--ssd-workers` | 1 | 1–4；只控制 CPU 行读取并发，本轮 4-worker 补测未显示额外优势 |
+| `--ssd-prefetch` | `nextChunk` | 提前读取下一块已知 prompt 的嵌入；`off` 关闭，保留末尾单 token，decode 仍按需读取 |
+| `--ssd-prefetch-order` | 不启用 | `off,nextChunk,...` 逐轮交错对照；与 `--ssd-prefetch` 互斥，最多 10 轮 |
+| `--raw-prompt` | `false` | 仅配合 `--prompt`；`true` 跳过聊天模板 |
+| `--profile-stages` | `disabled` | `hostBodyOnly` 或 `synchronizedStages` 用于诊断 |
+| `--telemetry-dir` | 不启用 | 新目录；启动当前 runner 拥有的可选硬件采样器，另存绝对 phase 时间 |
+| `--telemetry-interval-ms` | 200 | 50–10000；必须与 `--telemetry-dir` 一起使用，具体口径见 [TELEMETRY.md](TELEMETRY.md) |
+| `--gpu-command-timing-output` | 不启用 | 仅配合独立诊断 MLX 库；保存真实 command-buffer 起止时间，输出必须为新路径。见 [GPU_BOTTLENECK.md](GPU_BOTTLENECK.md) |
+
+| 环境变量 | 默认值 | 当前约束 |
+|---|---:|---|
+| `ANERUNNER_FUSED_PREFILL` | `1` | `0` 关闭融合 causal attention；仅无 QSA、序列长度大于 8、head dimension 256 时生效 |
+| `ANERUNNER_BLOCKED_GDN` | 关闭 | `1` 开启实验性 blocked 递推；已观察到生成 token 变化，未纳入默认 |
+| `ANERUNNER_PREFILL_EVAL_LAYERS` | `4` | 1–48；控制多 token prefill 的层间同步间隔 |
+
+当前固定贪心采样、文本/no-thinking、单请求；没有 MTP 开关、工具调用协议、视觉/音频输入、流式 HTTP 或跨进程会话持久化。扩大上下文前应先通过分块连续性、QSA 阈值和内存检查；不要把 CLI 可接受的最大数值当作已通过的容量结论。
+
+## 局部 GPU 探针
+
+只测一层完整 MoE，使用已保存的真实输入：
+
+```bash
+.build/release/ane-runner probe-gpu-moe \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --fixture fixtures/moe-real/converted/decode.json \
+  --layer 0 --warmups 3 --runs 10 \
+  --output results/manual-gpu-moe.json
+```
+
+该命令加载整层512个专家的原 Q4 bank，动态选择全部top-10；它不是只装载参考文件中命中的专家。结果包含路由、分支输出、误差和计时，不能直接换算为48层生成速度。
+
+捕获从原始 token 开始的前四层边界：
+
+```bash
+.build/release/ane-runner probe-gpu-model \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --tokens-file fixtures/moe-real/prefill-token-ids.json \
+  --decode-tokens-file fixtures/moe-real/decode-token-ids.json \
+  --layers 4 --prefill-chunk 64 \
+  --capture-output results/manual-gpu-boundaries.safetensors \
+  --output results/manual-gpu-boundaries.json
+```
+
+`--layers` 默认1、最多4；捕获同时受4096个总输入 token 和512 MiB逻辑张量预算限制，实际可能先触发后者。为避免覆盖证据，`--capture-output` 必须是不存在的新文件。
+
+参考 prefill 是26个token；所谓 decode fixture 是 offset 26 的 `[271]`，即作者延后处理的最后一个 prompt 换行，**不是第一个生成内容 token**。捕获键为 `prefill.N.*` / `decode.N.*`，每步都保存 token IDs 和处理前后的位置。随后可从现有环境执行纯 CPU 文件比较：
+
+```bash
+../../.venv/bin/python scripts/compare_gpu_model_capture.py \
+  --capture results/manual-gpu-boundaries.safetensors \
+  --reference-dir fixtures/moe-real \
+  --report results/manual-gpu-boundaries-validation.json
+```
+
+这里的 Python 只读取两份已保存的张量，不参与推理。比较器先验证完整 token 历史，再比较原始参考实际拥有的五个 layer 0 MoE / HC 边界；其他层和内部张量明确列为未比较。
+
+GDN / QSA 模块还可复用已有 [序列参考](fixtures/gpu-sequence-reference/manifest.json)：
+
+```bash
+.build/release/ane-runner probe-gpu-sequence \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --fixture fixtures/gpu-sequence-reference/manifest.json \
+  --max-relative-l2 0.005 --fused true \
+  --output results/manual-gpu-sequence.json
+```
+
+这一序列参考将真实 MoE 激活用于另一个模块边界，并包含为跨越QSA阈值而重复的输入；它属于模块数值测试，不是真实长上下文对话证据。不要将离线参考导出与原生 runner 推理混为一谈。
+
+## 如何解读速度和带宽
+
+性能对照使用 `--profile-stages disabled`。`hostBodyOnly` 主要记录主机提交开销；`synchronizedStages` 在每个阶段前后同步，会改变调度、融合和SSD计算重叠，仅用于找等待位置。[现有阶段诊断](results/gpu-full-model-v2-stage-profile.json) 与正常吞吐记录应分开解读。
+
+- `load_seconds` 是模型加载阶段；`time_to_first_token_seconds_excluding_load` 不含它。
+- `prefill_tokens_per_second` 包含最后一个保留的 prompt token 的 decode 形状前向与首次采样，不能直接比较作者的纯 prefill 吞吐。
+- `decode_tokens_per_second` 使用后续decode步数除以decode时间，不含首token、prefill和加载。生成 ID 包含 EOS，当前短请求的26个decode步不能代表长任务的稳定吞吐。
+- `ssd_wait_seconds` 是整次请求在收取SSD任务结果时尚未被计算掩盖的等待，包含prefill与decode；它不是整个文件读取耗时，不能再与计算时间相加。
+- `ssd_requested_row_bytes` 是逻辑行请求量；重复行仍计入，OS文件缓存可能命中，它不等于物理磁盘流量。
+- `logical_decode_weight_footprint_rate_gbps` 是逻辑权重规模除以耗时，**不是实测DRAM带宽**。报告中物理DRAM字节/带宽仍为不可用。
+- `memory.peak_bytes` 是进程累计 MLX allocator 峰值，各轮之间没有重置；它不是单轮独立峰值或全系统物理内存。
+- `qsa_active_layers` 记录最终状态已有 pooled indexer 缓存。当前注意力把完整 KV 与稀疏可见性 mask 交给 SDPA；启用 QSA 选择不证明已经按相同比例减少物理读取。
+
+当前记录没有可归属的物理 DRAM 流量计数，也没有设备计算单元利用率证据；不能从 token/s、权重大小、MLX active memory 或阶段等待推导“带宽已打满”或 GPU/NAX 利用率。
+
+新增 `--telemetry-dir` 可采集目标进程 CPU／磁盘计数与系统 IOReport 分档；`scripts/analyze_gpu_telemetry.py` 将其按 load、prefill、decode 对齐并报告完整／部分覆盖。[采样文档](TELEMETRY.md)列出实际开销配对、诊断命令、GPU trace 待验证项和所有 `null` 字段的含义。采样器不会把这些系统信号改写成物理 DRAM 流量。
+
+[有界并发SSD模块](Sources/ANERunnerGPU/GPUSSDReader.swift) 已接入 `generate-gpu --ssd-workers 1...4`，保留顺序、重复行及原始错误。默认仍使用原单worker路径，并发度应在相同输入、相同输出和独占资源条件下测量后选择。
+
+`--ssd-prefetch nextChunk` 使用每请求独立的串行队列，按输入顺序准备当前及下一块。队列内部仍遵守 `--ssd-workers`，不并发启动多个 chunk 的读操作。预取只复制 token/hash 历史并读取 CPU 数据；真正消费时校验 token、历史及表实例，然后推进 PLE 历史，模型卷积和递推状态照常在 GPU 前向中更新。成功或失败结束时等待已提交读取完成。
+
+预取在请求和首块计时开始后才创建，因此准备及未被覆盖的读取时间仍算入 TTFT。新增 `prefill_ssd_wait_seconds` 与 `prefill_chunk_ssd_wait_seconds` 将 prefill 剩余等待单独列出；这些等待包含 CPU 读取与解码，不代表物理 SSD 流量。无跨请求缓存，不加载整张 n-gram 表，也不预测未知的生成 token。
+
+
+--- Repository document: TELEMETRY.md ---
+
+# GPU 推理采样与结果对齐
+
+可选采样现已接入独立 Swift runner。它记录载入、预填充、单 token 解码的时间窗口，并由独立 `ane-telemetry` 进程读取 CPU、进程磁盘计数、存储驱动计数及可用的 IOReport 分档。Instruments 的 GPU 执行时间轴和计数器另行采集、离线对齐。
+
+IOReport 使用本机私有接口，放在可选的独立采样进程中；启动后的订阅或读取失败会保留错误和缺失值，不改变模型计算路径。缺少采样器可执行文件、无法创建输出目录或无法启动子进程属于启动错误，在加载模型前报告。它不构成跨系统版本的公开兼容接口承诺。
+
+**MTP 固定关闭，完整模型计算仍使用 Metal GPU。当前没有已验证的物理 DRAM 字节／带宽读数，也没有本模型 GPU 读写字节的实测结果。** 采样能力、已读到某个计数器、目标进程的执行证据是三项不同检查。
+
+新增的 [独立 MLX 命令缓冲计时](GPU_BOTTLENECK.md)已获得完整的 GPU 起止区间，与每个 token 的 CPU 时间对齐。这是另一套诊断证据，不改变下文旧 Instruments trace 的不完整标记；区间覆盖比例仍不能解释为 shader 活跃率或物理带宽。
+
+## 已完成的验证
+
+2026-09-05，在 M5 Max／128 GiB 机器上顺序执行同一可执行文件、同一 [1217-token 项目文档输入](fixtures/gpu-telemetry/provenance.json)，每个进程重复三轮、每轮输出上限 256 token。关闭逐阶段 profiler，默认 `reference` prefill 累加，单 SSD worker。两次进程的六轮生成 ID 完全相同，均生成 256 token 后因长度停止；最终 offset 1472，未触发 QSA。这只验证该请求的输出稳定性。
+
+| 同一计时口径 | 不启用采样 | 启用 200 ms 采样 |
+|---|---:|---:|
+| 第二、三轮 decode 步数 | 510 | 510 |
+| generation 报告的 decode 步耗时合计 | 13.6404 s | 14.0602 s |
+| 步数／合计耗时 | 37.389 token/s | 36.272 token/s |
+
+证据：[无采样基线](results/gpu-telemetry-validation/baseline.json)、[采样生成记录](results/gpu-telemetry-validation/sampled.json)、[执行参数与交接记录](results/gpu-telemetry-validation/run-ledger.json)。这一配对中采样运行的速率低约 **2.99%**、耗时高约 **3.08%**；顺序运行还受缓存、系统活动和热状态影响，不能把这两个数当作稳定、纯粹的采集开销。
+
+[已保存的离线分析](results/gpu-telemetry-validation/sampled-analysis.json)采用 telemetry 叶步骤自己的时间边界，略多包含记录开销，得到暖 decode **36.268 token/s**；若用包括循环间隙的连续 phase 窗口，则为 **36.244 token/s**。不要把这些分母与上表混用。
+
+同一分析的其他暖 decode 结果：
+
+- 510 个步骤的延迟中位数 **27.345 ms**，P95 **31.139 ms**；残余 SSD 等待合计 **0.392910 s**，平均 **0.7704 ms/token**。
+- 请求行的逻辑载荷为 **1,305,600 B**。完整落在 phase 内的进程磁盘读取增量为 **55,705,600 B**，相应观察窗口覆盖 **98.94%**；跨边界的增量不分摊。这两个字节数的含义不同，不能直接相除声称 SSD 放大率。
+- CPU 累计用时 **8.0482 s**／覆盖窗口 **13.9214 s**，相当于 **0.578 个核心**；不是整台机器的 57.8% 利用率。
+- 采样物理内存占用峰值 **79.207 GB**、resident 峰值 **24.522 GB**，均为十进制 GB。这是离散快照的最大值，不是瞬时真实峰值，也不能用 resident 表示全部 GPU 权重占用。
+
+**GPU 时间轴已用本模型采到，但录制完整性未通过。** 首次 xctrace `--launch` 触发 Documents 目录的系统授权提示，未产生模型生成报告。随后正常启动 runner、向本次 PID **37997** 附加追踪，三轮生成成功，256 个 ID 均与无追踪基线一致。原始 15 秒追踪保存超时；用标准 `xctrace import` 从保留的 2.42 GB 原始附件恢复成功，再导出目标进程的 **44,999 条 GPU Active 区间记录**及 **69,050 条 CPU 提交记录**。嵌套记录会重叠，这不是独立内核调用次数。
+
+导出的时间窗口为 **15.480702 s**，时间范围包含 `repetition=1` 的整个 **7.812484 s** decode，其他两轮 decode 未覆盖。该轮 38,500 条完整落入窗口的 GPU Active 记录求并集为 **6.137777 s**，仅代表已观察到的执行。不过原始录制未正常保存，不能确认没有丢事件；恢复导出明确携带 `--incomplete-source-trace`，因此仍有 `coverage.complete=false`。GPU 活跃率、完整空闲时间保持 `null`，不能将两个时间相除声称实测忙碌率。这次导出没有 GPU 带宽计数器样本，物理 DRAM 字节同样未知。独立空载能力探针仅在默认模板读到 `RT Unit Active`；另两个计数器配置被设备明确拒绝，见 [模板实测边界](templates/README.md)。
+
+证据：[附加追踪生成记录](results/gpu-telemetry-attach/generation.json)、[恢复命令及结果](results/gpu-telemetry-attach/recovery-diagnosis.json)、[GPU 原始导出](results/gpu-telemetry-attach/recovered-export-final/gpu_intervals.json)、[同次离线分析](results/gpu-telemetry-attach/analysis.json)。追踪明显扰动执行，这次的 token/s 单独保留作诊断，不混入上表的正常吞吐。作者服务已按原参数恢复，MTP／drafter／PLD 均关闭；[交接记录](results/gpu-telemetry-attach/run-ledger.json)保存本次恢复事实，实时状态以 [experiment-status.json](../qwen38-ssd/results/experiment-status.json) 为准。
+
+## 开始采样
+
+以下命令从本目录运行。构建与完整模型的资源交接见 [GPU runner 文档](GPU_RUNNER.md#环境与构建)；完整 Swift 模型和作者完整模型服务应顺序运行。采样器不会替你管理作者服务。
+
+```bash
+cd /Users/tom/Documents/test/coreai-models/experiments/ane-runner
+
+env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift build -c release
+```
+
+构建全部产品，确保 `ane-runner` 旁边有 `ane-telemetry`。可先执行不加载模型的短检查；这里的空闲数据不作为推理性能证据：
+
+```bash
+.build/release/ane-runner probe-telemetry \
+  --telemetry-dir results/manual-idle-sampling \
+  --seconds 2 \
+  --output results/manual-idle-sampling.json
+```
+
+完整模型资源交接后，先保存无采样基线：<|im_end|>
+<|im_start|>user
+针对 agent 启动时一次读入一万 token 以上系统提示的首字延迟，结合以上项目资料，按优先级给出三个优化方向，并说明每项应该对比的测量指标。请简洁回答，不执行工具。<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

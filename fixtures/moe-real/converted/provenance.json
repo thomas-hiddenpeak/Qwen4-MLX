@@ -1,0 +1,469 @@
+{
+  "schema": "ane-runner-moe-fixture-v1",
+  "capture_schema": "qwen4-layer0-moe-real-v1",
+  "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1",
+  "capture_build_report": {
+    "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/moe-capture/build-report.json",
+    "sha256": "59611bdd80ccfd54994465eb2f7b691a64333d0f655641b3b0fc60799e38f9b3",
+    "content": {
+      "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1",
+      "branch": "codex/ane-moe-capture",
+      "binary": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/moe-capture/runtime-src/zig-out/bin/mlx-serve",
+      "binary_sha256": "225a0564dac35be1ec64bb197f0aaa0e7ddd47a75dc27cf558049d3fac9dab12",
+      "instrumented_transformer_sha256": "4243cb76a0fcb70bec2b2466e27cd87be32b8cbfd0d4565045c7fffd7f544b2c",
+      "original_transformer_sha256": "108ed4764d11f941c5a52b81566d822dfc7f5a816b29ef16240be53690f669fe",
+      "instrumentation_patch_sha256": "a265cff6955505e428da92e2212b977a2466d2eed1f19e8f53440d3cc43269f0",
+      "build_exit_code": 0,
+      "build_log": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/moe-capture/build.log",
+      "build_command": "DEVELOPER_DIR=/Library/Developer/CommandLineTools ZIG_GLOBAL_CACHE_DIR=/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/zig-global-cache .zig-toolchain/zig build -Doptimize=ReleaseFast -Dwebp-prefix=/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/deps/webp -Dds4-commit=efdadd41e201 -Dmlx-c-version=56b2d39fc831",
+      "reused_dependencies": {
+        "lib/ds4": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/lib/ds4",
+        "lib/mlx-src": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/lib/mlx-src",
+        "lib/mlxc-src": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/lib/mlxc-src",
+        "lib/mlx": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/lib/mlx",
+        "lib/llama": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/lib/llama",
+        ".zig-toolchain": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/.zig-toolchain"
+      },
+      "modified_inference_files": [
+        "src/transformer.zig"
+      ],
+      "build_only_patch": "existing isolated WebP prefix support copied from baseline",
+      "capture_schema": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/moe-capture/capture-schema.json",
+      "capture_run_status": "not run; awaiting root controller to swap servers and arm after readiness"
+    }
+  },
+  "converter": {
+    "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/scripts/prepare_moe_fixture.py",
+    "sha256": "ec1f20c975ecb509059b1575b33e7cc300fbc0cb60926936bbcece8b7086a5cf"
+  },
+  "conversion": "Select actual token rows in original order; expand native floating tensors to float32; output renamed y. No routing, weights, or expected values recomputed.",
+  "scope": "Two prefill positions by default and first decode token from layer 0, not an end-to-end decoder or performance validation. All original raw capture files retained.",
+  "actual_expert_ids": [
+    42,
+    51,
+    58,
+    72,
+    88,
+    90,
+    91,
+    109,
+    123,
+    136,
+    144,
+    148,
+    150,
+    171,
+    214,
+    223,
+    226,
+    233,
+    249,
+    261,
+    302,
+    315,
+    333,
+    351,
+    358,
+    373,
+    391,
+    453,
+    471
+  ],
+  "phases": {
+    "prefill": {
+      "phase": "prefill",
+      "raw_capture": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/prefill.safetensors",
+      "raw_capture_bytes": 3325246,
+      "raw_capture_sha256": "64065b352567603ccdf154b593bf20b5540118c348eb7ab48f2ac5fa522e99ed",
+      "source_metadata": {
+        "origin": "actual armed HTTP request; original MLX graph; no synthetic activations",
+        "schema": "qwen4-layer0-moe-real-v1",
+        "phase": "prefill",
+        "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1",
+        "layer_index": "0"
+      },
+      "captured_token_count": 26,
+      "sequence_offset": 0,
+      "captured_token_ids": [
+        248045,
+        846,
+        198,
+        139054,
+        104213,
+        99986,
+        98682,
+        98832,
+        95779,
+        122826,
+        98138,
+        104916,
+        122501,
+        99448,
+        96919,
+        99142,
+        96931,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069
+      ],
+      "positions": [
+        14,
+        25
+      ],
+      "absolute_positions": [
+        14,
+        25
+      ],
+      "selected_token_ids": [
+        96919,
+        248069
+      ],
+      "selected_experts": [
+        [
+          471,
+          58,
+          391,
+          42,
+          51,
+          358,
+          91,
+          150,
+          233,
+          223
+        ],
+        [
+          302,
+          136,
+          453,
+          373,
+          226,
+          171,
+          72,
+          123,
+          144,
+          148
+        ]
+      ],
+      "routing_weights": [
+        [
+          0.30859375,
+          0.18359375,
+          0.1630859375,
+          0.0751953125,
+          0.06982421875,
+          0.05615234375,
+          0.042236328125,
+          0.037353515625,
+          0.033203125,
+          0.031982421875
+        ],
+        [
+          0.30859375,
+          0.11328125,
+          0.1103515625,
+          0.1064453125,
+          0.0830078125,
+          0.0732421875,
+          0.060546875,
+          0.050537109375,
+          0.050537109375,
+          0.04736328125
+        ]
+      ],
+      "routing_weight_sums": [
+        1.001220703125,
+        1.00390625
+      ],
+      "retained_tensor_sources": {
+        "x": {
+          "shape": [
+            1,
+            26,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "router_logits": {
+          "shape": [
+            1,
+            26,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "selected_experts": {
+          "shape": [
+            1,
+            26,
+            10
+          ],
+          "dtype": "torch.uint32"
+        },
+        "routing_weights": {
+          "shape": [
+            1,
+            26,
+            10
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "routed_sum": {
+          "shape": [
+            1,
+            26,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_down": {
+          "shape": [
+            1,
+            26,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gated": {
+          "shape": [
+            1,
+            26,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "output": {
+          "shape": [
+            1,
+            26,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gate_logits": {
+          "shape": [
+            1,
+            26,
+            1
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gate": {
+          "shape": [
+            1,
+            26,
+            1
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "selected_expert_outputs": {
+          "shape": [
+            1,
+            26,
+            10,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        }
+      },
+      "raw_tensor_names": [
+        "hc_inject",
+        "hc_stream_after",
+        "hc_stream_before",
+        "output",
+        "routed_sum",
+        "router_input",
+        "router_logits",
+        "routing_weights",
+        "selected_expert_outputs",
+        "selected_experts",
+        "sequence_offset",
+        "shared_activation",
+        "shared_down",
+        "shared_gate",
+        "shared_gate_logits",
+        "shared_gate_projection",
+        "shared_gated",
+        "shared_up_projection",
+        "token_ids",
+        "x"
+      ],
+      "omitted_optional_outputs": [],
+      "fixture": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/converted/prefill.json",
+      "fixture_sha256": "c52f906591f8b5df4d17e0cce53e58f9f9e9ae894e8e4b542c4290dac7e84ca9",
+      "numpy_companion": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/converted/prefill.npz",
+      "numpy_companion_sha256": "b8abf2c9ad1513f47de319ce64e1dcf5002680f4fb5f60bebf77edf93bbda66c"
+    },
+    "decode": {
+      "phase": "decode",
+      "raw_capture": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/decode.safetensors",
+      "raw_capture_bytes": 78368,
+      "raw_capture_sha256": "e83d897324e3833a47bcc1450e3226de14a081e9c7d03a81438f470a00cff18e",
+      "source_metadata": {
+        "schema": "qwen4-layer0-moe-real-v1",
+        "origin": "actual armed HTTP request; original MLX graph; no synthetic activations",
+        "layer_index": "0",
+        "phase": "decode",
+        "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1"
+      },
+      "captured_token_count": 1,
+      "sequence_offset": 26,
+      "captured_token_ids": [
+        271
+      ],
+      "positions": [
+        0
+      ],
+      "absolute_positions": [
+        26
+      ],
+      "selected_token_ids": [
+        271
+      ],
+      "selected_experts": [
+        [
+          333,
+          109,
+          214,
+          249,
+          351,
+          90,
+          315,
+          88,
+          261,
+          148
+        ]
+      ],
+      "routing_weights": [
+        [
+          0.38671875,
+          0.12158203125,
+          0.1142578125,
+          0.0859375,
+          0.068359375,
+          0.057373046875,
+          0.04833984375,
+          0.047607421875,
+          0.0400390625,
+          0.0284423828125
+        ]
+      ],
+      "routing_weight_sums": [
+        0.9986572265625
+      ],
+      "retained_tensor_sources": {
+        "x": {
+          "shape": [
+            1,
+            1,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "router_logits": {
+          "shape": [
+            1,
+            1,
+            512
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "selected_experts": {
+          "shape": [
+            1,
+            1,
+            10
+          ],
+          "dtype": "torch.uint32"
+        },
+        "routing_weights": {
+          "shape": [
+            1,
+            1,
+            10
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "routed_sum": {
+          "shape": [
+            1,
+            1,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_down": {
+          "shape": [
+            1,
+            1,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gated": {
+          "shape": [
+            1,
+            1,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "output": {
+          "shape": [
+            1,
+            1,
+            2560
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gate_logits": {
+          "shape": [
+            1,
+            1,
+            1
+          ],
+          "dtype": "torch.bfloat16"
+        },
+        "shared_gate": {
+          "shape": [
+            1,
+            1,
+            1
+          ],
+          "dtype": "torch.bfloat16"
+        }
+      },
+      "raw_tensor_names": [
+        "hc_inject",
+        "hc_stream_after",
+        "hc_stream_before",
+        "output",
+        "routed_sum",
+        "router_input",
+        "router_logits",
+        "routing_weights",
+        "selected_experts",
+        "sequence_offset",
+        "shared_activation",
+        "shared_down",
+        "shared_gate",
+        "shared_gate_logits",
+        "shared_gate_projection",
+        "shared_gated",
+        "shared_up_projection",
+        "token_ids",
+        "x"
+      ],
+      "omitted_optional_outputs": [],
+      "fixture": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/converted/decode.json",
+      "fixture_sha256": "e04bbc543170f6a59e88e61b040b3d6a58ac2e328ba212f5852ee4b6312ebcfd",
+      "numpy_companion": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/fixtures/moe-real/converted/decode.npz",
+      "numpy_companion_sha256": "fb75171e146ce803c8d072c58e481cc7414f209aa81701de4654b3bbcc013d78"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+<|im_start|>user
+请用一句话解释太阳为什么发光。<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

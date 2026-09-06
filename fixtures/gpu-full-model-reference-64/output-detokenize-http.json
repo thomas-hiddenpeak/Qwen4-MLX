@@ -1,0 +1,19 @@
+{
+  "name": "output-detokenize",
+  "endpoint": "/detokenize",
+  "generation": false,
+  "started_at_utc": "2026-09-05T10:36:15.909165+00:00",
+  "completed": true,
+  "status": 200,
+  "wall_seconds": 0.006480917000000197,
+  "body_bytes": 161,
+  "url": "http://127.0.0.1:11235/detokenize",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "161",
+    "Connection": "close",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "benchmark-2",
+  "endpoint": "/v1/completions",
+  "generation": true,
+  "started_at_utc": "2026-09-05T10:36:16.759751+00:00",
+  "completed": true,
+  "status": 200,
+  "wall_seconds": 0.8210594999999996,
+  "body_bytes": 442,
+  "url": "http://127.0.0.1:11235/v1/completions",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "442",
+    "Connection": "close",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  }
+}

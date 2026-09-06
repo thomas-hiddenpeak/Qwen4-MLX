@@ -1,0 +1,137 @@
+[
+  {
+    "run": 1,
+    "request_wall_seconds": 0.8174699589999999,
+    "usage": {
+      "prompt_tokens": 19,
+      "completion_tokens": 26,
+      "total_tokens": 45
+    },
+    "finish_reason": "stop",
+    "text_matches_reference": true,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7172
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7422
+      },
+      "raw_segment_sha256": "ce5d182bfc12289d841726d5d6c494f639ecc83ffd504e9541ea79944f6ac714",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (805ms) [prefill: 162.1 tok/s, decode: 39.2 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 805,
+        "prefill_tokens_per_second": 162.1,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 39.2,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    },
+    "token_ids": null,
+    "token_id_scope": "No per-token boundaries in this benchmark response; IDs are not inferred from whole text."
+  },
+  {
+    "run": 2,
+    "request_wall_seconds": 0.8210594999999996,
+    "usage": {
+      "prompt_tokens": 19,
+      "completion_tokens": 26,
+      "total_tokens": 45
+    },
+    "finish_reason": "stop",
+    "text_matches_reference": true,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7422
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7672
+      },
+      "raw_segment_sha256": "216d23e2398a2c5c1c55c59dc03e5da556d79ddfba7a02d8e984b184273924ae",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (814ms) [prefill: 160.0 tok/s, decode: 38.7 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 814,
+        "prefill_tokens_per_second": 160.0,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 38.7,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    },
+    "token_ids": null,
+    "token_id_scope": "No per-token boundaries in this benchmark response; IDs are not inferred from whole text."
+  },
+  {
+    "run": 3,
+    "request_wall_seconds": 0.8283897919999998,
+    "usage": {
+      "prompt_tokens": 19,
+      "completion_tokens": 26,
+      "total_tokens": 45
+    },
+    "finish_reason": "stop",
+    "text_matches_reference": true,
+    "server_log": {
+      "available": true,
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/gpu-reference-final.log",
+      "start": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7672
+      },
+      "end": {
+        "device": 16777230,
+        "inode": 4680992,
+        "offset": 7922
+      },
+      "raw_segment_sha256": "2ac03c6cbbdbace3b2f4058518a288b7f833b001a28fe61c7b188048dbfb0316",
+      "request_log_lines": [
+        "POST /v1/completions (max_tokens=64, temp=0.00, top_p=1.00, top_k=1, stream=false) "
+      ],
+      "timing_log_lines": [
+        "  <- 19+26 tokens (820ms) [prefill: 162.3 tok/s, decode: 38.4 tok/s] [stop]"
+      ],
+      "unambiguous_request_window": true,
+      "parsed_timing": {
+        "prompt_tokens": 19,
+        "completion_tokens": 26,
+        "elapsed_ms": 820,
+        "prefill_tokens_per_second": 162.3,
+        "cached_prompt_tokens": 0,
+        "decode_tokens_per_second": 38.4,
+        "finish_reason": "stop"
+      },
+      "scope": "Exact bytes appended during this HTTP request; attribution requires exactly one generation request and one matching timing line. No physical memory counters."
+    },
+    "token_ids": null,
+    "token_id_scope": "No per-token boundaries in this benchmark response; IDs are not inferred from whole text."
+  }
+]

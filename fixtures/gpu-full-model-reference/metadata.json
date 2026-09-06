@@ -1,0 +1,58 @@
+{
+  "captured_at_utc": "2026-09-05T09:36:36.958682+00:00",
+  "source_commit": "7dbcba04c98e4fd3bcc533c63e645547f13cc3b1",
+  "source_model_directory": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream",
+  "service_process": "10591 Sat Sep  5 15:30:24 2026     /Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/zig-out/bin/mlx-serve --model /Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream --serve --host 127.0.0.1 --port 11235 --ctx-size 4096 --prefill-chunk 512 --max-concurrent 1 --prefix-cache-entries 0 --no-mtp --no-drafter --no-pld --metrics",
+  "source_binary": "/Users/tom/Documents/test/coreai-models/experiments/qwen38-ssd/runtime/mlx-serve/zig-out/bin/mlx-serve",
+  "source_sha256": {
+    "binary": "a90120fe092a0ab805cc35fc41c4f94bbffb19a97ee754250e506ad71475203c",
+    "server.zig": "66c6efe77dcdb0bd1443043e714bdc3f0027915b730b6a71e7f5be745d4d77a1",
+    "transformer.zig": "108ed4764d11f941c5a52b81566d822dfc7f5a816b29ef16240be53690f669fe",
+    "tokenizer.zig": "fd5e372fe160cc731835ac199f63709a795b4f134309d8db5fa17a558a703cef",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "config.json": "fd945111eba53ca88ca5aaf20c5355972fb9643b4b048bf5de271fa22064a687",
+    "model.safetensors.index.json": "72dd63e0da29177db38293078029e76446db26e596caeb5903ae6d292843df18",
+    "capture_reference.py": "cf8cc2cb2235490edae60cd952ecbafb7496ecb98906e5ca4d92d6afd5f6c439"
+  },
+  "prompt_format": "Explicit raw Qwen role markers and closed think prefix; /v1/completions applies no server-side chat template.",
+  "generation_request_count": 1,
+  "request_wall_seconds": 1.497274042,
+  "timing_scope": "One reference capture, not a throughput benchmark; includes HTTP and requested per-token logprobs overhead.",
+  "mtp_evidence": [
+    "Live PID command line --no-mtp",
+    "Live models-before/after meta.mtp_loaded=false",
+    "Request enable_mtp=false",
+    "Source handler additionally disables all speculation when logprobs_n>0"
+  ],
+  "exact_token_id_evidence": "Per-token logprob text boundaries map uniquely to the source ByteLevel vocabulary; UTF-8 replacement rejected; raw-byte offsets, total text and /detokenize roundtrip all checked. Full-text retokenization was not used.",
+  "weight_payload_hash_scope": "Config/index/tokenizer/binary/source hashed; this capture does not reread/hash all checkpoint payloads.",
+  "source_api_lines": {
+    "raw_prompt_tokenization": "src/server.zig:5735",
+    "speculation_disabled_for_logprobs": "src/server.zig:5844",
+    "per_token_logprob_text": "src/server.zig:9328",
+    "bytelevel_decode": "src/tokenizer.zig:398"
+  },
+  "fixture_files_sha256": {
+    "models-after-response.json": "6eda086e62af5d397469f746e54125c9df28045cb84a823f7b97b20e5dcd8b29",
+    "completion-request.json": "b89896ec05d616ecf252a86b73fe1cf4c1c7661be494f2eb9fb6705585694b84",
+    "prompt-tokenize-request.json": "6aab321408ca579bad4236c1ad892557a09403c50a795f17c75f962e4d449339",
+    "output-detokenize-http.json": "0ed4d2aa66265898596192c68761cdb46f12757ea8b41744d9735e007655c951",
+    "prompt-token-ids.json": "584d802b468533f561c470e3de892294916b83c79b05fe30b542a172d52c9495",
+    "service-process.txt": "c7ae452a42c2d6a53f6334f0942d4849eff7d417abd417693a2fedc69abbb3d2",
+    "completion-http.json": "8fd836841e952c8e83a0cc057b1244f616f6aa4d8b29f291e85cc9afb0f3ad48",
+    "capture_reference.py": "cf8cc2cb2235490edae60cd952ecbafb7496ecb98906e5ca4d92d6afd5f6c439",
+    "prompt.txt": "d02152084de2ff1e40c328116418fb1b5330ef1fcb4ffca63f037d14153cd9af",
+    "completion-response.json": "a3c8767306e7eeb2696ca46a428f39377416994d2d1eceed798d2ce41b804c79",
+    "output-detokenize-request.json": "2fde6acadfac6f7589a556f779ba811fb2370ba0a46ff86d2604123bf1e002fe",
+    "reference.json": "c434f5ce981f4a66fc4c5a69798342f2d5ffce2994644114a06d641270d44c39",
+    "models-after-http.json": "292775ad6493ef5c7ff4689614b6649a435de6f683c9691458f552636f8d1571",
+    "generated-text.txt": "819000b273a77a7ccea28b60f20b41c5ed22aeced7fb69004a105eac563b0ac6",
+    "token-id-recovery.json": "967ac3fc2757e21b406328acf0a3d24d9d4d0d7b43316068f538f7e423bae558",
+    "output-detokenize-response.json": "422501c08b9eaf3b3b4adeeb3c982ce902d581bc6028d14bf86bb1e41429cce1",
+    "prompt-tokenize-http.json": "36936abe52970772b4bfcbe05d1b39232f6204ec7212530ea0b9103ef14b9ca2",
+    "models-before-response.json": "e5cd6849b02b508fe5a2337b281a11e4948374767cd5a3d5ea02f74f714e6f9f",
+    "models-before-http.json": "292775ad6493ef5c7ff4689614b6649a435de6f683c9691458f552636f8d1571",
+    "prompt-tokenize-response.json": "a5cf7270dc6f6b5f97e9d262f6d012bc289046975992bd511deada69852f3399",
+    "generated-token-ids.json": "89d5b893cf1a628381726ddaec50139e5fcf164ce2e448e7810c21eaf9b6dd62"
+  }
+}
