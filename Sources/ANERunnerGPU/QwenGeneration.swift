@@ -158,6 +158,24 @@ public struct QwenGenerationResult: Codable, Sendable {
     public let statistics: QwenGenerationStatistics
     /// Separate producer, handoff and consumer costs; nil in historical reports.
     public let phases: QwenGenerationPhases?
+    /// Derived from completed CPU counters only; nil for AR or historical reports.
+    public let mtpCostSummary: QwenMTPCostSummary?
+
+    init(tokens: [Int32], finishReason: QwenGenerationFinishReason,
+         preparationSeconds: Double, timeToFirstTokenSeconds: Double,
+         decodeSeconds: Double, totalSeconds: Double,
+         statistics: QwenGenerationStatistics, phases: QwenGenerationPhases?) {
+        self.tokens = tokens; self.finishReason = finishReason
+        self.preparationSeconds = preparationSeconds
+        self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
+        self.decodeSeconds = decodeSeconds; self.totalSeconds = totalSeconds
+        self.statistics = statistics; self.phases = phases
+        mtpCostSummary = statistics.mtp.map {
+            QwenMTPCostSummary(statistics: $0, decodeSteps: statistics.decodeRounds,
+                committedDecodeTokens: statistics.decodedTokenCount, decodeSeconds: decodeSeconds)
+        }
+    }
+
     public var decodeTokensPerSecond: Double? {
         decodeSeconds > 0 ? Double(statistics.decodedTokenCount) / decodeSeconds : nil
     }

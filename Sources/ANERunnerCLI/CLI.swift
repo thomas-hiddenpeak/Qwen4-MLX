@@ -294,6 +294,7 @@ struct RunnerCLI {
             [--tokens-file PATH --max-tokens 128 --suite mixed --golden-report PATH]
         Chunk/round scheduling: probe-gpu-cooperative-scheduler --model-dir PATH
             --tokens-file AGENT_11K.json --output NEW.json [--golden-report PATH]
+            [--decode-burst 4] (1...64 steps; includes first-token publication)
         Experimental draft prompt history: --mtp-draft-history full|1024 (default full); target context remains complete.
         Precision: --prefill-accumulation reference|float32 (default: reference)
         Fused causal prefill: enabled by default (M5, sequence > 8; QSA unchanged); ANERUNNER_FUSED_PREFILL=0 disables it

@@ -7,7 +7,10 @@ extension RunnerCLI {
     /// Fixed long/short requests compare whole-stage and cooperative scheduling.
     /// GPU execution remains serial; callback clocks measure observed latency.
     static func probeGPUCooperativeScheduler(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--tokens-file", "--output", "--golden-report"])
+        try args.validate(["--model-dir", "--tokens-file", "--output", "--golden-report", "--decode-burst"])
+        guard let decodeBurst = Int(args["--decode-burst"] ?? "4"), (1...64).contains(decodeBurst) else {
+            throw CLIError.usage("Cooperative scheduler probe --decode-burst must be in 1...64")
+        }
         let output = try args.require("--output")
         guard !FileManager.default.fileExists(atPath: output) else {
             throw CLIError.usage("Cooperative scheduler probe --output must be a new file")
@@ -25,10 +28,14 @@ extension RunnerCLI {
             "schema": "qwen38-cooperative-scheduler-probe-v1", "complete": false, "passed": false,
             "full_model_instances": 1, "mode_order": ["wholeStages", "cooperative", "cooperative_long_mtp"],
             "clock": "mach_absolute_time_nanoseconds", "long_max_tokens": 128, "short_max_tokens": 64,
+            "decode_burst": decodeBurst,
+            "callback_gap_quantile_method": "linear interpolation at q*(n-1), including zero gaps",
             "notes": [
                 "One mixed long-AR/short-MTP pair per scheduling mode, then a cooperative long-MTP/short-MTP pair. Long is submitted first. This is a functional and observed latency gate, not a statistical kernel speedup benchmark.",
                 "Standalone long AR, short AR and short MTP references run before both modes; short MTP initialization is therefore warmed for both.",
                 "All raw callback timestamps are recorded with committed token IDs. Mean compute TPOT differs from wall callback gaps under cooperative scheduling.",
+                "Callback p50/p95/max include every adjacent committed-token gap, including near-zero gaps within MTP rounds. They measure local delivery, not HTTP/SSE latency.",
+                "Submission-to-terminal observation ends when the terminal runNext returns; it is separate from the last callback and active decode compute time.",
                 "Callbacks only append a timestamped value. Event/JSON serialization and file writes occur after each mixed group, outside its pump loop.",
                 "Cancellation checks call cancel only after a yielded slice. No further runNext is used to complete the cancelled job; cancel latency may include SSD cleanup.",
                 "Logical token reservations are not physical memory bytes. No concurrent GPU execution, HTTP service, process transfer or kernel preemption is tested.",
@@ -168,7 +175,7 @@ extension RunnerCLI {
             ] {
                 let limits = QwenLocalScheduler.Limits(maxQueuedPrefills: 2, maxReadyDecodes: 2,
                     maxResidentTokens: reservation, maxConsecutivePrefills: 1,
-                    executionMode: cooperative ? .cooperative : .wholeStages, decodeBurst: 4, maxResidentSequences: 2)
+                    executionMode: cooperative ? .cooperative : .wholeStages, decodeBurst: decodeBurst, maxResidentSequences: 2)
                 let scheduler = try QwenLocalScheduler(generator: generator, limits: limits)
                 defer { _ = try? scheduler.discardAll() }
                 var longCallbacks = [GPUCooperativeCallback](), shortCallbacks = [GPUCooperativeCallback]()
@@ -229,15 +236,32 @@ extension RunnerCLI {
                         longDone.map { l in shortReady.map { $0.index > l.index } == true } == true &&
                         !steps.contains { [.prefillProgress, .decodeProgress].contains($0.event.kind) })
                 }
-                func callbackMetrics(_ callbacks: [GPUCooperativeCallback], submitted: UInt64) -> [String: Any] {
+                func callbackMetrics(_ callbacks: [GPUCooperativeCallback], submitted: UInt64,
+                                     terminalObserved: UInt64?) -> [String: Any] {
                     var metrics: [String: Any] = ["submit_ns": submitted, "count": callbacks.count]
                     if let first = callbacks.first {
                         metrics["submission_to_first_callback_seconds"] = seconds(submitted, first.timestampNS)
                     }
                     if let last = callbacks.last { metrics["submission_to_last_callback_seconds"] = seconds(submitted, last.timestampNS) }
-                    metrics["callback_gap_seconds"] = zip(callbacks, callbacks.dropFirst()).map { pair in
+                    let gaps = zip(callbacks, callbacks.dropFirst()).map { pair in
                         seconds(pair.0.timestampNS, pair.1.timestampNS)
                     }
+                    metrics["callback_gap_seconds"] = gaps
+                    let sorted = gaps.sorted()
+                    func quantile(_ q: Double) -> Any {
+                        guard !sorted.isEmpty else { return NSNull() }
+                        let rank = q * Double(sorted.count - 1)
+                        let lower = Int(rank.rounded(.down)), upper = Int(rank.rounded(.up))
+                        return sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - Double(lower))
+                    }
+                    metrics["callback_gap_count"] = gaps.count
+                    metrics["callback_gap_p50_seconds"] = quantile(0.5)
+                    metrics["callback_gap_p95_seconds"] = quantile(0.95)
+                    metrics["callback_gap_max_seconds"] = sorted.last.map { $0 as Any } ?? NSNull()
+                    metrics["terminal_observed_ns"] = terminalObserved.map { $0 as Any } ?? NSNull()
+                    metrics["submission_to_terminal_observation_seconds"] = terminalObserved.map {
+                        seconds(submitted, $0) as Any
+                    } ?? NSNull()
                     return metrics
                 }
                 if let first = shortCallbacks.first { shortTTFT[name] = seconds(shortSubmitted, first.timestampNS) }
@@ -246,8 +270,10 @@ extension RunnerCLI {
                     "wall_seconds": seconds(start, end), "long_job_id": longID.uuidString, "short_job_id": shortID.uuidString,
                     "submitted_snapshot": try object(submittedSnapshot), "steps": try object(steps),
                     "long_callbacks": try object(longCallbacks), "short_callbacks": try object(shortCallbacks),
-                    "long_callback_metrics": callbackMetrics(longCallbacks, submitted: longSubmitted),
-                    "short_callback_metrics": callbackMetrics(shortCallbacks, submitted: shortSubmitted),
+                    "long_callback_metrics": callbackMetrics(longCallbacks, submitted: longSubmitted,
+                        terminalObserved: longDone?.endNS),
+                    "short_callback_metrics": callbackMetrics(shortCallbacks, submitted: shortSubmitted,
+                        terminalObserved: shortDone?.endNS),
                     "final_snapshot": try object(scheduler.snapshot()), "memory_after": try MX.memory(),
                     "pump_exhausted_bound": exhausted]
                 if let pumpError { group["error"] = String(describing: pumpError) }

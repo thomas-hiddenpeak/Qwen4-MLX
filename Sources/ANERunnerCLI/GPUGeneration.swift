@@ -274,6 +274,20 @@ extension RunnerCLI {
             FileHandle.standardError.write(Data("Trial \(repetition + 1): \(decodeRate) tokens/s\n".utf8))
             let logicalRate: Any = decodeTime > 0 && mtpDecoder == nil ? Double(model.logicalDecodeWeightBytes) * Double(decode.count) / decodeTime * 1e-9 : NSNull()
             let decodeTPOT: Any = generated.count > 1 ? decodeTime / Double(generated.count - 1) : NSNull()
+            let mtpCostSummary = mtpDecoder.map {
+                QwenMTPCostSummary(statistics: $0.statistics, decodeSteps: decode.count,
+                    committedDecodeTokens: max(0, generated.count - 1), decodeSeconds: decodeTime)
+            }
+            // Keep throwing generic serialization out of the large heterogeneous
+            // trial dictionary so Swift does not need to infer the whole expression.
+            let mtpStatisticsJSON: Any
+            if let mtpDecoder {
+                mtpStatisticsJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(mtpDecoder.statistics))
+            } else { mtpStatisticsJSON = NSNull() }
+            let mtpCostSummaryJSON: Any
+            if let mtpCostSummary {
+                mtpCostSummaryJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(mtpCostSummary))
+            } else { mtpCostSummaryJSON = NSNull() }
             let phaseMetrics: [String: Any] = [
                 "prefill_target_seconds": prefillTargetSeconds,
                 "prefill_target_tokens_per_second": Double(tokens.count) / prefillTargetSeconds,
@@ -296,7 +310,8 @@ extension RunnerCLI {
                 "sampling": "greedy", "mtp_enabled": mtpDecoder != nil, "prefill_chunk": chunk,
                 "mtp_depth": mtpOrder[repetition], "mtp_verification": verification.rawValue,
                 "mtp_draft_history_limit": draftHistoryJSON,
-                "mtp_statistics": try mtpDecoder.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0.statistics)) } ?? NSNull(),
+                "mtp_statistics": mtpStatisticsJSON,
+                "mtp_cost_summary": mtpCostSummaryJSON,
                 "decode_mode": decodeMode.rawValue,
                 "gdn_gemv_mode": gemvOrder[repetition].rawValue,
                 "wired_memory": try JSONSerialization.jsonObject(with: JSONEncoder().encode(wiredReport)),

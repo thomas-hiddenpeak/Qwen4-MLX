@@ -20,6 +20,8 @@ Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配�
 
 [上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)已核对 vLLM、SGLang 与 Redis 作者的 DwarfStar 源码，按本机需求安排 GDN 载入实验、MTP 成本摘要、调度延迟、完整前缀状态与 SSD 缓存；计划中的候选尚不代表已支持。
 
+[MTP 请求成本摘要](docs/MTP_COST_SUMMARY.md)已接入 JSON 与库结果，区分实际输出、起草轮次和预算收尾；[调度延迟分析](docs/SCHEDULER_LATENCY_EXPERIMENT.md)可从原始 callback 时钟报告 p50/p95/max，并比较既有 decodeBurst 参数。它们补足统计，不改变生成策略和默认内核。
+
 ## 早期 Core ML / ANE 验证（2026-09-05）
 
 - 本机 macOS 26.6.2 / Swift 6.3.3：独立 Release 编译成功，36 项 XCTest 全部通过（[日志](results/moe-concurrency/swift-tests.log)）；另有 MoE 调度集成验证。
