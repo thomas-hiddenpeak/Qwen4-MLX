@@ -27,17 +27,19 @@
 
 | 顺序 | 工作 | 最小落点 | 进入下一步的依据 |
 | --- | --- | --- | --- |
-| 1A，正在实现 | MTP 请求成本摘要 | 在现有计数上导出实际 decode token/s、每轮产出、草稿浪费、计时时间覆盖；不增加同步 | 原始字段可手工复算，零 round、EOS、预算收尾正确；一组真实 AR/MTP 报告可直接比较 |
-| 1B，候选已编译 | GDN BF16 提前载入 | 仅 S1、K2560/N10240 QKV，原 lane/FMA/归约顺序；scalar 与 vector 两种 load | 四层真实权重逐位通过且命中指定 kernel；有局部收益再跑同 token 轨迹的整模型 decode |
-| 1C，正在补统计 | 输出间隔与调度实验 | 复用实际 callback 时间，导出 p50/p95/max、提交到终态耗时，开放既有 decodeBurst 参数 | 一个已开始 decode 请求与一个 11k prefill 交错；两边完整输出不变，等待改善且吞吐代价可接受 |
+| 1A，已实现并回归 | [MTP 请求成本摘要](MTP_COST_SUMMARY.md) | 既有计数导出实际 decode token/s、平均步骤产出、草稿浪费和计时覆盖；不增加同步 | 46项相关CPU检查、9轮11k及预算/EOS通过，原始字段可重算 |
+| 1B，本版未通过性能筛选 | [GDN BF16 提前载入](GDN_PREFETCH_EXPERIMENT.md) | 仅 S1、K2560/N10240 QKV，原 lane/FMA/归约顺序；scalar 与 vector 两种 load | 四层权重逐位与命中计数通过，但QKV约慢1%–2%，未进入整模型 |
+| 1C，已完成首轮 | [输出间隔与调度实验](SCHEDULER_LATENCY_EXPERIMENT.md) | 实际 callback p50/p95/max、提交到终态耗时、既有 decodeBurst 参数 | 同时提交11k与短请求后交错，各18项gate通过；burst4/8正序观察有漂移，默认未改，延迟到达场景另测 |
 | 2A | MTP depth 0/1/2 成本对照 | 先静态配置，不在线切换；高接受和低接受各一个真实任务 | 单独报告 prefill、decode 与服务等待；以实际输出/总 decode 时间判断，而非接受率 |
-| 2B，条件实验 | GDN ReplaySSM | 先统计逐位置 recurrent capture 的临时字节/时间，决定是否值得改 | 若值得，再只回放 recurrence，所有接受长度逐位状态一致；额外 dispatch 不抵消收益 |
-| 2C，下一内核候选 | shared/routed Metal 调度重叠 | 同一受 MLX 管理的 primitive 内明确资源依赖，先单层 | 完整 MoE 逐位通过、热测有收益后才进入整模型；仅开两个 Swift 队列不算实现 |
+| 2B，单层筛选已完成 | [GDN ReplaySSM](GDN_REPLAY_FEASIBILITY.md) | 复用现有小 recurrence，生产capture不变 | 720项逐位比较通过，S3加权单层约+2%–3.5%；尚不足以证明整模型收益，暂不替换生产路径 |
+| 2C，单层筛选未达门槛 | [shared/routed down 调度](MOE_BRANCH_OVERLAP_FEASIBILITY.md) | 合并两个down节点的输入hazard，再调用原primitive；MLX本来已用concurrent encoder | 三行逐位与编码计数通过，reference/fused约+3.04%/+4.16%，未达5%，pair未稳定胜过串行/原recipe，不进入整模 |
 | 3，依赖 MTP/生命周期稳定 | 不可变内存 checkpoint | 先有界精确系统提示词表、私有恢复，再加最长前缀索引 | 10k 公共前缀 + 不同后缀，A/B/A 无污染；节省的 prefill 大于保存/恢复成本 |
 | 4，依赖内存 checkpoint | SSD 状态缓存 | 有版本、身份与完整性校验的文件，独立磁盘额度，有界读写 | 冷盘恢复快于重算，损坏/中断写入正常回退，不拖慢 PLE 读取 |
 | 服务交付线 | HTTP/SSE、背压和断连 | 复用单推理执行器、现有取消/额度；网络线程处理有界输出 | 客户端慢读/断连不阻塞其他请求，终态只发一次、资源只释放一次；AR/MTP 分别验收 |
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
+
+当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)已完成，fit未阻止降速，进程分页和footprint未发现对应增长；下一步用原生GPU命令缓冲计时缩小发生位置，再继续发布性能结论。不能将一次较慢结果自动归因为训练或热降频。
 
 ## MTP 的统计与状态约束
 

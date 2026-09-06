@@ -15,16 +15,16 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新参考服务：PID3226，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/upstream-cost-latency-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新参考服务：PID5357，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/moe-down-pair-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
 ## 进行中的工作
 
-1. 研究vLLM/SGLang：分阶段调度、混合状态管理、MTP验证/回滚、前缀缓存、取消与背压，产物`docs/research/VLLM_SGLANG.md`。
-2. 核实Redis作者runner并读代码，产物`docs/research/REDIS_AUTHOR_RUNNER.md`。
-3. GDN decode qkv的载入流水实验：保持BF16逐标量累加和归约顺序，只改K块载入；独立构建，不替换原运行库。先测真实四层矩阵，再决定是否进入完整decode。
-4. 汇总为有依赖顺序的吸收计划，明确现在可做、需要改造和暂缓项；选择最小高价值项实施并回归。
+1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
+2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
+3. 下一GPU诊断是固定AR命令缓冲时长，区分逐轮漂移位置。最近驻留实验与VM采样均已结束。
+4. 独立CPU工作开始审查HTTP/SSE最小接入，优先有界输出、慢读/断连取消、终态生命周期；尚无HTTP服务。
 
 ## 接续记录
 
@@ -35,3 +35,7 @@
 - 05:38：调研提交`22d2f85`及 GDN 负结果提交`abe3a6e`已推送。MTP 成本摘要、调度 callback 分位数及 decodeBurst 参数已构建，46项 CPU 检查通过（含8项新成本测试）。当前唯一 GPU 控制器正在执行`results/upstream-cost-latency-v1/plan.json`，先9轮11k的0/1/2深度对照，再预算1/2/自然EOS，最后burst4/8混合请求；在该controller结束和恢复前不得启动另一个模型或重建二进制。运行ledger同目录，完成后其restoration将替代上一轮ledger。GDN agent正在写隔离Replay快筛，不执行GPU。
 
 - 05:51：上述controller全部完成，参考PID3226已恢复。9轮11k完整输出、预算1/2/自然EOS、所有成本字段通过；burst4/8各18项gate通过，短输出期间长prefill插入次数8→4，但最大gap仍约0.9s。明显持续降速使本次速度比较仅作观察，详见MTP_COST_SUMMARY.md和SCHEDULER_LATENCY_EXPERIMENT.md。下一步：正在构建GDN Replay单层快筛；随后固定AR做disabled/fit驻留+现有telemetry诊断，不能将本次漂移直接归因于SSD或训练。MoE双down primitive处于独立源码准备阶段，不得与主GPU实验并行执行。
+
+- 05:55：GDN Replay已通过30cases、720逐位比较、20边界，S3加权单层约+2.07%/3.52%，暂不进生产MTP。提交`98f7daf`正在推送。其恢复ledger为`results/gdn-replay-v1/run-ledger.json`（PID3782），当前又由唯一controller暂停用于`results/residency-drift-v1/plan.json`。该诊断在跑，禁止另一GPU任务/重建二进制；配套只读VM采样进程写`vm-stat.jsonl`并在controller恢复ready后自动退出（最多1200秒）。六轮顺序：D1暖、AR fit暖、AR disabled/fit/fit/disabled，全部500ms telemetry。完成后先分析分页/footprint与阶段漂移，再决定是否需要GPU命令缓冲诊断。MoE双down probe由vllm_sglang_research继续写独立native/Swift，暂未编译。
+
+- 06:10：驻留六轮已完成并独立复核，fit未消除漂移，进程内采样pageins为0且footprint稳定；VM时钟基准不匹配，保留整体数据、不作阶段归因，见RESIDENCY_DRIFT_DIAGNOSIS.md。MoE双down已构建并完成reference/fused两组：三行真实输入逐位及各87/87次原生调用通过，完整单层墙钟约+3.04%/+4.16%，未达5%门槛，pair不稳定胜过serial/recipe，不进入完整模型。服务已恢复PID5357，当前无GPU实验运行。

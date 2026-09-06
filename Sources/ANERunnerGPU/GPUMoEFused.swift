@@ -125,6 +125,27 @@ final class GPUMoEFused {
                             expertOutputs: diagnostics ? try MX.reshape(values[1], [1, 1, topK, hidden]) : nil)
     }
 
+    /// Experimental recipe only. The ordinary decode above stays unchanged.
+    /// Return the original single-output down primitive before its reshape so
+    /// the native pair can own its input dependencies and reuse its exact kernel.
+    func downPairRecipe(_ x: Tensor, indices: Tensor, scores: Tensor,
+                        gate: Projection, up: Projection, down: Projection) throws -> Tensor {
+        guard hidden == 2560, intermediate == 640, topK == 10,
+              x.shape == [1,1,2560], x.dtype == MLX_BFLOAT16,
+              indices.shape == [1,1,10], indices.dtype == MLX_UINT32,
+              scores.shape == [1,1,10], scores.dtype == MLX_BFLOAT16 else {
+            throw GPUError.invalid("Down-pair recipe requires the original S1 H2560/top10 affine-Q4 geometry")
+        }
+        let flatX = try MX.reshape(x, [hidden])
+        let flatIDs = try MX.cast(MX.reshape(indices, [topK]), MLX_UINT32)
+        let flatScores = try MX.reshape(scores, [topK])
+        let activation = try gateUp.apply([flatX, gate.weight, gate.scales, gate.biases,
+                                          up.weight, up.scales, up.biases, flatIDs,
+                                          sigmoidTable, hiddenScalar, intermediateScalar])[0]
+        return try downReduce.apply([activation, down.weight, down.scales, down.biases,
+                                     flatIDs, flatScores, intermediateScalar, hiddenScalar])[0]
+    }
+
     /// Two primary dispatches for S2...5 verification. Each (token, selected
     /// expert) retains the original S1 arithmetic; this adds scheduling width,
     /// not cross-token weight reuse. IDs must be valid router outputs in

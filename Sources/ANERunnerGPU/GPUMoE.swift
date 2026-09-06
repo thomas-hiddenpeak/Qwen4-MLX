@@ -542,4 +542,67 @@ public final class GPUMoE {
         }
         return GPUMoEOutput(y: y, diagnostics: values)
     }
+
+    /// Standalone layer probe only; no generation or prefill caller selects it.
+    /// A nil pair executor leaves the same two recipes in the normal lazy graph
+    /// for an additional control. Original forward() remains the main baseline.
+    public func probeDownPair(_ input: Tensor, executor: GPUMoEDownPairProbe?,
+                              serialControl: Bool = false, diagnostics: Bool = false) throws -> GPUMoEOutput {
+        guard input.shape == [1,1,2560], input.dtype == MLX_BFLOAT16,
+              hiddenSize == 2560, intermediateSize == 640, expertCount == 512,
+              topK == 10, groupSize == 64, bits == 4,
+              sharedDownTransposed.shape == [640,2560],
+              let fused, let routerFused, !serialControl || executor != nil else {
+            throw GPUMoEError.invalidConfiguration("Down-pair probe requires the fixed S1 MoE and a native executor for serial control")
+        }
+        let x = try MX.cast(input, MLX_BFLOAT16)
+        let logits = try MX.linear(x, routerTransposed, verification: nil)
+        let routing = try routerFused.route(logits)
+        let routedRecipe = try fused.downPairRecipe(x, indices: routing.indices, scores: routing.weights,
+            gate: .init(weight: gate.weight, scales: gate.scales, biases: gate.biases),
+            up: .init(weight: up.weight, scales: up.scales, biases: up.biases),
+            down: .init(weight: down.weight, scales: down.scales, biases: down.biases))
+        let sharedGateProjection = try MX.linear(x, sharedGateTransposed, verification: nil)
+        let sharedUpProjection = try MX.linear(x, sharedUpTransposed, verification: nil)
+        let sharedActivation = fuseSharedElementwise
+            ? try fused.sharedActivation(sharedGateProjection, up: sharedUpProjection)
+            : try swiglu(sharedGateProjection, sharedUpProjection)
+        // Two-dimensional same-dtype matmul creates the direct Matmul recipe;
+        // its transposed weight view selects the unchanged scalar GEMV path.
+        let sharedRecipe = try MX.matmul(MX.reshape(sharedActivation, [1,640]), sharedDownTransposed)
+        let routedDown: Tensor, sharedDown: Tensor
+        if let executor {
+            let pair = try executor.apply(routedRecipe: routedRecipe, sharedRecipe: sharedRecipe,
+                                          serialControl: serialControl)
+            routedDown = try MX.reshape(pair.routed, [1,1,2560])
+            sharedDown = try MX.reshape(pair.shared, [1,1,2560])
+        } else {
+            routedDown = try MX.reshape(routedRecipe, [1,1,2560])
+            sharedDown = try MX.reshape(sharedRecipe, [1,1,2560])
+        }
+        let sharedGateLogits = try MX.matmul(x, sharedRouterTransposed)
+        let y: Tensor, sharedGate: Tensor?, sharedGated: Tensor?
+        if fuseSharedElementwise {
+            let tail = try fused.sharedOutput(routed: routedDown, down: sharedDown,
+                                              gateLogits: sharedGateLogits, diagnostics: diagnostics)
+            y = tail.y; sharedGate = tail.gate; sharedGated = tail.gated
+        } else {
+            let gate = try MX.sigmoid(sharedGateLogits)
+            let gated = try MX.mul(sharedDown, gate)
+            y = try MX.add(routedDown, gated); sharedGate = gate; sharedGated = gated
+        }
+        var values: [String: Tensor] = [:]
+        if diagnostics {
+            guard let sharedGate, let sharedGated else {
+                throw GPUError.invalid("Down-pair probe is missing shared diagnostics")
+            }
+            values = ["x": x, "router_logits": logits, "selected_experts": routing.indices,
+                      "routing_weights": routing.weights, "routed_sum": routedDown,
+                      "shared_gate_projection": sharedGateProjection, "shared_up_projection": sharedUpProjection,
+                      "shared_activation": sharedActivation, "shared_down": sharedDown,
+                      "shared_gate_logits": sharedGateLogits, "shared_gate": sharedGate,
+                      "shared_gated": sharedGated, "output": y]
+        }
+        return GPUMoEOutput(y: y, diagnostics: values)
+    }
 }
