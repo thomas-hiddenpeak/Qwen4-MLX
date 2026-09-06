@@ -13,9 +13,11 @@
 
 ## 当前状态
 
-已推送`9a60fbd`到`codex/moe-composition`。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
+已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-初始参考服务：PID97647，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/moe-prefill-composed-boundaries-v1/run-ledger.json`。PID只作为本次起点；执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新参考服务：PID921，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/gdn-prefetch-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+
+本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
 ## 进行中的工作
 
@@ -27,3 +29,5 @@
 ## 接续记录
 
 - 05:20左右：分派三路研究/实现；参考服务保持运行；GDN agent只允许独立编译，尚未获得GPU运行权。
+- 05:31：三份上游固定版本已核对，两个调研文档和[综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)完成。开始请求级 MTP 成本摘要和调度输出延迟统计，不改变在线策略。
+- 05:31：GDN prefetch4 / prefetch4Vector 独立库编译成功；四层真实权重、确定性 BF16 输入的小门槛全部逐位通过，指定 QKV dispatch 计数正确。QKV 中位墙钟 0.2480 / 0.2510 / 0.2531 ms，两个候选没有收益（-1.17% / -1.98%）；不进入本版本整模型测速，不更改默认。其他矩阵未命中新 kernel，其时差只作为测量波动。原始数据见`results/gdn-prefetch-v1/matvec.json`、`summary.json`；服务已恢复。

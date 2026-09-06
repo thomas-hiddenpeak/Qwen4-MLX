@@ -19,7 +19,7 @@ GPU 后端和完整 48 层文本生成已落地，入口为 `generate-gpu`；具
 
 prefill 与 decode 使用同一数学语义，但选择不同内核和分块。已有 GDN/attention 连续状态、QSA 阈值及 reset 对照，并已运行完整输出 head 和生成；局部 fixture 的覆盖范围、整模型短请求对照和真实长文档验证分别记录。
 
-## 第一轮固定条件
+## 第一轮固定条件（历史基线）
 
 - 单请求、单序列、普通单 token decode；MTP、drafter、PLD 和前缀缓存关闭。
 - 同一原始 Q4/group64 权重、相同采样设置、实际 token 输入与上下文；prefill、稳定 decode、首次载入分别记录。
@@ -50,4 +50,4 @@ MoE/block 后端、原始 Q4 路径、完整路由、载荷账本和时间窗口
 
 降低冗余流量、提高缓存复用可能让物理GB/s下降，同时让推理变快；这属于有效优化。因此同时报告耗时、有效载荷和实际流量，不以“DRAM读得越满越好”代替整模型性能。
 
-MTP 以后单独评估，用于基础执行路径优化完成后的进一步收益，不参与本轮验收。
+上述第一轮以 AR 建立基线；现在 MTP 已进入独立开发与验收，不能继续将“MTP 暂缓”作为当前限制。现有本机 cooperative PD、MTP 状态及长输入回归分别以 [PD 说明](docs/PREFILL_DECODE_SEPARATION.md)、[MTP 发布条件](docs/MTP_RELEASE_CRITERIA.md)和各实验记录为准。2026-09-07 新增的 [上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)给出后续实施顺序：GDN 载入实验、MTP 完整成本与输出延迟、完整状态前缀复用及 SSD 缓存。

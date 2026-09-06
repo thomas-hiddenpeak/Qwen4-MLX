@@ -18,6 +18,8 @@ Agent 长提示基准已加入 [11k system/user 输入](fixtures/gpu-agent-11k/p
 
 Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配置显式使用；后续[叠加路由归约的对照](docs/MOE_PREFILL_COMPOSITION.md)在单层微测有额外收益，但本轮11k整模型prefill基本持平，因此组合保持实验选项。两个阶段分别计时，MTP默认关闭。
 
+[上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)已核对 vLLM、SGLang 与 Redis 作者的 DwarfStar 源码，按本机需求安排 GDN 载入实验、MTP 成本摘要、调度延迟、完整前缀状态与 SSD 缓存；计划中的候选尚不代表已支持。
+
 ## 早期 Core ML / ANE 验证（2026-09-05）
 
 - 本机 macOS 26.6.2 / Swift 6.3.3：独立 Release 编译成功，36 项 XCTest 全部通过（[日志](results/moe-concurrency/swift-tests.log)）；另有 MoE 调度集成验证。
