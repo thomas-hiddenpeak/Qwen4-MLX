@@ -31,6 +31,8 @@
 
 ## 接续记录
 
+下一次接续先跟进窗口A controller13960/session33813和ledger，不启动第二个模型或重建。完成后分析全部预定case，保留漂移/失败组；确认参考恢复，再按MTP_RELEASE_WINDOWS.md单独冻结窗口B：只反转六case，各case仍part1/part2，所有报告/telemetry路径改B，golden及完整91文件identity保持一致。B结束前推理源码、分析器、controller/helper均冻结。后续PD公平性与AR checkpoint的排序见[限定调度研究](research/LOCAL_SCHEDULER_NEXT.md)，缓存前置条件不变。
+
 - 05:20左右：分派三路研究/实现；参考服务保持运行；GDN agent只允许独立编译，尚未获得GPU运行权。
 - 05:31：三份上游固定版本已核对，两个调研文档和[综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)完成。开始请求级 MTP 成本摘要和调度输出延迟统计，不改变在线策略。
 - 05:31：GDN prefetch4 / prefetch4Vector 独立库编译成功；四层真实权重、确定性 BF16 输入的小门槛全部逐位通过，指定 QKV dispatch 计数正确。QKV 中位墙钟 0.2480 / 0.2510 / 0.2531 ms，两个候选没有收益（-1.17% / -1.98%）；不进入本版本整模型测速，不更改默认。其他矩阵未命中新 kernel，其时差只作为测量波动。原始数据见`results/gdn-prefetch-v1/matvec.json`、`summary.json`；服务已恢复。
@@ -54,3 +56,5 @@
 - 07:41：root完成窗口A冻结（UTC2026-09-06 23:41:14）与91文件preflight，启动唯一controller PID13960，exec session33813。`results/mtp-release-window-a/plan.json`保存分析合同，SHA256为`9c56790c0d6dfe0d09fc8459d725d65ad3691e069353d6619e5f90a02f37f2a6`；`controller-plan.json`保存平铺执行计划。共12进程96请求、每case三组、全窗口18组，gdn agent已独立只读核对参数与路径。预估约50分钟；参考13611由controller接管，后续恢复PID以新ledger为准。当前禁止并行GPU、修改被冻结源码/controller/helper或重建二进制。
 
 - 07:44:49：窗口A首进程10轮完整输出ID通过。root独立手算前两测量组：G1 AR30.4056/MTP35.4031 tokens/s，倍率1.16436，AR漂移2.4416%，该组通过；G2 AR27.9262/MTP35.8636，倍率1.28423，AR漂移12.3403%，按冻结门槛应为无法判定。保留该组，不重划或补换；这是首进程局部观察，不能作为整窗或发布结论。
+
+- 07:50：控制器收尾提交`84a7436`已推送并核对远程SHA。窗口A的original128两进程共16轮完整IDs/阶段合同通过；三组比值1.1644/1.2842/1.2815，AR漂移2.4416%/12.3403%/0.4213%，第二组仍为indeterminate。增量分析保存在`results/mtp-release-window-a/partial-after-original128.json`；窗口未完成时其全窗口all_correct=false包含缺失报告，不能误读为已完成请求错误。controller已进入tools128part1，继续按原计划保留所有组。新增调度优先级文档，仅研究与两个后续实验设计，没有实现跨请求batch或prefix cache。
