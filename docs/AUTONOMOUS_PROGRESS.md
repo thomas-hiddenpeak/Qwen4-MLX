@@ -15,7 +15,7 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新参考服务：PID11001，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/http-service-edges-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新参考服务：PID12832，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/http-service-soak-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -24,7 +24,8 @@
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
 3. 固定AR命令缓冲诊断及GPU档位/系统热压力采样已完成。两个独立长任务的24轮AR/MTP回归通过；初轮性能单窗口且一组AR漂移超5%，尚未通过MTP稳定性能发布门槛。
-4. loopback实验HTTP服务通过29项CPU、首轮19项live及补充15项网络边界。当前唯一GPU实验是`results/http-service-soak-v1/plan.json`，controller exec session2249、实验服务PID11935，固定12周期；参考PID11001已由controller暂停，须等待其finally恢复，禁止重建/另起模型。利用这段时间完成了[两窗口分析计划](MTP_RELEASE_WINDOWS.md)的CPU审阅，soak后才冻结并运行窗口A；真实send期限/输出overflow等未覆盖项仍单列。
+4. loopback实验HTTP服务通过29项CPU、首轮19项live、补充15项网络边界及固定12周期的46项短soak检查。controller2249已退出，参考12832 ready，无GPU实验在跑。[两窗口分析计划](MTP_RELEASE_WINDOWS.md)及分析器已完成CPU审阅并推送`c30b699`，尚未启动窗口A。
+5. 下一步先补控制器的安全中断：当前5秒仅kill wrapper可能早于HTTP子进程30+10秒清理，且controller默认SIGTERM未转finally。redis_runner_research准备自有process group清理与stop flag安全点；root用CPU-only case做一次真实controller中断/恢复smoke，再将该新ledger用于正式冻结窗口A。不要直接执行嵌套分析plan；须另生成12case扁平controller-plan。生产Swift二进制维持f95565c，未经窗口结束不得重建。
 
 ## 接续记录
 

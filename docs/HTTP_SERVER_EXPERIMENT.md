@@ -86,6 +86,33 @@ SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等�
 
 原始记录在 `results/http-service-edges-v1/edges.json`、`edges.server.log` 与 `run-ledger.json`。报告保留了取消请求原文、观察到的完整 SSE 帧、唯一请求 ID、匹配日志及清理后的计数；脚本与 runner 的 SHA-256 均已独立核对。该轮没有交错重复或冷热控制，不从短请求的耗时推断性能收益。
 
+### 固定 12 轮短时持续回归
+
+同日 `scripts/test_http_server_soak.py` 完成预先固定的 **12 轮、46 项检查，全部通过**；总脚本时间 808.770 秒（约 13 分 29 秒，含加载、基线和退出），未重试或因中途结果调整轮数。仍使用同一服务二进制、4 连接上限和 8192 字节输出额度。脚本设置 1150 秒工作期限，为自有服务的有界清理预留时间，总预算 1200 秒。
+
+每轮用冻结的 11216-token tools prompt、MTP2、128-token 输出预算，读到至少两条非空 SSE content 后 RST。随后同 prompt、同预算的新 MTP SSE 请求必须与初始基线的文本、实际 usage、stop 原因全部一致，并穿插短中文请求；第 3、6、9、12 轮再运行完整 AR 对照。初始 MTP、AR 基线均独立匹配冻结结果：自然输出 85 token 后 EOS。HTTP 不暴露 token IDs，以上一致性仍限于文本、计数和结束原因。
+
+| 短测证据 | 实际结果 |
+| --- | --- |
+| 生成请求及终态 | 日志逐条对应 **31 个自然 EOS 完成、12 个主动取消**的生成请求，合计 43 个；health 请求另计。12 个取消 ID 互不重复，每个 ID 都唯一匹配 `terminal=cancelled stage=decode`。 |
+| 取消后的恢复 | 12 份新 MTP、12 份短请求和 4 份追加完整 AR 对照均与各自基线一致；每轮取消后及轮末的 idle 记录中，active、jobs、prefill/ready 队列、pending、resident 和 reserved token 计数全部为零。 |
+| 取消到首次 idle 观测 | 最小 / 中位 / 最大值为 **0.104675 / 0.108646 / 0.114811 秒**；这是 RST 到 health 确认的观察值，受约 100 ms 轮询粒度影响，不是 kernel 内部中断耗时或取消延迟上限。 |
+| 服务退出与参考恢复 | 自有服务 SIGTERM 后以 0 退出，未强制 kill；外层 controller 同样以 0 结束，ledger 确认参考服务恢复 ready。 |
+
+仅在空闲基线和第 3、6、9、12 轮末，读取**同一个自有服务进程**的外部 RSS 与数字文件描述符计数：
+
+| 已完成轮数 | RSS（KiB，`ps rss`） | 数字 FD 数（`lsof`） |
+| --- | ---: | ---: |
+| 0（基线） | 30056336 | 11 |
+| 3 | 30057408 | 11 |
+| 6 | 30057536 | 11 |
+| 9 | 30057744 | 11 |
+| 12 | 30057888 | 11 |
+
+RSS 末值比基线增加 **1552 KiB，约 1.516 MiB**；五次数字 FD 计数均为 11。`lsof` 不把 cwd、txt 或内存映射条目算成数字 FD。这些是五次外部进程采样，**不是 MLX active memory 或 macOS physical footprint，也不能证明没有泄漏或已稳定运行 8 小时**。
+
+原始记录在 `results/http-service-soak-v1/soak.json`、`soak.server.log` 与 `run-ledger.json`，包含每轮完整结果、取消前的 SSE 帧、唯一请求 ID、匹配日志、恢复观察时间及空闲计数。脚本、复用的 edge helper、runner、冻结对照的 SHA-256，以及实际 fixture 文本均已独立核对。这一轮的结论限于固定 12 轮短时持续回归。
+
 仍需分开补齐以下边界，不能由上述通过结果外推：
 
 - MTP verify / replay 内部的精确取消位置尚未覆盖；已有证据限于 decode 阶段观察到内容后的网络断连、取消及后续恢复。
