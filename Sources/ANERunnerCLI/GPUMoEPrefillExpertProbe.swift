@@ -4,7 +4,12 @@ import Foundation
 
 extension RunnerCLI {
     static func probeGPUMoEPrefillExpert(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--manifest", "--output", "--config-output"])
+        try args.validate(["--model-dir", "--manifest", "--output", "--config-output", "--suite"])
+        let suite = args["--suite"] ?? "expert"
+        guard ["expert", "composition"].contains(suite) else {
+            throw CLIError.usage("Expert probe --suite requires expert or composition")
+        }
+        let isComposition = suite == "composition"
         let output = URL(fileURLWithPath: try args.require("--output")).standardizedFileURL.resolvingSymlinksInPath()
         let configOutput = URL(fileURLWithPath: try args.require("--config-output")).standardizedFileURL.resolvingSymlinksInPath()
         guard output != configOutput, !FileManager.default.fileExists(atPath: output.path),
@@ -15,7 +20,8 @@ extension RunnerCLI {
             let id: String
             let variant: Int?
             let groupedDown: Bool
-            func expected(_ calls: UInt64) -> (gate: [UInt64], grouped: [UInt64]) {
+            var reductionThreadgroup: Int? = nil
+            func expected(_ calls: UInt64) -> (gate: [UInt64], grouped: [UInt64], reduction: UInt64) {
                 var gate = [UInt64](repeating: 0, count: 4), grouped = gate
                 if let variant {
                     gate[variant] = calls
@@ -24,11 +30,15 @@ extension RunnerCLI {
                         if groupedDown { grouped[variant] = calls }
                     }
                 }
-                return (gate, grouped)
+                return (gate, grouped, reductionThreadgroup == nil ? 0 : calls)
             }
         }
-        let referenceMode = Mode(id: "reference", variant: nil, groupedDown: false)
-        let modes = [Mode(id: "prior1", variant: 1, groupedDown: false),
+        let referenceMode = isComposition
+            ? Mode(id: "expert32_down", variant: 2, groupedDown: true)
+            : Mode(id: "reference", variant: nil, groupedDown: false)
+        let modes = isComposition ? [128, 256, 512].map { (threads: Int) in
+            Mode(id: "expert32_down_reduce\(threads)", variant: 2, groupedDown: true, reductionThreadgroup: threads)
+        } : [Mode(id: "prior1", variant: 1, groupedDown: false),
             Mode(id: "expert32", variant: 2, groupedDown: false),
             Mode(id: "expert16", variant: 3, groupedDown: false),
             Mode(id: "expert32_down", variant: 2, groupedDown: true),
@@ -37,19 +47,28 @@ extension RunnerCLI {
         let base = try MoEGateUpProbeSupport.baseMLX()
         let plugin = try GPUMoEPrefillGateUp(variant: 0)
         let pluginHash = try MoETilingBytes.hash(URL(fileURLWithPath: plugin.libraryPath))
-        func counters() throws -> (gate: [UInt64], grouped: [UInt64]) {
+        // Successful calls supplied with a reduction selection, counted by this
+        // probe. This is host construction evidence, not a native dispatch count.
+        var reductionForwardCalls: UInt64 = 0
+        typealias Counts = (gate: [UInt64], grouped: [UInt64], reduction: UInt64)
+        func counters() throws -> Counts {
             let gate = plugin.dispatchCounts(), grouped = plugin.groupedDispatchCounts()
             guard gate.count == 4, grouped.count == 4 else { throw CLIError.usage("Expert plugin requires four gate and four grouped counters") }
-            return (gate, grouped)
+            return (gate, grouped, reductionForwardCalls)
         }
-        func delta(_ before: (gate: [UInt64], grouped: [UInt64])) throws -> (gate: [UInt64], grouped: [UInt64]) {
+        func delta(_ before: Counts) throws -> Counts {
             let after = try counters()
+            guard after.reduction >= before.reduction else { throw CLIError.usage("Reduction forward counter decreased") }
             return (try MoEGateUpProbeSupport.delta(after.gate, before.gate),
-                    try MoEGateUpProbeSupport.delta(after.grouped, before.grouped))
+                    try MoEGateUpProbeSupport.delta(after.grouped, before.grouped), after.reduction - before.reduction)
         }
-        func verify(_ actual: (gate: [UInt64], grouped: [UInt64]), _ mode: Mode, calls: UInt64) throws {
-            let expected = mode.expected(calls)
-            guard actual.gate == expected.gate, actual.grouped == expected.grouped else {
+        func verify(_ actual: Counts, _ mode: Mode, calls: UInt64, referenceCalls: UInt64 = 0) throws {
+            let candidate = mode.expected(calls), reference = referenceMode.expected(referenceCalls)
+            let expected: Counts = (zip(candidate.gate, reference.gate).map { $0.0 + $0.1 },
+                                    zip(candidate.grouped, reference.grouped).map { $0.0 + $0.1 },
+                                    candidate.reduction + reference.reduction)
+            guard actual.gate == expected.gate, actual.grouped == expected.grouped,
+                  actual.reduction == expected.reduction else {
                 throw CLIError.usage("Expert dispatch counts differ for \(mode.id)")
             }
         }
@@ -75,23 +94,32 @@ extension RunnerCLI {
         var cases = [[String: Any]](), rejected = Set<String>()
         var totals = [String: (reference: Double, candidate: Double, count: Int)]()
         var report: [String: Any] = [
-            "schema": "qwen38-prefill-expert-probe-v1", "complete": false, "passed": false,
+            "schema": isComposition ? "qwen38-prefill-expert-composition-probe-v1" : "qwen38-prefill-expert-probe-v1",
+            "suite": suite, "baseline_mode": referenceMode.id,
+            "comparison": isComposition ? "Direct incremental comparison against expert32 gate/up plus grouped down with original reduction" : "Each candidate against the original complete MoE chain",
+            "complete": false, "passed": false,
             "manifest": manifestURL.path, "manifest_sha256": MoETilingBytes.digest(manifestData),
             "model_directory": modelURL.path, "base_mlx": base,
             "gateup_plugin_path": plugin.libraryPath, "gateup_plugin_sha256": pluginHash,
             "executable_sha256": try MoETilingBytes.hash(URL(fileURLWithPath: CommandLine.arguments[0])),
-            "modes": ([referenceMode] + modes).map { ["id": $0.id, "variant": $0.variant.map { $0 as Any } ?? NSNull(), "grouped_down": $0.groupedDown] as [String: Any] },
+            "modes": ([referenceMode] + modes).map { ["id": $0.id, "variant": $0.variant.map { $0 as Any } ?? NSNull(), "grouped_down": $0.groupedDown,
+                "reduction_threadgroup": $0.reductionThreadgroup.map { $0 as Any } ?? NSNull()] as [String: Any] },
             "grouped_counter_order": ["plan32", "plan16", "down32", "down16"],
-            "reduction_threadgroup": NSNull(), "minimum_micro_speedup_percent": 2.0,
+            "reduction_threadgroup_scope": isComposition ? "per-mode" : "disabled", "minimum_micro_speedup_percent": 2.0,
             "warmups_per_mode": 3, "timed_samples_per_mode": 8, "timed_order": "ABBA repeated four times per candidate",
             "notes": [
-                "Each candidate is independently paired with the original complete MoE chain. Nine real S416 inputs determine selection; derived S205/S240 prefixes only check correctness.",
+                isComposition ? "Each candidate is directly paired with expert32 gate/up plus grouped down using the original reduction. Nine real S416 inputs determine selection; derived S205/S240 prefixes only check correctness."
+                    : "Each candidate is independently paired with the original complete MoE chain. Nine real S416 inputs determine selection; derived S205/S240 prefixes only check correctness.",
                 "Ten finite, bitwise comparisons include activation, expert outputs, complete output, and diagnostic/plain cross-checks. Consumed activation diagnostics are compared in the same sorted assignment order.",
-                "Timing builds a fresh complete MoE graph and evaluates y; diagnostics, host readback, loading and warmup are excluded. Original reduction and stock MLX stay active.",
-                "Relative-to-prior1 values compare separately measured reference-normalized ratios. They are indirect, not a direct paired prior1-versus-grouped benchmark.",
+                isComposition ? "Timing builds a fresh complete MoE graph and evaluates y; diagnostics, host readback, loading and warmup are excluded. Only candidate inverse-gather/product/top10 reduction varies; the stock MLX base and grouped matrix plugin stay identical."
+                    : "Timing builds a fresh complete MoE graph and evaluates y; diagnostics, host readback, loading and warmup are excluded. Original reduction and stock MLX stay active.",
+                isComposition ? "speedup_percent is the direct incremental throughput change over expert32_down, not the total gain over stock MoE. No prior1 normalization is computed."
+                    : "Relative-to-prior1 values compare separately measured reference-normalized ratios. They are indirect, not a direct paired prior1-versus-grouped benchmark.",
                 "Counters establish encoded plan/gate/down dispatches, not physical reads or bandwidth. Complete/passed means the bounded search finished without fatal error; rejected_modes and candidate_correctness_passed separately describe candidates.",
-                "Reference may win. The saved configuration requires full 11k producer/consumer PD validation before use."
+                "host_reduction_selected_forward_calls counts successful probe forwards supplied with a reduction argument; it is not a native reduction dispatch counter. Native timed counters include both A and B calls.",
+                "The suite baseline may win. The saved configuration requires full 11k producer/consumer PD validation before use."
             ]]
+        if !isComposition { report["reduction_threadgroup"] = NSNull() }
         func save() throws {
             report["cases"] = cases; report["rejected_modes"] = rejected.sorted()
             try emit(report, to: output.path)
@@ -120,18 +148,23 @@ extension RunnerCLI {
                             "derived": length != 416, "fixture": fixture.file]
                         var trials = [[String: Any]]()
                         func forward(_ mode: Mode, diagnostics: Bool) throws -> GPUMoEOutput {
-                            let result = try moe.forward(x, diagnostics: diagnostics, prefillReductionThreadgroup: nil,
+                            let result = try moe.forward(x, diagnostics: diagnostics, prefillReductionThreadgroup: mode.reductionThreadgroup,
                                 prefillGateUpVariant: mode.variant, groupedDown: mode.groupedDown)
+                            if mode.reductionThreadgroup != nil { reductionForwardCalls += 1 }
                             try MX.eval([result.y] + Array(result.diagnostics.values))
                             return result
                         }
                         let referenceBefore = try counters()
                         let reference = try forward(referenceMode, diagnostics: true)
                         let referencePlain = try forward(referenceMode, diagnostics: false)
-                        try verify(delta(referenceBefore), referenceMode, calls: 2)
+                        let referenceDelta = try delta(referenceBefore)
+                        try verify(referenceDelta, referenceMode, calls: 2)
                         let referenceCrossCheck = try MoETilingBytes.compare(reference.y, referencePlain.y)
                         guard referenceCrossCheck["exact"] as? Bool == true else { throw CLIError.usage("Reference diagnostic/plain differs") }
                         item["reference_diagnostic_plain"] = referenceCrossCheck
+                        item["reference_diagnostic_dispatch_delta"] = referenceDelta.gate
+                        item["reference_diagnostic_grouped_dispatch_delta"] = referenceDelta.grouped
+                        item["reference_host_reduction_selected_forward_calls"] = referenceDelta.reduction
                         for mode in modes {
                             FileHandle.standardError.write(Data("Expert probe: L\(layer) P\(fixture.offset) S\(length) \(mode.id)\n".utf8))
                             let before = try counters()
@@ -153,31 +186,38 @@ extension RunnerCLI {
                                 comparisons[name] = comparison; exact = exact && (comparison["exact"] as? Bool == true)
                             }
                             var trial: [String: Any] = ["mode": mode.id, "variant": mode.variant!, "grouped_down": mode.groupedDown,
+                                "reduction_threadgroup": mode.reductionThreadgroup.map { $0 as Any } ?? NSNull(),
+                                "baseline_mode": referenceMode.id,
                                 "exact": exact, "comparisons": comparisons, "diagnostic_dispatch_delta": dispatchDelta.gate,
-                                "diagnostic_grouped_dispatch_delta": dispatchDelta.grouped]
+                                "diagnostic_grouped_dispatch_delta": dispatchDelta.grouped,
+                                "diagnostic_host_reduction_selected_forward_calls": dispatchDelta.reduction]
                             if !exact { rejected.insert(mode.id) }
                             if rejected.contains(mode.id) { trials.append(trial); continue }
+                            let warmupBefore = try counters()
                             for _ in 0..<3 { _ = try forward(referenceMode, diagnostics: false); _ = try forward(mode, diagnostics: false) }
+                            try verify(delta(warmupBefore), mode, calls: 3, referenceCalls: 3)
                             var a = 0.0, b = 0.0, samples = [[String: Any]]()
                             let timedBefore = try counters()
                             for _ in 0..<4 {
                                 for useCandidate in [false, true, true, false] {
                                     let selected = useCandidate ? mode : referenceMode
                                     let start = DispatchTime.now().uptimeNanoseconds
-                                    let y = try moe.forward(x, prefillReductionThreadgroup: nil,
+                                    let y = try moe.forward(x, prefillReductionThreadgroup: selected.reductionThreadgroup,
                                         prefillGateUpVariant: selected.variant, groupedDown: selected.groupedDown).y
                                     try y.eval()
                                     let ms = Double(DispatchTime.now().uptimeNanoseconds - start) * 1e-6
+                                    if selected.reductionThreadgroup != nil { reductionForwardCalls += 1 }
                                     guard ms.isFinite, ms > 0 else { throw CLIError.usage("Invalid expert timing") }
                                     if useCandidate { b += ms } else { a += ms }
                                     samples.append(["candidate": useCandidate, "milliseconds": ms])
                                 }
                             }
                             let timedDelta = try delta(timedBefore)
-                            try verify(timedDelta, mode, calls: 8)
+                            try verify(timedDelta, mode, calls: 8, referenceCalls: 8)
                             trial["samples"] = samples; trial["baseline_mean_ms"] = a / 8; trial["candidate_mean_ms"] = b / 8
                             trial["speedup_percent"] = (a / b - 1) * 100
                             trial["timed_dispatch_delta"] = timedDelta.gate; trial["timed_grouped_dispatch_delta"] = timedDelta.grouped
+                            trial["timed_host_reduction_selected_forward_calls"] = timedDelta.reduction
                             if length == 416 {
                                 let old = totals[mode.id] ?? (0,0,0)
                                 totals[mode.id] = (old.reference + a / 8, old.candidate + b / 8, old.count + 1)
@@ -195,20 +235,32 @@ extension RunnerCLI {
                     return a == b ? $0.id < $1.id : a > b
                 }
             let winner = ranking.first.flatMap { totals[$0.id]!.reference / totals[$0.id]!.candidate >= 1.02 ? $0 : nil }
-            let config = GPUMoEPrefillConfiguration(threadgroups: [:], gateUpVariant: winner?.variant,
-                groupedDown: winner?.groupedDown == true ? true : nil)
+            let selected = winner ?? referenceMode
+            let threads = selected.reductionThreadgroup
+            let config = GPUMoEPrefillConfiguration(threadgroups: threads.map { [205: $0, 240: $0, 416: $0] } ?? [:],
+                gateUpVariant: selected.variant, groupedDown: selected.groupedDown ? true : nil)
             try config.validated()
-            let prior = !rejected.contains("prior1") && totals["prior1"]?.count == 9 ? totals["prior1"] : nil
+            let prior = !isComposition && !rejected.contains("prior1") && totals["prior1"]?.count == 9 ? totals["prior1"] : nil
             report["ranking"] = ranking.map { mode -> [String: Any] in
                 let total = totals[mode.id]!, ratio = total.reference / total.candidate
-                return ["mode": mode.id, "variant": mode.variant!, "grouped_down": mode.groupedDown,
-                    "baseline_sum_ms": total.reference, "candidate_sum_ms": total.candidate, "speedup_percent": (ratio - 1) * 100,
-                    "indirect_normalized_gain_vs_prior1_percent": prior.map { ((ratio / ($0.reference / $0.candidate) - 1) * 100) as Any } ?? NSNull()]
+                var row: [String: Any] = ["mode": mode.id, "variant": mode.variant!, "grouped_down": mode.groupedDown,
+                    "reduction_threadgroup": mode.reductionThreadgroup.map { $0 as Any } ?? NSNull(),
+                    "baseline_mode": referenceMode.id,
+                    "baseline_sum_ms": total.reference, "candidate_sum_ms": total.candidate, "speedup_percent": (ratio - 1) * 100]
+                if !isComposition {
+                    row["indirect_normalized_gain_vs_prior1_percent"] = prior.map { ((ratio / ($0.reference / $0.candidate) - 1) * 100) as Any } ?? NSNull()
+                }
+                return row
             }
-            report["selected_mode"] = winner?.id ?? "reference"
-            report["selected_variant"] = (winner?.variant).map { $0 as Any } ?? NSNull()
-            report["selected_grouped_down"] = winner?.groupedDown ?? false
-            report["selected_reference"] = winner == nil
+            report["selected_mode"] = selected.id
+            report["selected_variant"] = selected.variant.map { $0 as Any } ?? NSNull()
+            report["selected_grouped_down"] = selected.groupedDown
+            report["selected_reduction_threadgroup"] = threads.map { $0 as Any } ?? NSNull()
+            report["selected_baseline"] = winner == nil
+            // In the composition suite the baseline is an existing optimization,
+            // so retaining it is distinct from reverting to stock MoE.
+            report["selected_stock_reference"] = selected.variant == nil && selected.reductionThreadgroup == nil
+            report["selected_reference"] = selected.variant == nil && selected.reductionThreadgroup == nil
             report["complete"] = cases.count == 11; report["passed"] = cases.count == 11
             report["candidate_correctness_passed"] = rejected.isEmpty && cases.count == 11
             report["config_output"] = configOutput.path; try save()
@@ -216,6 +268,8 @@ extension RunnerCLI {
             saved["gateup_plugin_path"] = plugin.libraryPath; saved["gateup_plugin_sha256"] = pluginHash
             saved["base_mlx_sha256"] = base["loaded_sha256"]!; saved["base_mlx_path"] = base["loaded_path"]!
             saved["expert_report"] = output.path; saved["expert_report_sha256"] = try MoETilingBytes.hash(output)
+            saved["expert_suite"] = suite; saved["comparison_baseline"] = referenceMode.id
+            saved["selected_mode"] = selected.id
             saved["model_directory"] = modelURL.path; saved["device_target"] = "Apple M5 Max"
             saved["status"] = "micro_selected_requires_full_pd_validation"
             try emit(saved, to: configOutput.path)

@@ -327,12 +327,12 @@ struct RunnerCLI {
     probe-gpu-model --model-dir PATH --tokens-file PATH --capture-output PATH [--layers 1] [--output report.json]
         Capture real hidden states from the first few GPU layers for numerical validation.
     probe-gpu-prefill-attention --model-dir PATH --tokens-file PATH --output NEW_REPORT_JSON --golden-report PATH [--order reference,fusedQSA] [--max-tokens 128] [--mtp-depth 0|2]
-    probe-gpu-hotspots --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_REPORT_JSON [--max-tokens 128] [--detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert] [--moe-config PATH] [--ab-order ABBA|BAAB]
+    probe-gpu-hotspots --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_REPORT_JSON [--max-tokens 128] [--detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert|moe-composed] [--moe-config PATH] [--baseline-moe-config PATH] [--ab-order ABBA|BAAB]
     capture-gpu-moe-prefill --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_MANIFEST_JSON --fixture-dir NEW_DIRECTORY
     probe-gpu-moe-prefill-tiling --model-dir PATH --manifest PATH --output NEW_REPORT_JSON
     autotune-gpu-moe-prefill --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON
     probe-gpu-moe-prefill-gateup --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON
-    probe-gpu-moe-prefill-expert --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON
+    probe-gpu-moe-prefill-expert --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON [--suite expert|composition]
 
     probe-gpu-moe --model-dir PATH --fixture PATH [--output report.json]
     probe-gpu-moe-verification --model-dir PATH --output NEW_REPORT_JSON [--layer 0] [--warmups 3] [--runs 12]

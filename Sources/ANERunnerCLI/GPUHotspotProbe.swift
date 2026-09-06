@@ -7,21 +7,25 @@ extension RunnerCLI {
     /// Stage diagnostics and the optional unrecorded tiling A/B are distinct
     /// modes; both use real producer/consumer handoff on one loaded model.
     static func probeGPUHotspots(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--tokens-file", "--golden-report", "--output", "--max-tokens", "--detail", "--moe-config", "--ab-order"])
+        try args.validate(["--model-dir", "--tokens-file", "--golden-report", "--output", "--max-tokens", "--detail", "--moe-config", "--baseline-moe-config", "--ab-order"])
         let output = try args.require("--output")
         let detail = args["--detail"] ?? "attention"
         guard !FileManager.default.fileExists(atPath: output),
-              ["attention", "moe", "tiling", "moe-fusion", "moe-gateup", "moe-expert"].contains(detail),
+              ["attention", "moe", "tiling", "moe-fusion", "moe-gateup", "moe-expert", "moe-composed"].contains(detail),
               let maximum = Int(args["--max-tokens"] ?? "128"), (1...256).contains(maximum) else {
-            throw CLIError.usage("Hotspot probe requires new --output, --max-tokens 1...256 and --detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert")
+            throw CLIError.usage("Hotspot probe requires new --output, --max-tokens 1...256 and --detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert|moe-composed")
         }
         let isTiling = detail == "tiling"
         let isMoEFusion = detail == "moe-fusion"
-        let isExpert = detail == "moe-expert"
+        let isComposed = detail == "moe-composed"
+        let isExpert = detail == "moe-expert" || isComposed
         let isGateUp = detail == "moe-gateup" || isExpert
         let hasMoEConfiguration = isMoEFusion || isGateUp
         guard hasMoEConfiguration == (args["--moe-config"] != nil) else {
-            throw CLIError.usage("--detail moe-fusion|moe-gateup|moe-expert requires --moe-config; other details do not accept it")
+            throw CLIError.usage("--detail moe-fusion|moe-gateup|moe-expert|moe-composed requires --moe-config; other details do not accept it")
+        }
+        guard isComposed == (args["--baseline-moe-config"] != nil) else {
+            throw CLIError.usage("Only --detail moe-composed requires --baseline-moe-config for a direct incremental comparison")
         }
         let isUnrecordedAB = isTiling || hasMoEConfiguration
         let measuredOrder = args["--ab-order"] ?? "ABBA"
@@ -40,13 +44,15 @@ extension RunnerCLI {
             "clock": "mach_absolute_time_nanoseconds", "logit_finiteness_checked": false,
             "notes": [
                 "Each trial uses producer.prefill(request), then consumer.decode(ready) on one shared model and executor.",
-                hasMoEConfiguration ? "MoE A/B disables all stage recording. Each trial creates a request with nil baseline or the saved candidate prefill MoE configuration; decode remains reference."
+                isComposed ? "MoE composition A/B disables all stage recording. Both requests use the same saved expert gate/up and down configuration; only the candidate adds fused reduction. Decode remains reference."
+                    : hasMoEConfiguration ? "MoE A/B disables all stage recording. Each trial creates a request with nil baseline or the saved candidate prefill MoE configuration; decode remains reference."
                     : isTiling ? "Tiling A/B disables all stage recording. Prefill alone selects BM0 (baseline) or BM16 (candidate); BM0 is restored before every decode."
                     : "Only the two profiled prefills enable synchronized stage recording; every decode and both baseline prefills disable it.",
                 hasMoEConfiguration ? "The first baseline/candidate pair is warmup, followed by measured \(measuredOrder). The saved configuration is decoded and validated before model loading."
                     : isTiling ? "The first baseline/candidate pair is warmup. Dispatch counts establish path selection, not physical weight reads or bandwidth."
                     : "Stage synchronization changes graph evaluation, overlap and allocation reuse. These timings are not GPU-only time or undisturbed throughput.",
-                isExpert ? "Expert variants are request-local plugin calls. Nil is reference; variant1 is the prior fused path, variant2/3 add a shared expert plan and optionally grouped down. Plugin plan/gate/down and host graph counters are checked independently; all tracked decode counters must stay zero. Old native selectors and reduction fusion remain off."
+                isComposed ? "The baseline is the previously validated grouped expert path, not the original stock MoE. Reported gains are incremental. Both configurations use verified plugin/base identities; plan/gate/down and reduction counts must match each request, and all tracked decode counts must stay zero."
+                    : isExpert ? "Expert variants are request-local plugin calls. Nil is reference; variant1 is the prior fused path, variant2/3 add a shared expert plan and optionally grouped down. Plugin plan/gate/down and host graph counters are checked independently; all tracked decode counters must stay zero. Old native selectors and reduction fusion remain off."
                     : isGateUp ? "Gate/up variants are request-local plugin calls: nil is reference, 0/1 are candidates. Plugin and stock base MLX hashes must match; old native selectors and reduction fusion remain off. Plugin dispatches and host gate/up construction are checked separately; down has no counter and no down-dispatch count is inferred. Decode and reduction deltas must stay zero."
                     : isMoEFusion ? "The saved native configuration requires a matching library SHA. Native counters count encoded matmuls; reduction counters count host graph construction. Neither measures DRAM traffic. All decode deltas must remain zero."
                     : isTiling ? "Prefill dispatch deltas must show candidate BM16 or baseline BM32 with no BM16; all tracked counts must remain unchanged during decode."
@@ -131,7 +137,7 @@ extension RunnerCLI {
                 try decoded.validated()
                 if isGateUp {
                     try MoEGateUpProbeSupport.requireStockSelectors()
-                    guard decoded.threadgroups.isEmpty else { throw CLIError.usage("Gate/up isolation requires an empty reduction table") }
+                    guard isComposed || decoded.threadgroups.isEmpty else { throw CLIError.usage("Gate/up isolation requires an empty reduction table; use moe-composed to test reduction composition") }
                     if !isExpert {
                         guard decoded.gateUpVariant == nil || (0...1).contains(decoded.gateUpVariant!),
                               decoded.groupedDown != true else { throw CLIError.usage("Grouped expert configurations require --detail moe-expert") }
@@ -153,11 +159,29 @@ extension RunnerCLI {
                 report["prefill_chunk_lengths"] = promptChunkLengths
                 if isMoEFusion { report["expected_native_prefill_calls"] = expectedNativePrefillCalls }
             } else { moeConfiguration = nil; nativeSelection = nil; gateUpSelection = nil }
+            let baselineMoEConfiguration: GPUMoEPrefillConfiguration?
+            if isComposed {
+                let selected = try GPUMoEPrefillSelection(path: try args.require("--moe-config"),
+                    modelDirectory: directory, accumulation: .reference)
+                let baseline = try GPUMoEPrefillSelection(path: try args.require("--baseline-moe-config"),
+                    modelDirectory: directory, accumulation: .reference)
+                guard baseline.configuration.threadgroups.isEmpty,
+                      baseline.configuration.gateUpVariant == 2, baseline.configuration.groupedDown == true,
+                      selected.configuration.gateUpVariant == baseline.configuration.gateUpVariant,
+                      selected.configuration.groupedDown == baseline.configuration.groupedDown,
+                      selected.configuration == moeConfiguration,
+                      promptChunkLengths.contains(where: { selected.configuration.threadgroupSize(tokenCount: $0) != nil }) else {
+                    throw CLIError.usage("Composition requires matching expert32/groupedDown paths, an unfused baseline reduction, and a candidate reduction that matches a prompt chunk")
+                }
+                baselineMoEConfiguration = baseline.configuration
+                report["baseline_moe_configuration"] = baseline.provenance
+                report["candidate_selection"] = selected.provenance
+            } else { baselineMoEConfiguration = nil }
             func makeRequest(candidate: Bool) -> QwenGenerationRequest {
                 QwenGenerationRequest(tokens: tokens, maxTokens: maximum,
                     contextLimit: context, prefillChunk: 416, mtpDepth: 0,
                     decodeMode: .reference, prefillAttention: .reference,
-                    prefillMoEConfiguration: candidate ? moeConfiguration : nil)
+                    prefillMoEConfiguration: candidate ? moeConfiguration : baselineMoEConfiguration)
             }
             try makeRequest(candidate: false).validate(configuration: configuration)
             if hasMoEConfiguration { try makeRequest(candidate: true).validate(configuration: configuration) }
@@ -296,7 +320,7 @@ extension RunnerCLI {
                     "correctnessPassed": false, "prefill_profiling_enabled": profiled, "decode_profiling_enabled": false]
                 if hasMoEConfiguration {
                     trial["warmup"] = index < 2
-                    trial["prefill_moe_configuration"] = name == "candidate" ? try object(moeConfiguration!) : NSNull()
+                    trial["prefill_moe_configuration"] = try request.prefillMoEConfiguration.map { try object($0) } ?? NSNull()
                     if isMoEFusion { trial["selected_native_configuration"] = selectedNative }
                     trial["expected_prefill_reduction_calls"] = expectedReductionCalls
                 }
@@ -393,13 +417,13 @@ extension RunnerCLI {
                         }
                         let hostDelta = gateUpHostAfterPrefill - gateUpHostBeforePrefill
                         let reductionDelta = reductionAfterPrefill - reductionBeforePrefill
-                        let valid = delta == expected && hostDelta == expectedGateUpCalls && reductionDelta == 0
+                        let valid = delta == expected && hostDelta == expectedGateUpCalls && reductionDelta == expectedReductionCalls
                         trial["gateup_prefill_count_deltas"] = delta
                         trial["expected_gateup_prefill_count_deltas"] = expected
                         trial["gateup_host_prefill_call_delta"] = hostDelta
                         trial["prefill_reduction_call_delta"] = reductionDelta
                         trial["gateup_prefill_dispatch_matches"] = valid
-                        guard valid else { throw CLIError.usage("Gate/up prefill dispatches differ from requested variant, or reduction fusion was enabled") }
+                        guard valid else { throw CLIError.usage("Gate/up or reduction prefill counts differ from the requested configuration") }
                     }
                     if let groupedBeforePrefill, let groupedAfterPrefill {
                         let delta = try MoEGateUpProbeSupport.delta(groupedAfterPrefill, groupedBeforePrefill)

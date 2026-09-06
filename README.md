@@ -16,6 +16,8 @@ Agent 长提示基准已加入 [11k system/user 输入](fixtures/gpu-agent-11k/p
 
 后续的 [主要瓶颈审计](GPU_BOTTLENECK.md)已取得完整 GPU 命令缓冲时间，并用真实 GDN / head 权重做独立微基准。GDN 约占 42% 逻辑权重，其固定矩阵形状成为下一步重点；微基准差值不直接等于整模型提速，物理 DRAM 带宽仍未知。
 
+Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配置显式使用；后续[叠加路由归约的对照](docs/MOE_PREFILL_COMPOSITION.md)在单层微测有额外收益，但本轮11k整模型prefill基本持平，因此组合保持实验选项。两个阶段分别计时，MTP默认关闭。
+
 ## 早期 Core ML / ANE 验证（2026-09-05）
 
 - 本机 macOS 26.6.2 / Swift 6.3.3：独立 Release 编译成功，36 项 XCTest 全部通过（[日志](results/moe-concurrency/swift-tests.log)）；另有 MoE 调度集成验证。
