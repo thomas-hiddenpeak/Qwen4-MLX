@@ -57,6 +57,8 @@ ReplaySSM 的机会是少写验证期间每位置的完整 recurrent state，不
 
 先支持一个真实 10k 公共前缀和多个后缀，测试 A/B/A、QSA 阈值、chunk 边界，再加淘汰/前缀树。统一内存预算区分随 token 增长的 KV/QSA、每请求固定 GDN/PLE、MTP history/临时 capture、共享权重，并与 MLX 实际内存一起观察。session ID 只提示复用倾向，不替代 token 校验或无限 pin 内存。
 
+[精确前缀设计](EXACT_PREFIX_CHECKPOINT_DESIGN.md)已核对实际所有权与恢复落点，目前只有设计。MTP head 在chunk末尾可依赖第一个后缀token，初始历史起点也依赖完整prompt长度，不能直接跨后缀克隆。首版可先验证AR的完整主干状态与私有恢复，MTP保持冷miss；后续保留原chunk分段的主干hidden tail，按新请求重建head。MLX普通copy共享buffer，也不能充当这里要求的私有副本。
+
 ## 苹果硬件取舍
 
 当前主要 decode 时间在 GPU 内，先尝试减少 GPU 访存等待、临时状态流量与小 dispatch 空隙。CPU 负责有界调度、tokenizer、SSD I/O 和状态元数据；从真实等待决定是否增加读取 worker 或 PLE 行缓存。PLE 计量应报告 unique rows、实际请求读取字节和暴露等待，区分 OS 页缓存与物理 SSD。
