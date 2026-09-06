@@ -35,7 +35,7 @@
 | 2C，单层筛选未达门槛 | [shared/routed down 调度](MOE_BRANCH_OVERLAP_FEASIBILITY.md) | 合并两个down节点的输入hazard，再调用原primitive；MLX本来已用concurrent encoder | 三行逐位与编码计数通过，reference/fused约+3.04%/+4.16%，未达5%，pair未稳定胜过串行/原recipe，不进入整模 |
 | 3，依赖 MTP/生命周期稳定 | 不可变内存 checkpoint | 先有界精确系统提示词表、私有恢复，再加最长前缀索引 | 10k 公共前缀 + 不同后缀，A/B/A 无污染；节省的 prefill 大于保存/恢复成本 |
 | 4，依赖内存 checkpoint | SSD 状态缓存 | 有版本、身份与完整性校验的文件，独立磁盘额度，有界读写 | 冷盘恢复快于重算，损坏/中断写入正常回退，不拖慢 PLE 读取 |
-| 服务交付线，实验入口首轮通过 | [HTTP/SSE、背压和断连](HTTP_SERVER_EXPERIMENT.md) | 固定推理线程、独立网络队列、有界输出及text-only协议；29项CPU与19项live检查 | AR/MTP成功响应、并发、预填充RST清理及活动SIGTERM通过；生成中断、连接/期限和持续运行继续补测 |
+| 服务交付线，实验入口与边界通过 | [HTTP/SSE、背压和断连](HTTP_SERVER_EXPERIMENT.md) | 固定推理线程、独立网络队列、有界输出及text-only协议；29项CPU、19+15项live检查 | AR/MTP响应、并发、prefill/decode中RST、连接上限、接收期限、短预算与活动SIGTERM通过；持续运行及其他期限仍待测 |
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 

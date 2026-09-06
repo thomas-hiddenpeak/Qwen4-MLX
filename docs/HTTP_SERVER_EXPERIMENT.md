@@ -1,6 +1,6 @@
 # 本机文字 HTTP/SSE 实验服务
 
-此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过一轮真实本机 HTTP/SSE 与模型回归。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
+此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE 与模型回归及一轮补充网络边界检查。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
 
 ```bash
 .build/release/ane-runner serve-gpu --model-dir /absolute/path/to/model
@@ -70,10 +70,26 @@ SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等�
 
 复现入口为 `scripts/test_http_server_live.py`；本机原始记录在 `results/http-service-v1/live.json`、`live.server.log` 与 `run-ledger.json`，这些运行产物不随源码提交。冻结对照为 `results/mtp-agent-expansion-v1/tools-128.json` 的首轮结果。服务二进制 SHA-256：`f95565cb2bcb32b494c2fe9d3a6397f69c01e4433a761c7d910887ff874dd4be`。这轮用于正确性和生命周期验收，运行顺序与负载没有为性能比较设计，不据其中耗时宣布 AR/MTP 加速比例。
 
+### 补充网络边界回归
+
+同日补充的 15 项检查全部通过，使用与首轮相同 SHA-256 的服务二进制；这一轮设置 `--max-connections 4`，仍为 8192 字节输出额度。独立脚本 `scripts/test_http_server_edges.py` 只启动、关闭自己的一份服务并管理自己的连接，SIGTERM/KeyboardInterrupt 进入 finally 清理；外层 controller 统一安排 GPU 窗口和参考服务恢复。
+
+| 补充实测范围 | 结果与边界 |
+| --- | --- |
+| 连接数量硬上限与槽位恢复 | 4 条未完成 header 占位期间，第 5 条连接收到 RST；其后完成原 4 条请求，全部得到 200，观测连接数依次为 4、3、2、1。饱和期间没有另开 health 探测干扰计数；最终新 health 成功且所有任务/资源计数为零。这项不验证邮箱容量。 |
+| header/body 接收期限 | 未完成 header 与未完成 body 分别约 15.185 秒收到 408 / request_timeout，随后仍为 idle，无任务或资源预留。这是接收期限测试，不是发送期限测试。 |
+| Content-Length 截断与 EOF | 声明 body 为 2 字节，只发送 1 字节后 write half-close，收到 400 / Incomplete HTTP request；未进入推理调度。与上一轮完整请求 half-close 可正常读响应的结果互补。 |
+| 真实输出预算停止 | AR 非流式和 MTP2 SSE 的输出预算分别为 1、2、4；文本对应 `1`、`1,`、`1,2,`，均为 length。每份 prompt 为 35 token，实际 completion 计数等于预算、total 等于两者之和，AR/MTP 文本和 usage 一致。预算 1 只验证首 token 的结束处理，不能作为执行了 MTP round 的证据。 |
+| 未验证 MTP 范围拒绝 | `mtp_depth=2, max_tokens=257` 在真实 HTTP 返回 400，维持当前最高 256-token 输出预算的候选范围。 |
+| MTP decode 期间 RST | 同一长工具目录 fixture、MTP2、256-token 预算，观察到两条非空 content（`{` 和换行）后 RST。唯一响应 ID 对应日志 `terminal=cancelled stage=decode`；约 0.109 秒后 health 观察到所有队列与资源归零，后续新 AR 请求的预算 4 文本、usage 和 length 与此前一致。首 token 可来自 prefill，因此等待两条；本项没有定位到 verify/replay 内部的取消点，也不构成取消延迟上限保证。 |
+| 独占执行与退出 | 自有服务以 0 退出，SIGTERM 清理完成、未强制 kill；外层 ledger 确认参考服务恢复 ready。 |
+
+原始记录在 `results/http-service-edges-v1/edges.json`、`edges.server.log` 与 `run-ledger.json`。报告保留了取消请求原文、观察到的完整 SSE 帧、唯一请求 ID、匹配日志及清理后的计数；脚本与 runner 的 SHA-256 均已独立核对。该轮没有交错重复或冷热控制，不从短请求的耗时推断性能收益。
+
 仍需分开补齐以下边界，不能由上述通过结果外推：
 
-- 当前真实请求均由 EOS 停止；真实 HTTP 输出预算停止的 length、MTP decode / verify / replay 中取消尚未覆盖。RST 与活动退出测试发生在 prefill。
-- 真实应用输出 overflow、15 秒发送/接收期限、300 秒连接期限尚未触发；连接数量硬上限、邮箱满与槽位回收也未独立验证。CPU 缓冲测试不能代替真实 TCP 期限测试。
+- MTP verify / replay 内部的精确取消位置尚未覆盖；已有证据限于 decode 阶段观察到内容后的网络断连、取消及后续恢复。
+- 真实应用输出 overflow、15 秒发送期限、300 秒连接期限尚未触发；邮箱满与邮箱槽位回收也未独立验证。暂停客户端读取不等于观察到了应用 overflow，CPU 缓冲测试不能代替真实 TCP 期限测试。
 - 长期运行的内存/文件描述符增长、模型运行故障后的服务状态，以及故障发生在 SSE 已发送之后的错误终态，仍需后续回归。
 
 当前可作为本机文字客户端的实验入口；缓存、前缀复用、认证与远程部署尚未纳入此服务。

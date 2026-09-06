@@ -24,7 +24,7 @@ Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配�
 
 新增[两个独立长任务的 MTP 回归](docs/MTP_AGENT_EXPANSION.md)：冻结工具 JSON 与项目事实检索输入，24轮完整输入/输出 token 和功能答案通过。实际自然结束于85/110输出token；128/256预算分别保留，性能仍须独立时间窗口复测，MTP保持可选。
 
-实验性 [HTTP/SSE 服务](docs/HTTP_SERVER_EXPERIMENT.md)已通过29项相关CPU测试与19项真实网络检查。仅监听本机，支持文本聊天、greedy、AR默认，以及显式 `mtp_depth: 2`（最多256输出预算）；工具调用协议、采样和完整OpenAI兼容尚未实现。网络队列与固定推理线程分离，有界连接、排队和输出；prefill/decode独立计时。启动示例：
+实验性 [HTTP/SSE 服务](docs/HTTP_SERVER_EXPERIMENT.md)已通过29项相关CPU测试、首轮19项与补充15项真实网络检查。仅监听本机，支持文本聊天、greedy、AR默认，以及显式 `mtp_depth: 2`（最多256输出预算）；工具调用协议、采样和完整OpenAI兼容尚未实现。网络队列与固定推理线程分离，有界连接、排队和输出；prefill/decode独立计时。启动示例：
 
 ```bash
 .build/release/ane-runner serve-gpu \
