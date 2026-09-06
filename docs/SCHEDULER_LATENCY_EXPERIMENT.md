@@ -84,3 +84,24 @@ python3 scripts/analyze_scheduler_latency.py \
 ```
 
 小门槛：所有输出/状态检查通过；短请求 max 与 p95 gap 是否下降，长请求 TTFT/完成时间和整组吞吐是否恶化必须一起列出。若想研究“decode 已活跃时新长请求到达”，再为探针增加确定的到达时点，不能把当前 simultaneously queued 两请求结果换个名称当作那项证据。
+
+## 本轮新实模结果
+
+2026-09-07 按 `results/upstream-cost-latency-v1/plan.json` 依次运行 burst4、burst8。两份报告各 18 项检查全部通过；长/短完整 token、阶段计时、取消后恢复、额度与状态释放正常。新增 callback 分位数与终态时间由两份独立离线结果从原始整数时钟复算一致。该轮没有修改生产调度默认。
+
+| 长请求 / 短 MTP 指标 | burst4 | burst8 |
+| --- | ---: | ---: |
+| 长 AR：短请求 TTFT | 2.134 s | 2.004 s |
+| 长 AR：短请求完成 | 11.341 s | 7.317 s |
+| 长 AR：短请求 callback p95 | 947.8 ms | 758.4 ms |
+| 长 AR：短请求最大 gap | 1062.0 ms | 908.2 ms |
+| 长 AR：长请求完成 | 32.512 s | 30.515 s |
+| 长 MTP：短请求完成 | 9.849 s | 6.790 s |
+| 长 MTP：短请求 callback p95 | 746.1 ms | 640.5 ms |
+| 长 MTP：短请求最大 gap | 846.4 ms | 742.1 ms |
+
+两个混合组合中，短请求已经开始输出、尚未完成时插入的长 prefill 步骤都从 **8 次降为 4 次**。这是原始事件中的结构性变化。burst8 减少了短 decode 被打断的频率，但没有缩短固定 416-token prefill 块本身，不能据 p95 下降声称最大停顿已解决。
+
+这只是一次 4→8；同进程的 wholeStages 对照自身从整组 42.321 s 变为 30.908 s，首份长 AR 还出现约 1.357 s 的孤立 callback gap。时间明显有漂移，所以不将表中差异全部归因于调度参数，也不据此更改默认。需要继续比较时先做漂移诊断，再安排反序；不重复长输入只为补样本数。
+
+报告：`cooperative-burst4.json`、`cooperative-burst8.json`、`latency-summary.json`；独立复核为同目录 `independent-latency-both.json`。参考服务已恢复，MTP/drafter 关闭；运行身份见同目录 `run-ledger.json`。

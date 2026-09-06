@@ -50,9 +50,19 @@ CPU 检查（不创建模型或 MLX tensor）：
 swift test --filter QwenMTPCostSummaryTests
 ```
 
-测试覆盖实际输出分母、首 token 终止、接受草稿 EOS、预算缩短和 target-only 收尾、零/负/非有限时间、计数/直方图不一致及旧结果 JSON 兼容。运行结果需由执行验证者记录；新增测试源文件本身不代表已通过。
+测试覆盖实际输出分母、首 token 终止、接受草稿 EOS、预算缩短和 target-only 收尾、非法时间、计数/直方图和旧结果 JSON 兼容。2026-09-07 Release 构建及相关 46 项 CPU 检查通过，其中本摘要 8 项通过。首次 CLI 报告字典触发编译器类型推断超时，拆成显式局部值后通过；字段含义不变。日志为 [cpu-tests-retry.log](../results/upstream-cost-latency-v1/cpu-tests-retry.log)。
 
-2026-09-07 集中 Release 构建通过，相关 46 项 CPU 测试通过，其中本摘要的 8 项全部通过。初次构建触发 Swift 对大型报告字典的类型检查耗时错误，已将 JSON 编码拆为显式局部值，重试通过；未改变报告字段。日志为 `results/upstream-cost-latency-v1/cpu-tests-retry.log`。11k 与边界实模正在按同目录 plan 单独验证，完成前不视为实模通过。
+同轮 `long-cost.json` 九个 11,057-token 请求，每个 128 输出，全部与旧 golden 完全一致。深度顺序为 `0/1/2/0/1/2/2/1/0`；前三轮预热，后六轮各深度两次。全部 MTP 成本字段与原始计数、时间、直方图重算一致。另有预算 1/2/16 的 AR-MTP 对照，实际各输出 1/2/8 token，最后一组自然 EOS；预算 1 无 decode 吞吐，预算 2 是零起草轮、一个 target-only 步骤，符合合同。
+
+| 11k 测量窗口 | 两次 decode token/s | 草稿接受率 | Verify 占完整 decode |
+| --- | --- | ---: | ---: |
+| AR | 29.13 / 20.61 | — | — |
+| depth1 | 33.73 / 23.21 | 72.60% | 91.08% |
+| depth2 | 34.84 / 31.80 | 65.45% | 88.05% |
+
+后半程存在明显漂移：AR 自身降速约 29%，prefill 也从约 16 秒延长至 48 秒；allocator active 约 81.0 GB、peak 约 82.0 GB 基本稳定，不能据此归因为内存泄漏、其他训练或热降频。现场快照未报告热告警，但不足以排除其他竞争。两次 AR/D1/D2 聚合吞吐为 24.14/27.50/33.25 token/s，**只能作本窗口观察，不能将相对值宣布为稳定加速或默认启用依据**。本次更可靠的结论是输出、边界和统计合同通过；完整 verify 仍是主要耗时。
+
+数据与控制器记录在 `results/upstream-cost-latency-v1/`：`long-cost.json`、`short-budget1/2/16.json`、`cost-summary.json`、`run-ledger.json`。该目录被 Git 忽略，结果摘要保存在本页。
 
 整模型回归复用现有短/11k 的 AR/MTP 对照即可，不另开性能试验矩阵。核对 MTP trial 的 `countersConsistent`、`acceptanceHistogramConsistent` 与 `componentsFitDecodeWindow`，以及有效吞吐等于原 `decode_tokens_per_second`；正常 AR trial 摘要为 `null`。任何算力变化均不应归因于这个纯派生摘要。
 
