@@ -35,11 +35,11 @@
 | 2C，单层筛选未达门槛 | [shared/routed down 调度](MOE_BRANCH_OVERLAP_FEASIBILITY.md) | 合并两个down节点的输入hazard，再调用原primitive；MLX本来已用concurrent encoder | 三行逐位与编码计数通过，reference/fused约+3.04%/+4.16%，未达5%，pair未稳定胜过串行/原recipe，不进入整模 |
 | 3，依赖 MTP/生命周期稳定 | 不可变内存 checkpoint | 先有界精确系统提示词表、私有恢复，再加最长前缀索引 | 10k 公共前缀 + 不同后缀，A/B/A 无污染；节省的 prefill 大于保存/恢复成本 |
 | 4，依赖内存 checkpoint | SSD 状态缓存 | 有版本、身份与完整性校验的文件，独立磁盘额度，有界读写 | 冷盘恢复快于重算，损坏/中断写入正常回退，不拖慢 PLE 读取 |
-| 服务交付线 | HTTP/SSE、背压和断连 | 复用单推理执行器、现有取消/额度；网络线程处理有界输出 | 客户端慢读/断连不阻塞其他请求，终态只发一次、资源只释放一次；AR/MTP 分别验收 |
+| 服务交付线，CPU边界已实现 | [HTTP/SSE、背压和断连](HTTP_SSE_SERVICE_PLAN.md) | 有界SSE缓冲和增量UTF8共18项CPU检查通过；固定推理线程的loopback网络入口正在接入 | 还须真实网络慢读/断连/并发及AR/MTP验收，不能把CPU模块当成已完成服务 |
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 
-当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)已完成，fit未阻止降速，进程分页和footprint未发现对应增长；下一步用原生GPU命令缓冲计时缩小发生位置，再继续发布性能结论。不能将一次较慢结果自动归因为训练或热降频。
+当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。已补原始GPU状态与系统thermal等级采样，接下来与新任务一起记录；目前不能归因为训练或热降频。
 
 ## MTP 的统计与状态约束
 

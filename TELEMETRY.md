@@ -4,7 +4,7 @@
 
 IOReport 使用本机私有接口，放在可选的独立采样进程中；启动后的订阅或读取失败会保留错误和缺失值，不改变模型计算路径。缺少采样器可执行文件、无法创建输出目录或无法启动子进程属于启动错误，在加载模型前报告。它不构成跨系统版本的公开兼容接口承诺。
 
-**MTP 固定关闭，完整模型计算仍使用 Metal GPU。当前没有已验证的物理 DRAM 字节／带宽读数，也没有本模型 GPU 读写字节的实测结果。** 采样能力、已读到某个计数器、目标进程的执行证据是三项不同检查。
+**完整模型计算仍使用 Metal GPU；当前没有已验证的物理 DRAM 字节／带宽读数，也没有本模型 GPU 读写字节的实测结果。** 本页早期基准固定关闭 MTP；现有请求级进程采样也可记录显式 MTP，成本见 [请求摘要](docs/MTP_COST_SUMMARY.md)。命令缓冲逐步插桩仍限定 AR。采样能力、已读到某个计数器、目标进程的执行证据是三项不同检查。
 
 新增的 [独立 MLX 命令缓冲计时](GPU_BOTTLENECK.md)已获得完整的 GPU 起止区间，与每个 token 的 CPU 时间对齐。这是另一套诊断证据，不改变下文旧 Instruments trace 的不完整标记；区间覆盖比例仍不能解释为 shader 活跃率或物理带宽。
 
@@ -176,3 +176,10 @@ python3 -m unittest discover -s scripts -p test_analyze_gpu_telemetry.py
 ```
 
 另有 9 项 trace 导出测试、8 项本机 sidecar 检查及 4 项 runner 生命周期检查。整合结果、同输入输出校验及证据哈希见 [机器可读汇总](results/gpu-telemetry-validation/milestone.json)。完整 GPU 覆盖和物理 DRAM 带宽两项尚未通过，不与代码构建或单元测试通过混为一谈。
+# GPU 状态补充（2026-09-07）
+
+硬件 sidecar 现在附带 `gpu_states`：一次性订阅系统 `GPU Stats / GPU Performance States` 和 `CLTM-induced GPU Performance States`，并读取 `NSProcessInfo.thermalState`。本机初步发现分别为 GPUPH 的16个状态、GPU_CLTM的17个状态，原生单位 `24Mticks`；状态名和增量原样保存。两路订阅在当前用户权限下可用，缺失或失败保留显式错误，不申请提权。
+
+每路保存本次及前次读取的 start/end。做阶段归属时只使用整个端点包络落在阶段内的增量；发生失败会断开差值链。baseline 没有 delta，不能记成零。采样循环仍由目标 PID 身份控制，但这些 GPU 状态是系统范围，不能归属该 PID；多个通道不能相加。P1…P15 尚无经过核对的频率映射，不导出 MHz、shader 利用率或实际 DRAM 带宽。thermalState 是操作系统压力等级，不是摄氏温度；nominal 也不证明 GPU 没有调节频率。
+
+固定 AR [命令跨度诊断](docs/GPU_DRIFT_TRACE.md)把主要漂移收窄到 GPU 执行跨度内，因而补上这两路原始证据。新增采样已构建，并在空闲参考服务旁完成 baseline+3次采样：端点包络有效、两路 delta 完整、thermal nominal。原始记录 `results/gpu-states-v1/idle.jsonl`。这只是读取能力检查，尚不是生成阶段的降速解释；下一轮真实 workload 将同时记录这些字段。

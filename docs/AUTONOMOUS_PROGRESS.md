@@ -15,7 +15,7 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新参考服务：PID5357，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/moe-down-pair-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新参考服务：PID6275，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/gpu-drift-trace-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -23,8 +23,8 @@
 
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
-3. 下一GPU诊断是固定AR命令缓冲时长，区分逐轮漂移位置。最近驻留实验与VM采样均已结束。
-4. 独立CPU工作开始审查HTTP/SSE最小接入，优先有界输出、慢读/断连取消、终态生命周期；尚无HTTP服务。
+3. 固定AR命令缓冲诊断已完成，主要漂移在GPU跨度内；已补原始GPU档位/系统热压力采样。下一GPU工作是两个独立长任务的AR/MTP回归，同时采集状态分布。
+4. 有界SSE缓冲和增量UTF8已通过18项CPU测试；正在写仅loopback的实验HTTP服务，固定推理线程、独立网络队列。尚未完成网络/真实模型验收。
 
 ## 接续记录
 
@@ -39,3 +39,5 @@
 - 05:55：GDN Replay已通过30cases、720逐位比较、20边界，S3加权单层约+2.07%/3.52%，暂不进生产MTP。提交`98f7daf`正在推送。其恢复ledger为`results/gdn-replay-v1/run-ledger.json`（PID3782），当前又由唯一controller暂停用于`results/residency-drift-v1/plan.json`。该诊断在跑，禁止另一GPU任务/重建二进制；配套只读VM采样进程写`vm-stat.jsonl`并在controller恢复ready后自动退出（最多1200秒）。六轮顺序：D1暖、AR fit暖、AR disabled/fit/fit/disabled，全部500ms telemetry。完成后先分析分页/footprint与阶段漂移，再决定是否需要GPU命令缓冲诊断。MoE双down probe由vllm_sglang_research继续写独立native/Swift，暂未编译。
 
 - 06:10：驻留六轮已完成并独立复核，fit未消除漂移，进程内采样pageins为0且footprint稳定；VM时钟基准不匹配，保留整体数据、不作阶段归因，见RESIDENCY_DRIFT_DIAGNOSIS.md。MoE双down已构建并完成reference/fused两组：三行真实输入逐位及各87/87次原生调用通过，完整单层墙钟约+3.04%/+4.16%，未达5%门槛，pair不稳定胜过serial/recipe，不进入完整模型。服务已恢复PID5357，当前无GPU实验运行。
+
+- 06:24：`aed3e86`已推送并核对远程SHA。固定AR trace三轮完整128 IDs一致，135848 buffers完整无丢失；暖轮prefill新增耗时97.71%、decode76.80%落在GPU跨度内，见GPU_DRIFT_TRACE.md。服务恢复PID6275。GPUStateSampler读取两路原始state及thermalState，空闲采样6个delta/端点通过，不映射MHz。Core SSE缓冲10项+UTF8 8项测试通过，日志results/service-core-v1/tests.log。redis_runner_research正在写HTTP服务；vllm_sglang_research写独立CPU协议层；gdn_pipeline_probe写两个新冻结synthetic长任务及功能checker。三者均不得启动模型或自行build；root协调唯一GPU与统一编译。当前尚无GPU实验运行。

@@ -2,6 +2,7 @@
 // 3bfe69f524d33db8e2418536d0179fcbfc3dac00 (CIOReport/include/ktop_ioreport.h).
 // This process only discovers, subscribes and reads. It never controls a model.
 #import "TelemetrySampler.h"
+#import "GPUStateSampler.h"
 #import <IOKit/IOKitLib.h>
 #import <IOKit/storage/IOBlockStorageDriver.h>
 #include <libproc.h>
@@ -69,6 +70,7 @@ static NSDictionary *channelIdentity(CFDictionaryRef channel) {
     CFDictionaryRef _previousIO;
     NSString *_ioSource, *_ioKind;
     NSMutableArray *_ioAttempts;
+    ANEGPUStateSampler *_gpuStates;
 }
 - (NSDictionary *)metadata { return _metadata; }
 - (NSString *)stopReason { return _stopReason; }
@@ -83,6 +85,7 @@ static NSDictionary *channelIdentity(CFDictionaryRef channel) {
     _identityAvailable = rc == 0 && usage.ri_proc_start_abstime != 0;
     _originalStartTicks = usage.ri_proc_start_abstime;
     _ioAttempts = [NSMutableArray array];
+    _gpuStates = [ANEGPUStateSampler new];
     // One successful subscription for the sampler lifetime; no per-sample rediscovery.
     if (![self subscribeGroup:@"AMC Stats" subgroup:@"Perf Counters" kind:@"byte_counter_channels"]) {
         for (NSString *group in @[@"PMP0", @"PMP", @"PMP1"]) {
@@ -91,6 +94,7 @@ static NSDictionary *channelIdentity(CFDictionaryRef channel) {
     }
     _metadata = @{
         @"target_pid": @(pid), @"target_start_abstime": _identityAvailable ? @(_originalStartTicks) : nullValue(),
+        @"gpu_states": _gpuStates.metadata,
         @"target_start_ns": _identityAvailable ? @(ticksToNS(_originalStartTicks)) : nullValue(),
         @"target_identity_error": _identityAvailable ? nullValue() : errorValue(@"proc_pid_rusage", usageError, @"Cannot establish process identity; sampling will stop"),
         @"ioreport": @{@"source": _ioSource ?: @"unavailable", @"kind": _ioKind ?: @"unavailable",
@@ -276,11 +280,13 @@ static NSDictionary *channelIdentity(CFDictionaryRef channel) {
     // Revalidate process start time before each collection, before private API I/O.
     NSDictionary *process = [self readProcess];
     NSDictionary *io = [self readIOReport], *disks = [self readDisks];
+    NSDictionary *gpuStates = [_gpuStates sample];
     uint64_t end = ANETelemetryNowNS();
     NSMutableDictionary *result = [@{@"type": baseline ? @"baseline" : @"sample", @"schema_version": @1,
         @"clock": @"mach_absolute_time_nanoseconds", @"target_pid": @(_pid), @"sample_id": @(sampleID),
         @"start_ns": @(_previousEndNS ?: end), @"end_ns": @(end), @"collection_start_ns": @(start),
         @"is_final_partial": @(partial), @"process": process, @"system_disk": disks, @"ioreport": io,
+        @"gpu_states": gpuStates,
         @"process_disk_read_bytes_delta": nullValue(), @"process_disk_write_bytes_delta": nullValue(),
         @"system_disk_read_bytes_delta": nullValue(), @"system_disk_write_bytes_delta": nullValue(),
         @"physical_dram_read_bytes_delta": nullValue(), @"physical_dram_write_bytes_delta": nullValue(),
