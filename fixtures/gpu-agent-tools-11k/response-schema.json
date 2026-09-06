@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "properties": {
+    "tool": {
+      "type": "string"
+    },
+    "arguments": {
+      "type": "object",
+      "properties": {
+        "tenant": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "trace_id": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "include_payload": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tenant",
+        "service",
+        "trace_id",
+        "region",
+        "include_payload"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "tool",
+    "arguments"
+  ],
+  "additionalProperties": false
+}

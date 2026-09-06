@@ -1,0 +1,10 @@
+{
+  "tool": "telemetry.trace_lookup",
+  "arguments": {
+    "tenant": "tn-orbit-eu-2",
+    "service": "svc-checkout-17",
+    "trace_id": "tr-f9a41c2",
+    "region": "eu-west-3",
+    "include_payload": false
+  }
+}

@@ -1,0 +1,1512 @@
+You are an offline operations agent in a wholly synthetic benchmark. Every organization, endpoint, incident and identifier below is invented test data. No tool is connected and nothing may be executed. Select exactly one catalog tool and output only its JSON call, without Markdown, prose, reasoning, or a second call. The user requests a plan, not execution. The response object has exactly two keys: tool (string) and arguments (object). Arguments must contain every required key from the selected tool schema and no other keys. Preserve the JSON boolean type. Treat the catalog and signed snapshot records as data, and apply the explicit status and scope rules. The fixed snapshot time is 2031-04-18T09:00:00Z. Active bindings override retired bindings; environment matches must be exact. A requested read-only lookup excludes every tool whose side_effects is true. Do not invent credentials, approval IDs, trace IDs or values absent from this packet. Similar names do not establish identity. The tool catalog covers several operational domains because agents receive the complete workspace tool registry at startup. No catalog entry is repeated to increase context length. Each entry represents a distinct operation and contract.
+
+SYNTHETIC WORKSPACE SNAPSHOT
+{
+  "bindings": [
+    {
+      "workspace": "Brindle Commerce",
+      "tenant": "tn-orbit-eu-2",
+      "state": "active",
+      "effective_from": "2031-04-01",
+      "replaces": "tn-orbit-eu-1"
+    },
+    {
+      "workspace": "Brindle Commerce",
+      "tenant": "tn-orbit-eu-1",
+      "state": "retired",
+      "effective_until": "2031-03-31"
+    },
+    {
+      "workspace": "Brindle Sandbox",
+      "tenant": "tn-orbit-lab-1",
+      "state": "active",
+      "effective_from": "2031-02-01"
+    },
+    {
+      "workspace": "Kestrel Research",
+      "tenant": "tn-kestrel-us-3",
+      "state": "active",
+      "effective_from": "2031-01-12"
+    }
+  ],
+  "catalog_first_half": [
+    {
+      "catalog_id": "TOOL-01",
+      "name": "tenant.resolve",
+      "purpose": "Map a human workspace label to its currently active tenant, excluding tombstoned migrations.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "description": "Workspace from the referenced record."
+          },
+          "as_of": {
+            "type": "string",
+            "description": "Fixed snapshot time in UTC."
+          }
+        },
+        "required": [
+          "workspace",
+          "as_of"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "tenant",
+        "status",
+        "effective_at"
+      ],
+      "side_effects": false,
+      "contract": "Ambiguous aliases require the exact workspace label; this endpoint never creates a tenant.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-02",
+      "name": "tenant.history",
+      "purpose": "Inspect completed migrations and retired tenant IDs for an audit investigation.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "description": "Workspace from the referenced record."
+          },
+          "as_of": {
+            "type": "string",
+            "description": "Fixed snapshot time in UTC."
+          }
+        },
+        "required": [
+          "workspace",
+          "as_of"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "migration_id",
+        "old_tenant",
+        "new_tenant"
+      ],
+      "side_effects": false,
+      "contract": "Historical IDs remain visible but cannot be supplied to production telemetry endpoints.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-03",
+      "name": "tenant.regions",
+      "purpose": "List regions permitted by a tenant residency agreement, without changing placement.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "environment"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "region",
+        "telemetry_allowed",
+        "storage_allowed"
+      ],
+      "side_effects": false,
+      "contract": "An allowed storage region need not be an allowed trace-processing region.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-04",
+      "name": "services.resolve",
+      "purpose": "Resolve a project and environment to its canonical runtime service identifier.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "project": {
+            "type": "string",
+            "description": "Project from the referenced record."
+          },
+          "environment": {
+            "type": "string",
+            "description": "Environment from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "project",
+          "environment"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "service",
+        "revision",
+        "active"
+      ],
+      "side_effects": false,
+      "contract": "A display name is not a service ID; staging and production have separate entries.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-05",
+      "name": "services.versions",
+      "purpose": "Read deployed revisions and traffic fractions for one service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "revision",
+        "traffic_fraction",
+        "observed_at"
+      ],
+      "side_effects": false,
+      "contract": "The largest version number is not necessarily the revision receiving live traffic.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-06",
+      "name": "services.owners",
+      "purpose": "Find the team responsible for operational response to a service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "as_of": {
+            "type": "string",
+            "description": "Fixed snapshot time in UTC."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "as_of"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "team",
+        "rotation",
+        "contact_alias"
+      ],
+      "side_effects": false,
+      "contract": "This returns a team directory record and sends no message or notification.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-07",
+      "name": "incidents.get",
+      "purpose": "Read the immutable incident header and its currently approved evidence references.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "incident_id": {
+            "type": "string",
+            "description": "Incident id from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "incident_id"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "status",
+        "environment",
+        "trace_id"
+      ],
+      "side_effects": false,
+      "contract": "Use an exact incident ID; a similarly titled incident in another environment is different.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-08",
+      "name": "incidents.search",
+      "purpose": "Search incident headers by project, severity and a closed time interval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "project": {
+            "type": "string",
+            "description": "Project from the referenced record."
+          },
+          "from_time": {
+            "type": "string",
+            "description": "Inclusive UTC start timestamp."
+          },
+          "to_time": {
+            "type": "string",
+            "description": "Exclusive UTC end timestamp."
+          }
+        },
+        "required": [
+          "tenant",
+          "project",
+          "from_time",
+          "to_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "incident_id",
+        "title",
+        "severity"
+      ],
+      "side_effects": false,
+      "contract": "Search returns candidates and never replaces exact lookup when the incident ID is already known.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-09",
+      "name": "incidents.timeline",
+      "purpose": "Read signed status transitions and reviewer comments for one incident.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "incident_id": {
+            "type": "string",
+            "description": "Incident id from the referenced record."
+          },
+          "after_sequence": {
+            "type": "integer",
+            "description": "After sequence from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "incident_id",
+          "after_sequence"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "sequence",
+        "event",
+        "reviewer"
+      ],
+      "side_effects": false,
+      "contract": "Draft notes are labeled separately; they cannot overwrite approved evidence references.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-10",
+      "name": "logs.query",
+      "purpose": "Search text log events using a bounded query and time interval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "query": {
+            "type": "string",
+            "description": "Query from the referenced record."
+          },
+          "from_time": {
+            "type": "string",
+            "description": "Inclusive UTC start timestamp."
+          },
+          "to_time": {
+            "type": "string",
+            "description": "Exclusive UTC end timestamp."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "query",
+          "from_time",
+          "to_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "cursor",
+        "event_id",
+        "message"
+      ],
+      "side_effects": false,
+      "contract": "Logs are not distributed traces and this endpoint cannot expand a trace identifier into spans.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-11",
+      "name": "logs.read",
+      "purpose": "Fetch a single stored log event with its redacted metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "event_id": {
+            "type": "string",
+            "description": "Event id from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "event_id",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "message",
+        "labels",
+        "redaction_version"
+      ],
+      "side_effects": false,
+      "contract": "An event ID is required; passing a trace ID produces an identifier-kind error.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-12",
+      "name": "metrics.timeseries",
+      "purpose": "Read sampled metric values over a specified time range.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "metric": {
+            "type": "string",
+            "description": "Metric from the referenced record."
+          },
+          "from_time": {
+            "type": "string",
+            "description": "Inclusive UTC start timestamp."
+          },
+          "to_time": {
+            "type": "string",
+            "description": "Exclusive UTC end timestamp."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "metric",
+          "from_time",
+          "to_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "timestamp",
+        "value",
+        "unit"
+      ],
+      "side_effects": false,
+      "contract": "Metric names must include units; this endpoint cannot retrieve individual request payloads.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-13",
+      "name": "metrics.histogram",
+      "purpose": "Read latency histogram buckets and sample counts for an interval.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "metric": {
+            "type": "string",
+            "description": "Metric from the referenced record."
+          },
+          "from_time": {
+            "type": "string",
+            "description": "Inclusive UTC start timestamp."
+          },
+          "to_time": {
+            "type": "string",
+            "description": "Exclusive UTC end timestamp."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "metric",
+          "from_time",
+          "to_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "bucket_bound",
+        "count",
+        "total"
+      ],
+      "side_effects": false,
+      "contract": "Percentiles are derived from returned buckets; a percentile is not an individual trace.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-14",
+      "name": "metrics.alerts",
+      "purpose": "List active alert rules and the most recent transition for a service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "rule_id",
+        "state",
+        "last_transition"
+      ],
+      "side_effects": false,
+      "contract": "A firing alert does not prove that the incident belongs to the same deployment.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-15",
+      "name": "metrics.silence",
+      "purpose": "Create a temporary suppression of notifications for a named alert rule.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "rule_id": {
+            "type": "string",
+            "description": "Rule id from the referenced record."
+          },
+          "until_time": {
+            "type": "string",
+            "description": "Until time from the referenced record."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reason from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "rule_id",
+          "until_time",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "silence_id",
+        "expires_at"
+      ],
+      "side_effects": true,
+      "contract": "This changes notification behavior and requires explicit approval; it is unsuitable for evidence lookup.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-16",
+      "name": "telemetry.trace_search",
+      "purpose": "Search a bounded trace index for matching service and operation labels.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "query": {
+            "type": "string",
+            "description": "Query from the referenced record."
+          },
+          "from_time": {
+            "type": "string",
+            "description": "Inclusive UTC start timestamp."
+          },
+          "to_time": {
+            "type": "string",
+            "description": "Exclusive UTC end timestamp."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "query",
+          "from_time",
+          "to_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "trace_id",
+        "start_time",
+        "operation"
+      ],
+      "side_effects": false,
+      "contract": "Search is for unknown trace identifiers; it may return several candidates and no complete span tree.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-17",
+      "name": "telemetry.trace_lookup",
+      "purpose": "Retrieve the stored span graph for one exact distributed trace, with optional redacted payload fields.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "trace_id": {
+            "type": "string",
+            "description": "Exact immutable distributed trace identifier."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          },
+          "include_payload": {
+            "type": "boolean",
+            "description": "Whether to include request payload fields; false unless explicitly permitted."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "trace_id",
+          "region",
+          "include_payload"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "trace_id",
+        "spans",
+        "redaction_version"
+      ],
+      "side_effects": false,
+      "contract": "The service must match the incident environment; include_payload must obey the tenant evidence policy.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    }
+  ],
+  "service_registry": [
+    {
+      "record_id": "SVC-01",
+      "workspace": "Brindle Commerce",
+      "project": "Checkout",
+      "environment": "production",
+      "service": "svc-checkout-17",
+      "region": "eu-west-3"
+    },
+    {
+      "record_id": "SVC-02",
+      "workspace": "Brindle Commerce",
+      "project": "Checkout",
+      "environment": "staging",
+      "service": "svc-checkout-09",
+      "region": "eu-west-3"
+    },
+    {
+      "record_id": "SVC-03",
+      "workspace": "Brindle Commerce",
+      "project": "Ledger",
+      "environment": "production",
+      "service": "svc-ledger-04",
+      "region": "eu-west-3"
+    },
+    {
+      "record_id": "SVC-04",
+      "workspace": "Kestrel Research",
+      "project": "Checkout",
+      "environment": "production",
+      "service": "svc-k-checkout-2",
+      "region": "us-east-2"
+    }
+  ],
+  "catalog_second_half": [
+    {
+      "catalog_id": "TOOL-18",
+      "name": "telemetry.span_tree",
+      "purpose": "Retrieve descendants of an already known span within a trace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "trace_id": {
+            "type": "string",
+            "description": "Exact immutable distributed trace identifier."
+          },
+          "span_id": {
+            "type": "string",
+            "description": "Span id from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "trace_id",
+          "span_id",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "span_id",
+        "parent_span_id",
+        "children"
+      ],
+      "side_effects": false,
+      "contract": "A span ID is mandatory; use trace_lookup when the user requests the complete trace graph.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-19",
+      "name": "telemetry.payload_get",
+      "purpose": "Retrieve an explicitly approved request body from a restricted evidence vault.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "trace_id": {
+            "type": "string",
+            "description": "Exact immutable distributed trace identifier."
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Unexpired signed approval for this resource and action."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "trace_id",
+          "approval_id",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "payload_digest",
+        "redacted_body"
+      ],
+      "side_effects": false,
+      "contract": "A separate signed payload approval is mandatory; a general incident reference is insufficient.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-20",
+      "name": "telemetry.live_watch",
+      "purpose": "Start a server-side subscription to future trace events for a service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "query": {
+            "type": "string",
+            "description": "Query from the referenced record."
+          },
+          "until_time": {
+            "type": "string",
+            "description": "Until time from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "query",
+          "until_time"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "subscription_id",
+        "expires_at"
+      ],
+      "side_effects": true,
+      "contract": "This creates subscription state and does not retrieve a previously stored exact trace.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-21",
+      "name": "deployments.get",
+      "purpose": "Read the deployment manifest and rollout phase for one deployment.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "deployment_id": {
+            "type": "string",
+            "description": "Deployment id from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "deployment_id",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "revision",
+        "phase",
+        "traffic_fraction"
+      ],
+      "side_effects": false,
+      "contract": "Deployment IDs and incident IDs use separate namespaces and are never interchangeable.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-22",
+      "name": "deployments.compare",
+      "purpose": "Compare two deployment manifests without loading artifact payloads.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "base_revision": {
+            "type": "string",
+            "description": "Base revision from the referenced record."
+          },
+          "target_revision": {
+            "type": "string",
+            "description": "Target revision from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "base_revision",
+          "target_revision"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "changed_fields",
+        "artifact_digests"
+      ],
+      "side_effects": false,
+      "contract": "The comparison describes configuration differences and does not establish causal incident evidence.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-23",
+      "name": "deployments.promote",
+      "purpose": "Move a previously approved deployment to the next traffic stage.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "deployment_id": {
+            "type": "string",
+            "description": "Deployment id from the referenced record."
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Unexpired signed approval for this resource and action."
+          }
+        },
+        "required": [
+          "tenant",
+          "deployment_id",
+          "approval_id"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "phase",
+        "traffic_fraction",
+        "operation_id"
+      ],
+      "side_effects": true,
+      "contract": "Promotion mutates live traffic and must never be selected for a read-only investigation.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-24",
+      "name": "deployments.rollback",
+      "purpose": "Restore the approved rollback revision for a live service.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "service": {
+            "type": "string",
+            "description": "Canonical service ID for the requested environment."
+          },
+          "rollback_id": {
+            "type": "string",
+            "description": "Rollback id from the referenced record."
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Unexpired signed approval for this resource and action."
+          }
+        },
+        "required": [
+          "tenant",
+          "service",
+          "rollback_id",
+          "approval_id"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "operation_id",
+        "restored_revision"
+      ],
+      "side_effects": true,
+      "contract": "An incident does not itself authorize rollback; a matching approval token is required.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-25",
+      "name": "artifacts.metadata",
+      "purpose": "Read the format, size and provenance of a build artifact.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "artifact_digest": {
+            "type": "string",
+            "description": "Artifact digest from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "artifact_digest",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "format",
+        "size_bytes",
+        "producer"
+      ],
+      "side_effects": false,
+      "contract": "A content digest is required; mutable artifact tags must first be resolved by a deployment manifest.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-26",
+      "name": "artifacts.verify",
+      "purpose": "Verify a stored artifact signature against a named trust profile.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "artifact_digest": {
+            "type": "string",
+            "description": "Artifact digest from the referenced record."
+          },
+          "trust_profile": {
+            "type": "string",
+            "description": "Trust profile from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "artifact_digest",
+          "trust_profile"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "signature_valid",
+        "signer",
+        "expires_at"
+      ],
+      "side_effects": false,
+      "contract": "Signature validity says nothing about runtime performance or incident attribution.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-27",
+      "name": "artifacts.sign",
+      "purpose": "Attach a new release signature to an immutable artifact.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "artifact_digest": {
+            "type": "string",
+            "description": "Artifact digest from the referenced record."
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Unexpired signed approval for this resource and action."
+          }
+        },
+        "required": [
+          "tenant",
+          "artifact_digest",
+          "approval_id"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "signature_id",
+        "signer"
+      ],
+      "side_effects": true,
+      "contract": "This publishes an attestation and requires release authority, even though the artifact bytes remain unchanged.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-28",
+      "name": "jobs.list",
+      "purpose": "List batch jobs belonging to one project and execution state.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "project": {
+            "type": "string",
+            "description": "Project from the referenced record."
+          },
+          "state": {
+            "type": "string",
+            "description": "State from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "project",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "job_id",
+        "created_at",
+        "worker_pool"
+      ],
+      "side_effects": false,
+      "contract": "A finished batch job is distinct from a continuously deployed service.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-29",
+      "name": "jobs.read",
+      "purpose": "Read a batch job's immutable inputs and recorded exit status.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "job_id": {
+            "type": "string",
+            "description": "Job id from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "job_id",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "inputs_digest",
+        "exit_code",
+        "log_reference"
+      ],
+      "side_effects": false,
+      "contract": "The log reference is metadata only; logs.read requires its own exact event identifier.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-30",
+      "name": "jobs.cancel",
+      "purpose": "Request cancellation of a queued or running batch job.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "job_id": {
+            "type": "string",
+            "description": "Job id from the referenced record."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reason from the referenced record."
+          }
+        },
+        "required": [
+          "tenant",
+          "job_id",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "cancel_requested",
+        "operation_id"
+      ],
+      "side_effects": true,
+      "contract": "Cancellation is irreversible for a completed job allocation and is not a telemetry query.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-31",
+      "name": "storage.list",
+      "purpose": "List object metadata under a bounded storage prefix.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Bucket from the referenced record."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Prefix from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "bucket",
+          "prefix",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "object_key",
+        "size_bytes",
+        "etag"
+      ],
+      "side_effects": false,
+      "contract": "Object listing does not read payload bytes and does not search traces by service labels.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-32",
+      "name": "storage.stat",
+      "purpose": "Read a single object's size, checksum and retention metadata.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Bucket from the referenced record."
+          },
+          "object_key": {
+            "type": "string",
+            "description": "Object key from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "bucket",
+          "object_key",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "size_bytes",
+        "checksum",
+        "retention_until"
+      ],
+      "side_effects": false,
+      "contract": "Storage keys are case-sensitive; the checksum is not a substitute for an evidence approval.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-33",
+      "name": "storage.manifest",
+      "purpose": "Fetch a small declared manifest with object references, not arbitrary object contents.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Bucket from the referenced record."
+          },
+          "object_key": {
+            "type": "string",
+            "description": "Object key from the referenced record."
+          },
+          "region": {
+            "type": "string",
+            "description": "Exact region allowed by the evidence policy."
+          }
+        },
+        "required": [
+          "tenant",
+          "bucket",
+          "object_key",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "manifest_version",
+        "entries"
+      ],
+      "side_effects": false,
+      "contract": "The object must advertise a manifest media type; payload exports use a separate approved workflow.",
+      "errors": [
+        "NOT_FOUND",
+        "SCOPE_MISMATCH"
+      ]
+    },
+    {
+      "catalog_id": "TOOL-34",
+      "name": "storage.delete",
+      "purpose": "Mark an eligible object for deletion after retention checks.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "type": "string",
+            "description": "Canonical active tenant ID."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Bucket from the referenced record."
+          },
+          "object_key": {
+            "type": "string",
+            "description": "Object key from the referenced record."
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Unexpired signed approval for this resource and action."
+          }
+        },
+        "required": [
+          "tenant",
+          "bucket",
+          "object_key",
+          "approval_id"
+        ],
+        "additionalProperties": false
+      },
+      "returns": [
+        "deletion_id",
+        "eligible_at"
+      ],
+      "side_effects": true,
+      "contract": "This mutates stored data and cannot satisfy any read-only evidence request.",
+      "errors": [
+        "APPROVAL_REQUIRED",
+        "SCOPE_MISMATCH"
+      ]
+    }
+  ],
+  "reviewed_incidents": [
+    {
+      "record_id": "INC-7427",
+      "workspace": "Brindle Commerce",
+      "project": "Checkout",
+      "environment": "production",
+      "trace_id": "tr-74a010e",
+      "state": "closed",
+      "summary": "Duplicate receipt display after mobile client retry."
+    },
+    {
+      "record_id": "INC-7428",
+      "workspace": "Brindle Commerce",
+      "project": "Checkout",
+      "environment": "staging",
+      "trace_id": "tr-5eeda11",
+      "state": "reviewed",
+      "summary": "Synthetic checkout latency test on a canary revision."
+    },
+    {
+      "record_id": "INC-7429",
+      "workspace": "Brindle Commerce",
+      "project": "Checkout",
+      "environment": "production",
+      "trace_id": "tr-f9a41c2",
+      "state": "reviewed",
+      "summary": "One payment confirmation exceeded the latency threshold; the stored trace is approved evidence."
+    },
+    {
+      "record_id": "INC-7430",
+      "workspace": "Brindle Commerce",
+      "project": "Ledger",
+      "environment": "production",
+      "trace_id": "tr-b62c709",
+      "state": "reviewed",
+      "summary": "Delayed ledger reconciliation with no checkout request impact."
+    }
+  ],
+  "evidence_policy": {
+    "record_id": "POL-TRACE-4",
+    "tenant": "tn-orbit-eu-2",
+    "trace_processing_region": "eu-west-3",
+    "include_payload": false,
+    "rule": "Incident review permits stored redacted span graphs, but never request payload fields. A trace ID already present in a reviewed incident must be looked up directly; do not search, start a subscription, or call a second tool. Migration aliases are not active tenant IDs."
+  }
+}

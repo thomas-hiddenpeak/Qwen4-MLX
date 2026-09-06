@@ -1,0 +1,13 @@
+{
+  "project": "HARBOR-17",
+  "owner": "Anika Reed",
+  "release_date": "2031-06-04",
+  "rollback": "rb-harbor-4",
+  "retention_days": 45,
+  "sources": [
+    "DOC-E07",
+    "DOC-E19",
+    "DOC-P17",
+    "POL-R03"
+  ]
+}

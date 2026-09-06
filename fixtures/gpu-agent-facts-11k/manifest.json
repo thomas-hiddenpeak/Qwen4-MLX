@@ -1,0 +1,113 @@
+{
+  "schema": "qwen38-synthetic-agent-workload-v1",
+  "fixture_id": "gpu-agent-facts-11k",
+  "synthetic": true,
+  "authorship": "Original synthetic project portfolio, field-level approval journal and retention policies",
+  "reuses_original_11k_prompt": false,
+  "repeated_padding": false,
+  "frozen_before_model_generation": true,
+  "freeze_utc": "2026-09-06T22:31:52.510403+00:00",
+  "input_tokens": 10784,
+  "output_budgets": [
+    128,
+    256
+  ],
+  "natural_eos_allowed": true,
+  "canonical_expected_output_tokens_without_eos": 68,
+  "material_counts": {
+    "project_baselines": 28,
+    "journal_entries": 20,
+    "retention_policies": 5
+  },
+  "answer_evidence": [
+    {
+      "id": "approved-release",
+      "source_fragment": "\"release_date\": \"2031-06-04\"",
+      "prompt_character_offset": 11083,
+      "prompt_character_fraction": 0.3045
+    },
+    {
+      "id": "baseline-rollback",
+      "source_fragment": "\"rollback\": \"rb-harbor-4\"",
+      "prompt_character_offset": 19357,
+      "prompt_character_fraction": 0.5318
+    },
+    {
+      "id": "approved-owner",
+      "source_fragment": "\"owner\": \"Anika Reed\"",
+      "prompt_character_offset": 28060,
+      "prompt_character_fraction": 0.7709
+    },
+    {
+      "id": "retention-policy",
+      "source_fragment": "\"retention_days\": 45",
+      "prompt_character_offset": 35073,
+      "prompt_character_fraction": 0.9635
+    }
+  ],
+  "tokenizer_metadata_sha256": {
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "config.json": "fd945111eba53ca88ca5aaf20c5355972fb9643b4b048bf5de271fa22064a687",
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+  },
+  "tokenize_runner_sha256": "2cbab9da356e373e530fed5d94f468e90620e87999c99b7a2afbf7be0f14cc24",
+  "tokenization_scope": "Existing ane-runner tokenize only; pure CPU; no model weights loaded; rendered_prompt and decoded exactly match prompt.txt",
+  "checker_sha256": "07ff8168331f5dc838008ad09ac010809eec2db5288af7da258e4052bffcb25d",
+  "files": {
+    "README.md": {
+      "sha256": "87865fa426b74ab2c485d5067a66d85035416e6fdd08f11254666ae3577a9926",
+      "bytes": 2240
+    },
+    "source-data.json": {
+      "sha256": "a1229311b5de97d3b11fc653e91231dd89689b856fb15dcee4c746d291154d2f",
+      "bytes": 34486
+    },
+    "expected.json": {
+      "sha256": "14229539151e78f38390a6e1ec2223cd7d0a5a15735e0836e4fda1b93219d09f",
+      "bytes": 218
+    },
+    "response-schema.json": {
+      "sha256": "4eda82d9e0ddd9b6bf85b06e9916f03445c24f6ce0c3138500d5bb1f273a47a6",
+      "bytes": 612
+    },
+    "system-prompt.txt": {
+      "sha256": "5364e1cd267e8ce61bbabbf281bced64b2c76f523139cd13f84a415d84b0025a",
+      "bytes": 35953
+    },
+    "user-prompt.txt": {
+      "sha256": "8b860a596ea1566bb9a49c13e803009e3c3b391804387d3fd0a74a09189e024a",
+      "bytes": 351
+    },
+    "prompt.txt": {
+      "sha256": "3c375c2cb65d96ff49dd710e0455227add649e78a155529e52cf5474a29c32b1",
+      "bytes": 36401
+    },
+    "prompt-token-ids.json": {
+      "sha256": "8fa0e14806cef623d1eee76a4b9b45c390ebeca75b62bd5c274b5bac55ef875a",
+      "bytes": 78311
+    },
+    "tokenization.json": {
+      "sha256": "2d0332fed230bce2f73988025e3745622319af47d2fea71473248391ca6d9a7e",
+      "bytes": 180184
+    },
+    "expected-tokenization.json": {
+      "sha256": "cd5925794e5dc1a85a12620dbf4301dcc64ad673a02c648769655326fb8ed4d7",
+      "bytes": 1102
+    }
+  },
+  "acceptance_note": "Functional JSON correctness is separate from full AR/MTP output-token, EOS, state and performance gates. Do not revise expected values from generation results.",
+  "checker_corrections": [
+    {
+      "previous_checker_sha256": "6fd857edf3fc73375623010e2119e5bbe555063da2b15308484376f4e15eebb9",
+      "corrected_checker_sha256": "07ff8168331f5dc838008ad09ac010809eec2db5288af7da258e4052bffcb25d",
+      "previous_manifest_sha256": "bdde43b562c1453ff9efef22618b949093708b5a9eef34a641d45345ee72c3a2",
+      "corrected_utc": "2026-09-06T22:38:17.402581+00:00",
+      "reason": "Correct the existing generate-gpu report schema: trial.prompt_tokens is a complete integer token-ID array, not its count. Compare every ID; correct README description. No generation result changed the expected answer, schema, prompt or frozen IDs.",
+      "previous_readme_fingerprint": {
+        "sha256": "fb2adfb7866298c9bc37d7ce44abb4a320eb010e60952909279032f511f0274b",
+        "bytes": 2150
+      }
+    }
+  ]
+}

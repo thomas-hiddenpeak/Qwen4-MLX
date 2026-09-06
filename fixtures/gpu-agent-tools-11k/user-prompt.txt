@@ -1,0 +1,1 @@
+For incident INC-7429 in Brindle Commerce, project Checkout, production, prepare the single read-only call that retrieves the complete stored trace graph. Resolve the active tenant, canonical service, exact trace ID, processing region and payload setting from the packet. Return only the tool JSON; do not execute it.

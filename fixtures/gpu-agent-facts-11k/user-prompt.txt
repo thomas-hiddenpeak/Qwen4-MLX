@@ -1,0 +1,1 @@
+At the packet's as-of time, retrieve the approved facts for HARBOR-17: current owner, release date, rollback reference, and retention days. Return exactly the keys project, owner, release_date, rollback, retention_days, sources. Include the minimal sorted document IDs supporting those final facts. Ignore unsigned proposals and do not execute tools.

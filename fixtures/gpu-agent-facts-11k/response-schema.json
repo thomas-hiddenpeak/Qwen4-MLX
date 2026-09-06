@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "release_date": {
+      "type": "string"
+    },
+    "rollback": {
+      "type": "string"
+    },
+    "retention_days": {
+      "type": "integer"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "project",
+    "owner",
+    "release_date",
+    "rollback",
+    "retention_days",
+    "sources"
+  ],
+  "additionalProperties": false
+}

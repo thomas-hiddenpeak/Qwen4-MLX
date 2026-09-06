@@ -1,0 +1,995 @@
+<|im_start|>system
+You are an offline project-records agent in a wholly synthetic benchmark. Every project, person, date and document below is invented test data, not real user or company information. Do not browse, call tools, infer unstated facts, or perform any external action. Read this independent portfolio packet and return exactly the JSON object requested by the user, with no Markdown, surrounding prose or reasoning. The fixed as-of time is 2031-04-30T12:00:00Z. Project IDs, not similar names, identify projects. An approved_baseline is the initial approved record. Apply only journal entries whose status is approved and whose effective_at is not after the as-of time. A change replaces only fields explicitly present in its changes object, not all fields from the baseline. If more than one approved change names the same field, use the latest effective_at. Draft and revoked entries never change approved facts even when their timestamp is later. Retention comes from the approved policy for the final data_class, not the generic default and not a draft extension. Sources must identify only the documents that directly supply the requested final facts, once each, sorted lexicographically by document ID. A baseline source remains necessary for an unchanged requested field. Use ISO dates and a JSON integer for retention_days. No answer has been generated for this fixture; all facts and the expected result were authored before inference.
+
+SYNTHETIC PORTFOLIO PACKET
+{
+  "baseline_documents_a": [
+    {
+      "document_id": "DOC-P01",
+      "project_id": "ALDER-01",
+      "display_name": "Alder",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-02T09:00:00Z",
+      "owner": "Tessa Holt",
+      "release_date": "2031-05-02",
+      "rollback": "rb-alder-2",
+      "data_class": "public-reference",
+      "workstream": "inventory reconciliation",
+      "objective": "Reconcile physical stock counts with warehouse reservations before the nightly settlement cutoff.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-inventory",
+      "dependencies": [
+        "CAT-02",
+        "REG-02"
+      ],
+      "acceptance_checks": [
+        "pallet identifiers are unique",
+        "reservation totals conserve stock",
+        "late uploads are labeled"
+      ],
+      "known_risk": "A late handheld scanner upload can duplicate a counted pallet."
+    },
+    {
+      "document_id": "DOC-P02",
+      "project_id": "BEACON-02",
+      "display_name": "Beacon",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-03T09:00:00Z",
+      "owner": "Omar Finch",
+      "release_date": "2031-05-03",
+      "rollback": "rb-beacon-3",
+      "data_class": "supplier-evidence",
+      "workstream": "accessibility review",
+      "objective": "Track accessibility findings from document previews and assign an auditable resolution owner.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-accessibility",
+      "dependencies": [
+        "CAT-03",
+        "REG-03"
+      ],
+      "acceptance_checks": [
+        "reading order matches headings",
+        "image descriptions are present",
+        "keyboard navigation covers controls"
+      ],
+      "known_risk": "A preview renderer may hide reading-order defects that remain in exported documents."
+    },
+    {
+      "document_id": "DOC-P03",
+      "project_id": "CAIRN-03",
+      "display_name": "Cairn",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-04T09:00:00Z",
+      "owner": "Leila Ash",
+      "release_date": "2031-05-04",
+      "rollback": "rb-cairn-4",
+      "data_class": "audit-derived",
+      "workstream": "field sensor intake",
+      "objective": "Collect water-level sensor batches from disconnected field gateways and reconcile their sequence numbers.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-field",
+      "dependencies": [
+        "CAT-04",
+        "REG-04"
+      ],
+      "acceptance_checks": [
+        "gateway sequences are monotone",
+        "resend batches are idempotent",
+        "missing intervals stay explicit"
+      ],
+      "known_risk": "An intermittently connected gateway can resend a complete morning batch."
+    },
+    {
+      "document_id": "DOC-P04",
+      "project_id": "DAHLIA-04",
+      "display_name": "Dahlia",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-05T09:00:00Z",
+      "owner": "Noah Mercer",
+      "release_date": "2031-05-05",
+      "rollback": "rb-dahlia-5",
+      "data_class": "operational-summary",
+      "workstream": "training enrollment",
+      "objective": "Match training enrollment requests to available course sessions without overbooking seats.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-training",
+      "dependencies": [
+        "CAT-05",
+        "REG-05"
+      ],
+      "acceptance_checks": [
+        "seat counts never exceed capacity",
+        "duplicate learners are rejected",
+        "cancellations release seats"
+      ],
+      "known_risk": "Waitlisted learners can appear in multiple requests for the same course."
+    },
+    {
+      "document_id": "DOC-P05",
+      "project_id": "ELM-05",
+      "display_name": "Elm",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-06T09:00:00Z",
+      "owner": "Priya Wren",
+      "release_date": "2031-05-06",
+      "rollback": "rb-elm-6",
+      "data_class": "public-reference",
+      "workstream": "library acquisition",
+      "objective": "Track requested technical books from order approval through catalog registration.",
+      "service_environment": "staging",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-library",
+      "dependencies": [
+        "CAT-06",
+        "REG-06"
+      ],
+      "acceptance_checks": [
+        "edition identifiers match orders",
+        "receipt counts match invoices",
+        "substitutes require review"
+      ],
+      "known_risk": "A supplier substitution may carry a different edition identifier."
+    },
+    {
+      "document_id": "DOC-P06",
+      "project_id": "FJORD-06",
+      "display_name": "Fjord",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-07T09:00:00Z",
+      "owner": "Elias Stone",
+      "release_date": "2031-05-07",
+      "rollback": "rb-fjord-7",
+      "data_class": "supplier-evidence",
+      "workstream": "route planning",
+      "objective": "Prepare ferry timetable revisions from signed operator notices and berth constraints.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-route",
+      "dependencies": [
+        "CAT-07",
+        "REG-01"
+      ],
+      "acceptance_checks": [
+        "voyages retain stable IDs",
+        "berth conflicts are detected",
+        "approved notices override drafts"
+      ],
+      "known_risk": "A notice can revise arrival times without changing the voyage identifier."
+    },
+    {
+      "document_id": "DOC-P07",
+      "project_id": "GROVE-07",
+      "display_name": "Grove",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-08T09:00:00Z",
+      "owner": "Sana Brook",
+      "release_date": "2031-05-08",
+      "rollback": "rb-grove-1",
+      "data_class": "audit-derived",
+      "workstream": "sample custody",
+      "objective": "Maintain custody transitions for laboratory samples between collection and analysis.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-sample",
+      "dependencies": [
+        "CAT-08",
+        "REG-02"
+      ],
+      "acceptance_checks": [
+        "barcodes remain unique",
+        "custody actors are recorded",
+        "handoff timestamps are ordered"
+      ],
+      "known_risk": "Two samples from one collection event can have similar handwritten labels."
+    },
+    {
+      "document_id": "DOC-P08",
+      "project_id": "HEARTH-08",
+      "display_name": "Hearth",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-09T09:00:00Z",
+      "owner": "Milo Hart",
+      "release_date": "2031-05-09",
+      "rollback": "rb-hearth-2",
+      "data_class": "operational-summary",
+      "workstream": "building maintenance",
+      "objective": "Combine inspection findings into maintenance work packages with explicit equipment scope.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-building",
+      "dependencies": [
+        "CAT-09",
+        "REG-03"
+      ],
+      "acceptance_checks": [
+        "room identifiers are mandatory",
+        "findings link to equipment",
+        "closed work has inspection evidence"
+      ],
+      "known_risk": "Several identical pumps in different rooms may share the same manufacturer label."
+    }
+  ],
+  "change_journal_a": [
+    {
+      "document_id": "DOC-E01",
+      "project_id": "ALDER-01",
+      "status": "approved",
+      "effective_at": "2031-04-03T10:00:00Z",
+      "changes": {
+        "deployment_region": "eu-west-3"
+      },
+      "reason": "The receiving warehouse now uses the same region as its reservation ledger."
+    },
+    {
+      "document_id": "DOC-E02",
+      "project_id": "CAIRN-03",
+      "status": "draft",
+      "effective_at": "2031-04-24T10:00:00Z",
+      "changes": {
+        "release_date": "2031-06-09"
+      },
+      "reason": "A proposed gateway field trial has not been approved by the project owner."
+    },
+    {
+      "document_id": "DOC-E03",
+      "project_id": "ELM-05",
+      "status": "approved",
+      "effective_at": "2031-04-06T10:00:00Z",
+      "changes": {
+        "owner": "Nadia Quinn"
+      },
+      "reason": "The acquisitions review handoff is signed and covers the owner field only."
+    },
+    {
+      "document_id": "DOC-E04",
+      "project_id": "FJORD-06",
+      "status": "revoked",
+      "effective_at": "2031-04-25T10:00:00Z",
+      "changes": {
+        "release_date": "2031-05-02"
+      },
+      "reason": "The operator withdrew this schedule after detecting an unresolved berth conflict."
+    },
+    {
+      "document_id": "DOC-E05",
+      "project_id": "GROVE-07",
+      "status": "approved",
+      "effective_at": "2031-04-08T10:00:00Z",
+      "changes": {
+        "review_queue": "queue-custody"
+      },
+      "reason": "Sample custody reviewers now use a queue separate from test-result reviewers."
+    },
+    {
+      "document_id": "DOC-E06",
+      "project_id": "HEARTH-08",
+      "status": "approved",
+      "effective_at": "2031-04-09T10:00:00Z",
+      "changes": {
+        "release_date": "2031-05-23"
+      },
+      "reason": "The approved release includes an additional equipment-room identity check."
+    },
+    {
+      "document_id": "DOC-E07",
+      "project_id": "HARBOR-17",
+      "status": "approved",
+      "effective_at": "2031-04-11T10:00:00Z",
+      "changes": {
+        "release_date": "2031-06-04"
+      },
+      "reason": "The signed release board moved the date after adding a document evidence review. This amendment changes only release_date."
+    },
+    {
+      "document_id": "DOC-E08",
+      "project_id": "IRIS-09",
+      "status": "approved",
+      "effective_at": "2031-04-12T10:00:00Z",
+      "changes": {
+        "data_class": "supplier-evidence"
+      },
+      "reason": "The reviewed image subset includes externally supplied annotation evidence."
+    }
+  ],
+  "baseline_documents_b": [
+    {
+      "document_id": "DOC-P09",
+      "project_id": "IRIS-09",
+      "display_name": "Iris",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-10T09:00:00Z",
+      "owner": "Zara Lane",
+      "release_date": "2031-05-10",
+      "rollback": "rb-iris-3",
+      "data_class": "public-reference",
+      "workstream": "media annotation",
+      "objective": "Organize image annotation batches with reviewer agreement statistics and dataset version references.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-media",
+      "dependencies": [
+        "CAT-01",
+        "REG-04"
+      ],
+      "acceptance_checks": [
+        "image digests match labels",
+        "reviewer decisions are preserved",
+        "old revisions remain distinguishable"
+      ],
+      "known_risk": "A corrected label may be attached to an obsolete image revision."
+    },
+    {
+      "document_id": "DOC-P10",
+      "project_id": "JUNIPER-10",
+      "display_name": "Juniper",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-11T09:00:00Z",
+      "owner": "Theo Birch",
+      "release_date": "2031-05-11",
+      "rollback": "rb-juniper-4",
+      "data_class": "supplier-evidence",
+      "workstream": "shipment exceptions",
+      "objective": "Connect delayed shipment reports with approved carrier exception codes and revised delivery windows.",
+      "service_environment": "staging",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-shipment",
+      "dependencies": [
+        "CAT-02",
+        "REG-05"
+      ],
+      "acceptance_checks": [
+        "carrier and shipment IDs form identity",
+        "exceptions have codes",
+        "revised windows are versioned"
+      ],
+      "known_risk": "A carrier can reuse a tracking label after an old shipment is archived."
+    },
+    {
+      "document_id": "DOC-P11",
+      "project_id": "KITE-11",
+      "display_name": "Kite",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-12T09:00:00Z",
+      "owner": "Nadia Quinn",
+      "release_date": "2031-05-12",
+      "rollback": "rb-kite-5",
+      "data_class": "audit-derived",
+      "workstream": "grant reporting",
+      "objective": "Prepare research grant milestone summaries using signed expenditure and deliverable records.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-grant",
+      "dependencies": [
+        "CAT-03",
+        "REG-06"
+      ],
+      "acceptance_checks": [
+        "expense categories are explicit",
+        "totals use integer cents",
+        "unsigned deliverables remain draft"
+      ],
+      "known_risk": "An expense may be eligible for one grant category but excluded from another."
+    },
+    {
+      "document_id": "DOC-P12",
+      "project_id": "LAUREL-12",
+      "display_name": "Laurel",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-13T09:00:00Z",
+      "owner": "Felix Rowan",
+      "release_date": "2031-05-13",
+      "rollback": "rb-laurel-6",
+      "data_class": "operational-summary",
+      "workstream": "water billing",
+      "objective": "Reconcile meter readings with tariff versions and documented adjustment approvals.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-water",
+      "dependencies": [
+        "CAT-04",
+        "REG-01"
+      ],
+      "acceptance_checks": [
+        "meter swaps are recorded",
+        "tariff dates are respected",
+        "adjustments have approval IDs"
+      ],
+      "known_risk": "A meter replacement can reset the reading while the customer account remains active."
+    },
+    {
+      "document_id": "DOC-P13",
+      "project_id": "MOSS-13",
+      "display_name": "Moss",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-14T09:00:00Z",
+      "owner": "Ada Linden",
+      "release_date": "2031-05-14",
+      "rollback": "rb-moss-7",
+      "data_class": "public-reference",
+      "workstream": "asset calibration",
+      "objective": "Track calibration intervals and certificates for portable measurement instruments.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-asset",
+      "dependencies": [
+        "CAT-05",
+        "REG-02"
+      ],
+      "acceptance_checks": [
+        "serial numbers identify instruments",
+        "certificates have dates",
+        "expired assets are flagged"
+      ],
+      "known_risk": "The same instrument can be borrowed by another team before its certificate expires."
+    },
+    {
+      "document_id": "DOC-P14",
+      "project_id": "NORTHSTAR-14",
+      "display_name": "Northstar",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-15T09:00:00Z",
+      "owner": "Ravi Marsh",
+      "release_date": "2031-05-15",
+      "rollback": "rb-northstar-1",
+      "data_class": "supplier-evidence",
+      "workstream": "volunteer scheduling",
+      "objective": "Allocate volunteer shifts using availability, role qualifications and venue limits.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-volunteer",
+      "dependencies": [
+        "CAT-06",
+        "REG-03"
+      ],
+      "acceptance_checks": [
+        "venue timezones are explicit",
+        "qualifications match roles",
+        "overlapping shifts are rejected"
+      ],
+      "known_risk": "Availability messages may refer to local dates that cross the UTC day boundary."
+    },
+    {
+      "document_id": "DOC-P15",
+      "project_id": "OPAL-15",
+      "display_name": "Opal",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-16T09:00:00Z",
+      "owner": "Iona Reed",
+      "release_date": "2031-05-16",
+      "rollback": "rb-opal-2",
+      "data_class": "audit-derived",
+      "workstream": "invoice matching",
+      "objective": "Match purchase receipts to invoice lines while retaining unmatched differences for review.",
+      "service_environment": "staging",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-invoice",
+      "dependencies": [
+        "CAT-07",
+        "REG-04"
+      ],
+      "acceptance_checks": [
+        "line totals reconcile",
+        "partial receipts remain visible",
+        "currency changes require review"
+      ],
+      "known_risk": "A supplier may split one purchase line across several partial invoices."
+    },
+    {
+      "document_id": "DOC-P16",
+      "project_id": "PINE-16",
+      "display_name": "Pine",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-17T09:00:00Z",
+      "owner": "Joel Frost",
+      "release_date": "2031-05-17",
+      "rollback": "rb-pine-3",
+      "data_class": "operational-summary",
+      "workstream": "archive discovery",
+      "objective": "Build a searchable finding aid for donated document boxes using stable accession identifiers.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-archive",
+      "dependencies": [
+        "CAT-08",
+        "REG-05"
+      ],
+      "acceptance_checks": [
+        "accession IDs disambiguate titles",
+        "box order is retained",
+        "missing dates remain unknown"
+      ],
+      "known_risk": "Folder titles can be duplicated across donations received in different years."
+    },
+    {
+      "document_id": "DOC-P17",
+      "project_id": "HARBOR-17",
+      "display_name": "Harbor",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-18T09:00:00Z",
+      "owner": "Mira Vale",
+      "release_date": "2031-05-11",
+      "rollback": "rb-harbor-4",
+      "data_class": "audit-derived",
+      "workstream": "release evidence",
+      "objective": "Publish a compact release evidence register for an internal document-processing service.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-release",
+      "dependencies": [
+        "CAT-09",
+        "REG-06"
+      ],
+      "acceptance_checks": [
+        "approved changes identify fields",
+        "rollback references remain immutable",
+        "audit-derived records follow retention policy"
+      ],
+      "known_risk": "A proposed schedule or owner handoff can appear newer than its signed approval."
+    },
+    {
+      "document_id": "DOC-P18",
+      "project_id": "QUARRY-18",
+      "display_name": "Quarry",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-19T09:00:00Z",
+      "owner": "Nora Glen",
+      "release_date": "2031-05-19",
+      "rollback": "rb-quarry-5",
+      "data_class": "supplier-evidence",
+      "workstream": "materials testing",
+      "objective": "Connect construction-material samples with batch certificates and destructive-test results.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-materials",
+      "dependencies": [
+        "CAT-01",
+        "REG-01"
+      ],
+      "acceptance_checks": [
+        "supplier identity qualifies batch IDs",
+        "units are explicit",
+        "consumed samples stay accounted for"
+      ],
+      "known_risk": "Several suppliers can use the same local batch number."
+    },
+    {
+      "document_id": "DOC-P19",
+      "project_id": "ROWAN-19",
+      "display_name": "Rowan",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-20T09:00:00Z",
+      "owner": "Amir Lake",
+      "release_date": "2031-05-20",
+      "rollback": "rb-rowan-6",
+      "data_class": "audit-derived",
+      "workstream": "meeting decisions",
+      "objective": "Record decisions and action owners from approved meeting minutes without treating discussion as a decision.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-meeting",
+      "dependencies": [
+        "CAT-02",
+        "REG-02"
+      ],
+      "acceptance_checks": [
+        "decisions cite approved minutes",
+        "open proposals are separate",
+        "owner changes need recorded consent"
+      ],
+      "known_risk": "An agenda item may recur before any vote is approved."
+    },
+    {
+      "document_id": "DOC-P20",
+      "project_id": "SPRUCE-20",
+      "display_name": "Spruce",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-21T09:00:00Z",
+      "owner": "Lena Shore",
+      "release_date": "2031-05-21",
+      "rollback": "rb-spruce-7",
+      "data_class": "operational-summary",
+      "workstream": "equipment lending",
+      "objective": "Track equipment loans, expected returns and documented condition checks.",
+      "service_environment": "staging",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-equipment",
+      "dependencies": [
+        "CAT-03",
+        "REG-03"
+      ],
+      "acceptance_checks": [
+        "kit membership is checked",
+        "return dates are recorded",
+        "damage photos reference loan IDs"
+      ],
+      "known_risk": "A returned case may contain an accessory from a different kit."
+    },
+    {
+      "document_id": "DOC-P21",
+      "project_id": "TERN-21",
+      "display_name": "Tern",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-22T09:00:00Z",
+      "owner": "Dario Moss",
+      "release_date": "2031-05-22",
+      "rollback": "rb-tern-1",
+      "data_class": "public-reference",
+      "workstream": "travel claims",
+      "objective": "Prepare reimbursement claims from signed trip approvals and dated receipts.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-travel",
+      "dependencies": [
+        "CAT-04",
+        "REG-04"
+      ],
+      "acceptance_checks": [
+        "claim currency is declared",
+        "rate dates are retained",
+        "missing receipts stay exceptions"
+      ],
+      "known_risk": "A receipt in a foreign currency can use a settlement rate from a later day."
+    },
+    {
+      "document_id": "DOC-P22",
+      "project_id": "UMBER-22",
+      "display_name": "Umber",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-23T09:00:00Z",
+      "owner": "Esme Wood",
+      "release_date": "2031-05-23",
+      "rollback": "rb-umber-2",
+      "data_class": "supplier-evidence",
+      "workstream": "document conversion",
+      "objective": "Convert archived office documents to a searchable format with page-level traceability.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-document",
+      "dependencies": [
+        "CAT-05",
+        "REG-05"
+      ],
+      "acceptance_checks": [
+        "page references survive conversion",
+        "text checksums are stored",
+        "visual review precedes release"
+      ],
+      "known_risk": "Embedded fonts may change pagination even when the visible text remains similar."
+    }
+  ],
+  "change_journal_b": [
+    {
+      "document_id": "DOC-E09",
+      "project_id": "JUNIPER-10",
+      "status": "draft",
+      "effective_at": "2031-04-27T10:00:00Z",
+      "changes": {
+        "owner": "Theo Birch"
+      },
+      "reason": "The carrier liaison has proposed a temporary owner change but lacks acceptance."
+    },
+    {
+      "document_id": "DOC-E10",
+      "project_id": "KITE-11",
+      "status": "approved",
+      "effective_at": "2031-04-14T10:00:00Z",
+      "changes": {
+        "review_queue": "queue-grant-finance"
+      },
+      "reason": "Financial eligibility review is now recorded separately from deliverable approval."
+    },
+    {
+      "document_id": "DOC-E11",
+      "project_id": "LAUREL-12",
+      "status": "approved",
+      "effective_at": "2031-04-15T10:00:00Z",
+      "changes": {
+        "release_date": "2031-06-12"
+      },
+      "reason": "A tariff effective-date fixture was added before the signed release decision."
+    },
+    {
+      "document_id": "DOC-E12",
+      "project_id": "MOSS-13",
+      "status": "revoked",
+      "effective_at": "2031-04-28T10:00:00Z",
+      "changes": {
+        "data_class": "public-reference"
+      },
+      "reason": "Certificate provenance must remain restricted; the proposed publication classification was withdrawn."
+    },
+    {
+      "document_id": "DOC-E13",
+      "project_id": "NORTHSTAR-14",
+      "status": "approved",
+      "effective_at": "2031-04-17T10:00:00Z",
+      "changes": {
+        "deployment_region": "ap-south-2"
+      },
+      "reason": "The venue calendar owner approved relocation of the synthetic scheduling dataset."
+    },
+    {
+      "document_id": "DOC-E14",
+      "project_id": "OPAL-15",
+      "status": "approved",
+      "effective_at": "2031-04-18T10:00:00Z",
+      "changes": {
+        "owner": "Iona Reed"
+      },
+      "reason": "A signed finance operations handoff named the reviewer for unmatched invoice lines."
+    },
+    {
+      "document_id": "DOC-E15",
+      "project_id": "PINE-16",
+      "status": "draft",
+      "effective_at": "2031-04-29T10:00:00Z",
+      "changes": {
+        "release_date": "2031-05-01"
+      },
+      "reason": "An accelerated finding-aid release was suggested but has not passed archival review."
+    },
+    {
+      "document_id": "DOC-E16",
+      "project_id": "QUARRY-18",
+      "status": "approved",
+      "effective_at": "2031-04-20T10:00:00Z",
+      "changes": {
+        "review_queue": "queue-supplier-materials"
+      },
+      "reason": "Batch-number conflicts require a reviewer who can resolve supplier identities."
+    },
+    {
+      "document_id": "DOC-E17",
+      "project_id": "ROWAN-19",
+      "status": "approved",
+      "effective_at": "2031-04-21T10:00:00Z",
+      "changes": {
+        "data_class": "audit-derived"
+      },
+      "reason": "The published register contains decisions derived from signed meeting minutes."
+    },
+    {
+      "document_id": "DOC-E18",
+      "project_id": "SPRUCE-20",
+      "status": "approved",
+      "effective_at": "2031-04-22T10:00:00Z",
+      "changes": {
+        "release_date": "2031-06-16"
+      },
+      "reason": "The return-condition checklist was extended to verify individual kit accessories."
+    },
+    {
+      "document_id": "DOC-E19",
+      "project_id": "HARBOR-17",
+      "status": "approved",
+      "effective_at": "2031-04-23T10:00:00Z",
+      "changes": {
+        "owner": "Anika Reed"
+      },
+      "reason": "The release evidence handoff is signed. This amendment changes only owner; all other approved fields retain their previous values."
+    }
+  ],
+  "baseline_documents_c": [
+    {
+      "document_id": "DOC-P23",
+      "project_id": "VALE-23",
+      "display_name": "Vale",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-24T09:00:00Z",
+      "owner": "Owen Clay",
+      "release_date": "2031-05-24",
+      "rollback": "rb-vale-3",
+      "data_class": "audit-derived",
+      "workstream": "workshop booking",
+      "objective": "Assign workshop machines to reserved sessions with operator qualifications and safety checks.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-workshop",
+      "dependencies": [
+        "CAT-06",
+        "REG-06"
+      ],
+      "acceptance_checks": [
+        "machine classes are explicit",
+        "operator training is current",
+        "maintenance blocks reservations"
+      ],
+      "known_risk": "A valid qualification for one machine class may not cover another."
+    },
+    {
+      "document_id": "DOC-P24",
+      "project_id": "WILLOW-24",
+      "display_name": "Willow",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-01T09:00:00Z",
+      "owner": "Alma Reed",
+      "release_date": "2031-05-01",
+      "rollback": "rb-willow-4",
+      "data_class": "operational-summary",
+      "workstream": "food distribution",
+      "objective": "Reconcile donated food lots with expiry dates and distribution-center allocations.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-food",
+      "dependencies": [
+        "CAT-07",
+        "REG-01"
+      ],
+      "acceptance_checks": [
+        "lots preserve expiry dates",
+        "cold-chain exceptions are recorded",
+        "allocations conserve quantity"
+      ],
+      "known_risk": "A donation can contain mixed expiry dates under one delivery note."
+    },
+    {
+      "document_id": "DOC-P25",
+      "project_id": "XENIA-25",
+      "display_name": "Xenia",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-02T09:00:00Z",
+      "owner": "Seth Fern",
+      "release_date": "2031-05-02",
+      "rollback": "rb-xenia-5",
+      "data_class": "public-reference",
+      "workstream": "translation review",
+      "objective": "Manage bilingual translation reviews with source revision and terminology decisions.",
+      "service_environment": "staging",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-translation",
+      "dependencies": [
+        "CAT-08",
+        "REG-02"
+      ],
+      "acceptance_checks": [
+        "source hashes identify revisions",
+        "terminology exceptions are approved",
+        "reviewer notes remain traceable"
+      ],
+      "known_risk": "A translation accepted for one source revision may be stale after a wording change."
+    },
+    {
+      "document_id": "DOC-P26",
+      "project_id": "YARROW-26",
+      "display_name": "Yarrow",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-03T09:00:00Z",
+      "owner": "Rina Cove",
+      "release_date": "2031-05-03",
+      "rollback": "rb-yarrow-6",
+      "data_class": "supplier-evidence",
+      "workstream": "visitor access",
+      "objective": "Prepare visitor access records from approved host invitations and venue rules.",
+      "service_environment": "production",
+      "deployment_region": "us-east-2",
+      "review_queue": "queue-visitor",
+      "dependencies": [
+        "CAT-09",
+        "REG-03"
+      ],
+      "acceptance_checks": [
+        "invitation IDs define identity",
+        "host approvals are required",
+        "access expires after the visit"
+      ],
+      "known_risk": "Two visitors may have the same display name and different invitation scopes."
+    },
+    {
+      "document_id": "DOC-P27",
+      "project_id": "ZEPHYR-27",
+      "display_name": "Zephyr",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-04T09:00:00Z",
+      "owner": "Jules Pine",
+      "release_date": "2031-05-04",
+      "rollback": "rb-zephyr-7",
+      "data_class": "audit-derived",
+      "workstream": "energy audits",
+      "objective": "Collect building energy observations with instrument settings and weather-context references.",
+      "service_environment": "production",
+      "deployment_region": "eu-west-3",
+      "review_queue": "queue-energy",
+      "dependencies": [
+        "CAT-01",
+        "REG-04"
+      ],
+      "acceptance_checks": [
+        "measurement windows are labeled",
+        "units are consistent",
+        "exceptional operating states are retained"
+      ],
+      "known_risk": "An observation taken during maintenance may not represent normal occupancy."
+    },
+    {
+      "document_id": "DOC-P28",
+      "project_id": "ACORN-28",
+      "display_name": "Acorn",
+      "record_status": "approved_baseline",
+      "approved_at": "2031-03-05T09:00:00Z",
+      "owner": "Anya Vale",
+      "release_date": "2031-05-05",
+      "rollback": "rb-acorn-1",
+      "data_class": "operational-summary",
+      "workstream": "museum loans",
+      "objective": "Track artwork loan agreements, shipping conditions and installation checklists.",
+      "service_environment": "production",
+      "deployment_region": "ap-south-2",
+      "review_queue": "queue-museum",
+      "dependencies": [
+        "CAT-02",
+        "REG-05"
+      ],
+      "acceptance_checks": [
+        "object IDs bind agreements",
+        "crate contents are versioned",
+        "installation checks cite conditions"
+      ],
+      "known_risk": "A shipping crate identifier can persist after its contents change."
+    }
+  ],
+  "pending_proposal": {
+    "document_id": "DOC-E20",
+    "project_id": "HARBOR-17",
+    "status": "draft",
+    "effective_at": "2031-04-29T10:00:00Z",
+    "changes": {
+      "owner": "Rohan Pike",
+      "release_date": "2031-07-12",
+      "rollback": "rb-harbor-9"
+    },
+    "reason": "A later planning proposal is unsigned and has no effect on the approved register."
+  },
+  "retention_policies": [
+    {
+      "document_id": "POL-R01",
+      "data_class": "operational-summary",
+      "status": "approved",
+      "retention_days": 30,
+      "scope": "Aggregate operational summaries without signed approval evidence. Deletion is measured from the recorded closure date.",
+      "exclusion": "This default does not apply when a more specific class is recorded."
+    },
+    {
+      "document_id": "POL-R02",
+      "data_class": "public-reference",
+      "status": "approved",
+      "retention_days": 365,
+      "scope": "Public finding aids and reference material whose publication review is complete.",
+      "exclusion": "An unpublished or restricted record is not made public by this policy."
+    },
+    {
+      "document_id": "POL-R03",
+      "data_class": "audit-derived",
+      "status": "approved",
+      "retention_days": 45,
+      "scope": "Derived registers whose source documents contain signed approvals or custody evidence.",
+      "exclusion": "This is the retention of the derived register, not the longer retention of original signed source documents."
+    },
+    {
+      "document_id": "POL-R04",
+      "data_class": "supplier-evidence",
+      "status": "approved",
+      "retention_days": 90,
+      "scope": "Supplier certificates and externally supplied evidence attached to internal decisions.",
+      "exclusion": "A supplier name alone does not change the classification of an unrelated record."
+    },
+    {
+      "document_id": "POL-R05",
+      "data_class": "audit-derived",
+      "status": "draft",
+      "retention_days": 60,
+      "scope": "Proposed extension still awaiting records-owner review.",
+      "exclusion": "Draft policies never supersede an approved policy."
+    }
+  ]
+}<|im_end|>
+<|im_start|>user
+At the packet's as-of time, retrieve the approved facts for HARBOR-17: current owner, release date, rollback reference, and retention days. Return exactly the keys project, owner, release_date, rollback, retention_days, sources. Include the minimal sorted document IDs supporting those final facts. Ignore unsigned proposals and do not execute tools.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

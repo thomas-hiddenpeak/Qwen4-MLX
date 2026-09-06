@@ -1,0 +1,114 @@
+{
+  "schema": "qwen38-synthetic-agent-workload-v1",
+  "fixture_id": "gpu-agent-tools-11k",
+  "synthetic": true,
+  "authorship": "Original synthetic tool registry and workspace records",
+  "reuses_original_11k_prompt": false,
+  "repeated_padding": false,
+  "frozen_before_model_generation": true,
+  "freeze_utc": "2026-09-06T22:31:50.181116+00:00",
+  "input_tokens": 11216,
+  "output_budgets": [
+    128,
+    256
+  ],
+  "natural_eos_allowed": true,
+  "canonical_expected_output_tokens_without_eos": 53,
+  "material_counts": {
+    "tool_cards": 34,
+    "tenant_bindings": 4,
+    "service_records": 4,
+    "incident_records": 4
+  },
+  "answer_evidence": [
+    {
+      "id": "active-tenant",
+      "source_fragment": "\"tenant\": \"tn-orbit-eu-2\"",
+      "prompt_character_offset": 1352,
+      "prompt_character_fraction": 0.0303
+    },
+    {
+      "id": "canonical-service",
+      "source_fragment": "\"service\": \"svc-checkout-17\"",
+      "prompt_character_offset": 21947,
+      "prompt_character_fraction": 0.4927
+    },
+    {
+      "id": "exact-trace",
+      "source_fragment": "\"trace_id\": \"tr-f9a41c2\"",
+      "prompt_character_offset": 43237,
+      "prompt_character_fraction": 0.9706
+    },
+    {
+      "id": "payload-policy",
+      "source_fragment": "\"include_payload\": false",
+      "prompt_character_offset": 43836,
+      "prompt_character_fraction": 0.984
+    }
+  ],
+  "tokenizer_metadata_sha256": {
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "config.json": "fd945111eba53ca88ca5aaf20c5355972fb9643b4b048bf5de271fa22064a687",
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+  },
+  "tokenize_runner_sha256": "2cbab9da356e373e530fed5d94f468e90620e87999c99b7a2afbf7be0f14cc24",
+  "tokenization_scope": "Existing ane-runner tokenize only; pure CPU; no model weights loaded; rendered_prompt and decoded exactly match prompt.txt",
+  "checker_sha256": "07ff8168331f5dc838008ad09ac010809eec2db5288af7da258e4052bffcb25d",
+  "files": {
+    "README.md": {
+      "sha256": "167b8d6c30608950bd349a6cd0908f26fd1d8663a1aab8f6d1edc8221fa19811",
+      "bytes": 2240
+    },
+    "source-data.json": {
+      "sha256": "530f3a805ebab1ce6cc67d5d5b43e382ea608ef52e1e99fc479f969585cb9b9c",
+      "bytes": 42869
+    },
+    "expected.json": {
+      "sha256": "1e87403bc09fcd59ef46d79dfb3adeb2ad74a17a44b3f8c4b324a1ca36e1adfe",
+      "bytes": 212
+    },
+    "response-schema.json": {
+      "sha256": "17615b42b583bb7b7c39623a7ea88344cf8d5b0490df9e08a0a5bf22818489d6",
+      "bytes": 720
+    },
+    "system-prompt.txt": {
+      "sha256": "3fd413c56157d4769008deb31de68c95e64d5e414d1ac6f227bbd2cf4be37a3d",
+      "bytes": 44133
+    },
+    "user-prompt.txt": {
+      "sha256": "4df909bbbfa80935a68a02c35a22385a5b2b1c8deabb590245b7cae30a8c85b7",
+      "bytes": 318
+    },
+    "prompt.txt": {
+      "sha256": "7e3b77bba5dca70596a942745838f6eb6abae706a9954206959a82bd8b0c2497",
+      "bytes": 44548
+    },
+    "prompt-token-ids.json": {
+      "sha256": "b73512d800f78446a3c4b14426ad9bfaf8ec6872eb6f8e32873249d26791091c",
+      "bytes": 82929
+    },
+    "tokenization.json": {
+      "sha256": "6bf21ba4c41df23bc0577d60153eeff024ac7214cb2c8e31f33cb9897f67e906",
+      "bytes": 203962
+    },
+    "expected-tokenization.json": {
+      "sha256": "fb36d063257e28c7b5b2c03291328889c234fe17c4eb125c75036229e87905c5",
+      "bytes": 962
+    }
+  },
+  "acceptance_note": "Functional JSON correctness is separate from full AR/MTP output-token, EOS, state and performance gates. Do not revise expected values from generation results.",
+  "checker_corrections": [
+    {
+      "previous_checker_sha256": "6fd857edf3fc73375623010e2119e5bbe555063da2b15308484376f4e15eebb9",
+      "corrected_checker_sha256": "07ff8168331f5dc838008ad09ac010809eec2db5288af7da258e4052bffcb25d",
+      "previous_manifest_sha256": "caa9aefcd69e0d643a4d255d37cbf999b70d2b6f0c0ad73ab159997ce45c19ee",
+      "corrected_utc": "2026-09-06T22:38:17.402581+00:00",
+      "reason": "Correct the existing generate-gpu report schema: trial.prompt_tokens is a complete integer token-ID array, not its count. Compare every ID; correct README description. No generation result changed the expected answer, schema, prompt or frozen IDs.",
+      "previous_readme_fingerprint": {
+        "sha256": "bbc7bdd47b5958d1960ddc9ddaf7c9d02783e7ae8c87c08169ddb517e95912c5",
+        "bytes": 2150
+      }
+    }
+  ]
+}
