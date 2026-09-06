@@ -105,6 +105,7 @@ extension RunnerCLI {
                 let matrix = test.matrices[slot]
                 let mode = modes[modeIndex]
                 try mode.apply() // Selection setup is outside the timed NEW graph.
+                let dispatchBefore = try mode.prefetchDispatchCount()
                 let phase = test.name + "." + mode.rawValue + (warmup ? ".warmup" : "")
                 let start = GPUCommandTimingSession.now()
                 // Always build a NEW matmul graph; evaluating a prior result
@@ -113,15 +114,25 @@ extension RunnerCLI {
                 let forwardEnd = GPUCommandTimingSession.now()
                 try MX.eval([y])
                 let evaluationEnd = GPUCommandTimingSession.now()
+                let dispatchAfter = try mode.prefetchDispatchCount()
+                if let before = dispatchBefore, let after = dispatchAfter {
+                    let expected: UInt64 = test.name == "gdn_qkv" ? 1 : 0
+                    guard after >= before && after - before == expected else {
+                        throw CLIError.usage("Unexpected GDN prefetch dispatch count for \(test.name)/\(mode.rawValue)")
+                    }
+                }
                 timing?.step(phase: phase, repetition: modeIndex, index: index, inputTokens: 0,
                     start: start, forwardEnd: forwardEnd, evaluationEnd: evaluationEnd)
-                let record: [String: Any] = [
+                var record: [String: Any] = [
                     "phase": phase, "index": index, "weight_slot": slot, "gdn_gemv_mode": mode.rawValue,
                     "start_ns": start, "forward_end_ns": forwardEnd,
                     "evaluation_end_ns": evaluationEnd,
                     "cpu_wall_seconds": Double(evaluationEnd - start) * 1e-9,
                     "logical_weight_bytes": test.descriptions[slot]["source_bytes"]!,
                 ]
+                if let before = dispatchBefore, let after = dispatchAfter {
+                    record["prefetch_dispatch_count"] = after - before
+                }
                 return (y, record)
             }
 

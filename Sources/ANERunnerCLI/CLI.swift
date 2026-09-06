@@ -302,7 +302,7 @@ struct RunnerCLI {
         Decode: --decode-mode reference|scalar|elementwise|projections|all (default: reference)
         Residency: --wired-policy disabled|fit (default: disabled; setup excluded from request timing)
         Interleaved trials: --decode-order CSV and/or --wired-order CSV (one value per repetition, at most 10)
-        GDN tuning library: --gdn-gemv-mode reference|bm4|rows4|bm2|bm1|gemm|gemmSplit or --gdn-gemv-order CSV
+        GDN tuning library: --gdn-gemv-mode reference|bm4|rows4|bm2|bm1|gemm|gemmSplit|prefetch4|prefetch4Vector or --gdn-gemv-order CSV
         Profiling: --profile-stages disabled|hostBodyOnly|synchronizedStages
         System telemetry: --telemetry-dir NEW_PATH [--telemetry-interval-ms 200]
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
@@ -322,7 +322,7 @@ struct RunnerCLI {
         Validate the isolated native timing hook with tiny matrices; no model load.
     probe-gpu-matvec --model-dir PATH --output NEW_JSON_PATH [--repeats 16] [--gpu-command-timing-output NEW_JSON_PATH]
         Diagnose real BF16 GDN/head matrix-vector kernels with synthetic fixed inputs; not full-model inference.
-        GDN tuning library: --gdn-gemv-order reference,bm4,rows4,bm2,bm1,gemm,gemmSplit
+        GDN tuning library: --gdn-gemv-order reference,bm4,rows4,bm2,bm1,gemm,gemmSplit,prefetch4,prefetch4Vector
         Exploratory GEMM rounding check: --allow-rounding true (default false; records the measured error)
     probe-gpu-model --model-dir PATH --tokens-file PATH --capture-output PATH [--layers 1] [--output report.json]
         Capture real hidden states from the first few GPU layers for numerical validation.

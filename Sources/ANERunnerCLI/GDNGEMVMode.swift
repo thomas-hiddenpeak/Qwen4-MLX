@@ -2,7 +2,21 @@ import Darwin
 
 /// Trial-local selection in the separately staged MLX experimental library.
 enum GDNGEMVMode: String, CaseIterable {
-    case reference, bm4, rows4, bm2, bm1, gemm, gemmSplit
+    case reference, bm4, rows4, bm2, bm1, gemm, gemmSplit, prefetch4, prefetch4Vector
+
+    /// Optional counter for the narrowly dispatched load-lookahead candidates.
+    func prefetchDispatchCount() throws -> UInt64? {
+        guard self == .prefetch4 || self == .prefetch4Vector else { return nil }
+        guard let library = dlopen(nil, RTLD_NOW) else {
+            throw CLIError.usage("Cannot inspect loaded MLX library")
+        }
+        defer { dlclose(library) }
+        guard let symbol = dlsym(library, "anemlx_gdn_prefetch_dispatch_count") else {
+            throw CLIError.usage("GDN prefetch experiments require the dispatch counter export")
+        }
+        typealias Counter = @convention(c) (Int32) -> UInt64
+        return unsafeBitCast(symbol, to: Counter.self)(self == .prefetch4 ? 7 : 8)
+    }
 
     func apply() throws {
         guard let library = dlopen(nil, RTLD_NOW) else {
@@ -24,6 +38,8 @@ enum GDNGEMVMode: String, CaseIterable {
         case .bm1: value = 4
         case .gemm: value = 5
         case .gemmSplit: value = 6
+        case .prefetch4: value = 7
+        case .prefetch4Vector: value = 8
         }
         typealias Maximum = @convention(c) () -> Int32
         let maximum = dlsym(library, "anemlx_gdn_gemv_max_mode").map {
