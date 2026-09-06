@@ -35,6 +35,14 @@ public final class GPUGatedDeltaNet {
         public let recurrentStates: Tensor
         /// [1,S+3,10240], old three-token convolution history followed by QKV.
         public let convInputs: Tensor
+
+        /// Public construction supports isolated verification probes; prefix
+        /// commit remains responsible for the existing shape/offset checks.
+        public init(initialOffset: Int, recurrentStates: Tensor, convInputs: Tensor) {
+            self.initialOffset = initialOffset
+            self.recurrentStates = recurrentStates
+            self.convInputs = convInputs
+        }
     }
     public struct State {
         public var convHistory: Tensor?

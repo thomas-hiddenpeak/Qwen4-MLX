@@ -6,8 +6,7 @@ import Foundation
 extension RunnerCLI {
     /// Sequence validation, with an optional blocked-only recurrence timing probe.
     static func probeGPUSequence(_ args: Arguments) throws {
-        try args.validate(["--model-dir","--fixture","--output","--max-relative-l2","--fused","--prework","--blocked-only"])
-        let model = URL(fileURLWithPath: try args.require("--model-dir"),isDirectory: true)
+        try args.validate(["--model-dir","--fixture","--output","--max-relative-l2","--fused","--prework","--blocked-only","--replay-only","--replay-repeats"])
         let manifestURL = URL(fileURLWithPath: try args.require("--fixture"))
         let manifestData = try Data(contentsOf: manifestURL)
         let decoder = JSONDecoder()
@@ -17,12 +16,32 @@ extension RunnerCLI {
               let tolerance = Double(args["--max-relative-l2"] ?? "0.005"), tolerance >= 0, tolerance.isFinite,
               ["true","false"].contains(args["--fused"] ?? "true"),
               ["true","false"].contains(args["--prework"] ?? "false"),
-              ["true","false"].contains(args["--blocked-only"] ?? "false") else {
+              ["true","false"].contains(args["--blocked-only"] ?? "false"),
+              ["true","false"].contains(args["--replay-only"] ?? "false"),
+              !(args["--blocked-only"] == "true" && args["--replay-only"] == "true") else {
             throw CLIError.usage("Invalid sequence reference or tolerance; --fused/--prework accept true/false")
         }
         let runFused = (args["--fused"] ?? "true") == "true"
         let runPrework = (args["--prework"] ?? "false") == "true"
         let directory = manifestURL.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        if args["--replay-only"] == "true" {
+            guard let repeats = Int(args["--replay-repeats"] ?? "16"), (4...64).contains(repeats),
+                  let step = manifest.cases.first(where: { $0.kind == "gdn" })?.steps.first,
+                  step.file == URL(fileURLWithPath: step.file).lastPathComponent else {
+                throw CLIError.usage("GDN replay probe requires a GDN fixture and --replay-repeats in 4...64")
+            }
+            let url = directory.appendingPathComponent(step.file).resolvingSymlinksInPath()
+            guard url.deletingLastPathComponent() == directory, try sequenceSHA256(url) == step.sha256 else {
+                throw CLIError.usage("GDN replay fixture path or SHA-256 mismatch")
+            }
+            try probeGDNReplay(GPUSequenceTensors(url).tensors, fixturePath: url.path,
+                fixtureSHA256: step.sha256, manifestSHA256: sequenceSHA256(manifestURL),
+                repeats: repeats, output: args.require("--output"))
+            return
+        }
+        guard args["--replay-repeats"] == nil else {
+            throw CLIError.usage("--replay-repeats requires --replay-only true")
+        }
         if args["--blocked-only"] == "true" {
             guard let step = manifest.cases.first(where: { $0.kind == "gdn" })?.steps.first,
                   step.file == URL(fileURLWithPath: step.file).lastPathComponent else {
@@ -35,6 +54,7 @@ extension RunnerCLI {
             try probeBlockedGDN(GPUSequenceTensors(url), tolerance: tolerance, output: args["--output"])
             return
         }
+        let model = URL(fileURLWithPath: try args.require("--model-dir"),isDirectory: true)
         let weights = try GPUWeights(modelDirectory: model)
         let fused = runFused ? try GPUGatedDeltaNetFused() : nil
         var cases = [[String: Any]](), allPassed = true
