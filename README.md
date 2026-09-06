@@ -6,7 +6,7 @@
 
 **当前生成默认：chunk416、SSD 跨块预取 `nextChunk`、1 个 SSD worker，并开启符合条件的融合 causal attention。** `ANERUNNER_FUSED_PREFILL=0` 可关闭融合 attention；GDN blocked 仍关闭，每 4 层同步。MTP 默认关闭，原生 head 和生成会话 API 已接入实验路径，详见 [MTP 与会话接口](MTP_AND_SESSIONS.md)。
 
-源权重格式和 `reference` BF16 prefill 累加不变，另提供 FP32 累加实验选项；chunk416 已改变跨块状态舍入边界，因此不宣称保留作者全部数值语义。新默认配置的输出一致性验证目前限于同一份 1,217-token 文档提示、64-token 生成。构建、普通使用示例和验证范围见 [GPU runner 使用与验证](GPU_RUNNER.md)。已有 Core ML / ANE 探针继续保留，以下记录的是此前局部 ANE 实验，不代表整模型使用 ANE。
+源权重格式和 `reference` BF16 prefill 累加不变，另提供 FP32 累加实验选项；chunk416 已改变跨块状态舍入边界，因此不宣称保留作者全部数值语义。最初默认切换的验证使用 1,217-token 文档提示与64-token生成；后续11k回归及不同候选的验证范围分别记录在 [GPU runner 使用与验证](GPU_RUNNER.md)和下方实验文档中。已有 Core ML / ANE 探针继续保留，以下记录的是此前局部 ANE 实验，不代表整模型使用 ANE。
 
 普通单 token decode 的性能诊断入口见 [采样、GPU 时间轴与指标口径](TELEMETRY.md)：`generate-gpu --telemetry-dir NEW_PATH` 可保存进程／系统采样，离线分析按载入、预填充与解码分开；有无采样的整模型配对已经保存，GPU trace 本模型结果仍单独核验。物理 DRAM 带宽不可用时保持 `null`。
 
@@ -21,6 +21,18 @@ Prefill MoE 的[专家分组融合](docs/MOE_PREFILL_EXPERT.md)已可通过配�
 [上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)已核对 vLLM、SGLang 与 Redis 作者的 DwarfStar 源码，按本机需求安排 GDN 载入实验、MTP 成本摘要、调度延迟、完整前缀状态与 SSD 缓存；计划中的候选尚不代表已支持。
 
 [MTP 请求成本摘要](docs/MTP_COST_SUMMARY.md)已接入 JSON 与库结果，区分实际输出、起草轮次和预算收尾；[调度延迟分析](docs/SCHEDULER_LATENCY_EXPERIMENT.md)可从原始 callback 时钟报告 p50/p95/max，并比较既有 decodeBurst 参数。它们补足统计，不改变生成策略和默认内核。
+
+新增[两个独立长任务的 MTP 回归](docs/MTP_AGENT_EXPANSION.md)：冻结工具 JSON 与项目事实检索输入，24轮完整输入/输出 token 和功能答案通过。实际自然结束于85/110输出token；128/256预算分别保留，性能仍须独立时间窗口复测，MTP保持可选。
+
+实验性 [HTTP/SSE 服务](docs/HTTP_SERVER_EXPERIMENT.md)已通过29项相关CPU测试与19项真实网络检查。仅监听本机，支持文本聊天、greedy、AR默认，以及显式 `mtp_depth: 2`（最多256输出预算）；工具调用协议、采样和完整OpenAI兼容尚未实现。网络队列与固定推理线程分离，有界连接、排队和输出；prefill/decode独立计时。启动示例：
+
+```bash
+.build/release/ane-runner serve-gpu \
+  --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
+  --port 11236
+```
+
+整模型占用较大，运行前应确保参考服务或其他模型实验已退出；本项目实验控制器会核对并恢复其管理的参考服务。
 
 ## 早期 Core ML / ANE 验证（2026-09-05）
 

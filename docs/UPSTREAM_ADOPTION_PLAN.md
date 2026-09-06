@@ -21,7 +21,7 @@
 - GDN / PLE / Attention / QSA / MTP 的事务状态交接。当前 prefill handle 单次消费，尚不具备多请求共享 checkpoint 的生命周期。
 - SSD PLE 预取、专用 MoE / GDN 探针、独立原生库构建和可恢复的实验控制器。
 
-这些基础支持下面的局部实验；不表示已有 HTTP 服务、跨进程 PD、连续批处理或共享前缀树。此前 MoE 组合单层 +5.21%，完整 prefill 828→824 token/s，已保留为可选，并未因此替换默认。
+这些基础支持下面的局部实验；新HTTP入口的有限验收单列于下表，跨进程 PD、连续批处理及共享前缀树仍未实现。此前 MoE 组合单层 +5.21%，完整 prefill 828→824 token/s，已保留为可选，并未因此替换默认。
 
 ## 实施顺序与决策
 
@@ -30,16 +30,16 @@
 | 1A，已实现并回归 | [MTP 请求成本摘要](MTP_COST_SUMMARY.md) | 既有计数导出实际 decode token/s、平均步骤产出、草稿浪费和计时覆盖；不增加同步 | 46项相关CPU检查、9轮11k及预算/EOS通过，原始字段可重算 |
 | 1B，本版未通过性能筛选 | [GDN BF16 提前载入](GDN_PREFETCH_EXPERIMENT.md) | 仅 S1、K2560/N10240 QKV，原 lane/FMA/归约顺序；scalar 与 vector 两种 load | 四层权重逐位与命中计数通过，但QKV约慢1%–2%，未进入整模型 |
 | 1C，已完成首轮 | [输出间隔与调度实验](SCHEDULER_LATENCY_EXPERIMENT.md) | 实际 callback p50/p95/max、提交到终态耗时、既有 decodeBurst 参数 | 同时提交11k与短请求后交错，各18项gate通过；burst4/8正序观察有漂移，默认未改，延迟到达场景另测 |
-| 2A | MTP depth 0/1/2 成本对照 | 先静态配置，不在线切换；高接受和低接受各一个真实任务 | 单独报告 prefill、decode 与服务等待；以实际输出/总 decode 时间判断，而非接受率 |
+| 2A，新增长任务首轮完成 | [MTP 长任务扩展](MTP_AGENT_EXPANSION.md) | 原11k之外独立冻结工具JSON与事实检索；AR与拟发布D2各测128/256预算 | 24轮完整IDs/功能答案/EOS通过；单独报告prefill和decode，仍须多窗口稳定收益，不在线切换 |
 | 2B，单层筛选已完成 | [GDN ReplaySSM](GDN_REPLAY_FEASIBILITY.md) | 复用现有小 recurrence，生产capture不变 | 720项逐位比较通过，S3加权单层约+2%–3.5%；尚不足以证明整模型收益，暂不替换生产路径 |
 | 2C，单层筛选未达门槛 | [shared/routed down 调度](MOE_BRANCH_OVERLAP_FEASIBILITY.md) | 合并两个down节点的输入hazard，再调用原primitive；MLX本来已用concurrent encoder | 三行逐位与编码计数通过，reference/fused约+3.04%/+4.16%，未达5%，pair未稳定胜过串行/原recipe，不进入整模 |
 | 3，依赖 MTP/生命周期稳定 | 不可变内存 checkpoint | 先有界精确系统提示词表、私有恢复，再加最长前缀索引 | 10k 公共前缀 + 不同后缀，A/B/A 无污染；节省的 prefill 大于保存/恢复成本 |
 | 4，依赖内存 checkpoint | SSD 状态缓存 | 有版本、身份与完整性校验的文件，独立磁盘额度，有界读写 | 冷盘恢复快于重算，损坏/中断写入正常回退，不拖慢 PLE 读取 |
-| 服务交付线，CPU边界已实现 | [HTTP/SSE、背压和断连](HTTP_SSE_SERVICE_PLAN.md) | 有界SSE缓冲和增量UTF8共18项CPU检查通过；固定推理线程的loopback网络入口正在接入 | 还须真实网络慢读/断连/并发及AR/MTP验收，不能把CPU模块当成已完成服务 |
+| 服务交付线，实验入口首轮通过 | [HTTP/SSE、背压和断连](HTTP_SERVER_EXPERIMENT.md) | 固定推理线程、独立网络队列、有界输出及text-only协议；29项CPU与19项live检查 | AR/MTP成功响应、并发、预填充RST清理及活动SIGTERM通过；生成中断、连接/期限和持续运行继续补测 |
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 
-当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。已补原始GPU状态与系统thermal等级采样，接下来与新任务一起记录；目前不能归因为训练或热降频。
+当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。新增长任务同时记录了原始GPU状态与系统thermal等级，观察到档位分布变化及nominal→fair，详见其报告；这是关联证据，尚未单独建立降速因果。
 
 ## MTP 的统计与状态约束
 

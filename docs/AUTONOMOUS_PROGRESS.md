@@ -15,7 +15,7 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新参考服务：PID6275，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/gpu-drift-trace-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
+最新参考服务：PID9437，`http://127.0.0.1:11235`，MTP/drafter关闭。最新恢复ledger为`results/http-service-v1/run-ledger.json`。执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -23,8 +23,8 @@
 
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
-3. 固定AR命令缓冲诊断已完成，主要漂移在GPU跨度内；已补原始GPU档位/系统热压力采样。下一GPU工作是两个独立长任务的AR/MTP回归，同时采集状态分布。
-4. 有界SSE缓冲和增量UTF8已通过18项CPU测试；正在写仅loopback的实验HTTP服务，固定推理线程、独立网络队列。尚未完成网络/真实模型验收。
+3. 固定AR命令缓冲诊断及GPU档位/系统热压力采样已完成。两个独立长任务的24轮AR/MTP回归通过；初轮性能单窗口且一组AR漂移超5%，尚未通过MTP稳定性能发布门槛。
+4. loopback实验HTTP服务、协议与有界SSE/UTF8合计29项CPU和19项真实网络检查通过；原服务已恢复。下一步补MTP生成中网络断连、连接上限和接收期限，随后做预先约定的MTP性能窗口。
 
 ## 接续记录
 
@@ -41,3 +41,5 @@
 - 06:10：驻留六轮已完成并独立复核，fit未消除漂移，进程内采样pageins为0且footprint稳定；VM时钟基准不匹配，保留整体数据、不作阶段归因，见RESIDENCY_DRIFT_DIAGNOSIS.md。MoE双down已构建并完成reference/fused两组：三行真实输入逐位及各87/87次原生调用通过，完整单层墙钟约+3.04%/+4.16%，未达5%门槛，pair不稳定胜过serial/recipe，不进入完整模型。服务已恢复PID5357，当前无GPU实验运行。
 
 - 06:24：`aed3e86`已推送并核对远程SHA。固定AR trace三轮完整128 IDs一致，135848 buffers完整无丢失；暖轮prefill新增耗时97.71%、decode76.80%落在GPU跨度内，见GPU_DRIFT_TRACE.md。服务恢复PID6275。GPUStateSampler读取两路原始state及thermalState，空闲采样6个delta/端点通过，不映射MHz。Core SSE缓冲10项+UTF8 8项测试通过，日志results/service-core-v1/tests.log。redis_runner_research正在写HTTP服务；vllm_sglang_research写独立CPU协议层；gdn_pipeline_probe写两个新冻结synthetic长任务及功能checker。三者均不得启动模型或自行build；root协调唯一GPU与统一编译。当前尚无GPU实验运行。
+
+- 07:05左右：两个独立长任务24轮通过并已提交推送`cb23860`，见MTP_AGENT_EXPANSION.md；GPU状态出现nominal→fair及档位分布变化，仅作关联。HTTP release构建49.66s、29项CPU与19项live全部通过，controller已退出并恢复参考PID9437。新入口保持实验性、AR默认、MTP2最多256预算。下一批由vllm_sglang_research准备网络边界脚本（无GPU权），gdn_pipeline_probe准备既定MTP性能窗口分析与草案（无GPU权），redis_runner_research只读设计完整prefix checkpoint（不接生产）。当前root持有唯一GPU启动/构建/Git权，尚无GPU实验运行。

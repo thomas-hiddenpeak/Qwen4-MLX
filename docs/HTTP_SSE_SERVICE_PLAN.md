@@ -1,6 +1,6 @@
 # 本机 HTTP/SSE 的最小接入
 
-2026-09-07：现有 runner 仍没有 HTTP 服务。生成器和 cooperative scheduler 已提供服务所需的推理入口；本轮先补独立 CPU 输出边界，不改变模型、调度策略或默认 kernel。
+2026-09-07：本文保存 HTTP 接入的设计约束与首批 CPU 输出边界。随后已实现实验入口并完成29项相关CPU、19项真实loopback检查，当前支持范围与未覆盖项见 [服务验收](HTTP_SERVER_EXPERIMENT.md)。模型、调度策略和默认 kernel 没有因接入服务而改变。
 
 ## 已有接口与接入点
 
@@ -42,4 +42,4 @@ Apple 的 `contentProcessed` 表示连接已处理内容，不是客户端已经
 
 本模块对应 [`QwenSSEOutputBufferTests`](../Tests/ANERunnerCoreTests/QwenSSEOutputBufferTests.swift)：byte/event 上限、in-flight 额度、overflow 输出前缀、终态竞争、迟到 send failure、断连和并发 enqueue。现有 local/cooperative scheduler 测试继续负责 job 与 GPU handoff 的释放；它们不等同于 HTTP 验收。
 
-当前新文件已完成同行只读审阅和集中构建，18 项 CPU 测试通过（缓冲 10 项、UTF-8 8 项，`results/service-core-v1/tests.log`）；网络层仍待验收。下一 gate：用假 backend 和真实 loopback TCP 客户端核对正常/SSE/慢读/断连/过载；最后才使用真实 11k + 短请求并测 AR/MTP。服务记录 request 接收、scheduler admission、首帧入队、首帧 contentProcessed、推理终态和传输结束时间，继续单独保存 prefill/decode compute 时间，不把 socket 指标称为客户端实际 TTFT。
+首批缓冲10项、UTF-8 8项CPU测试通过（`results/service-core-v1/tests.log`）。随后协议层再补11项，直接使用真实模型完成首轮网络回归；未构建额外假backend。服务已分别记录prefill/decode与scheduler总耗时，传输时刻仍用于内部期限管理，尚未完整导出接收、admission、首帧与传输结束的分段时间；不能把内部send callback称为客户端实际TTFT。后续网络边界以[服务验收](HTTP_SERVER_EXPERIMENT.md)中的实际覆盖为准。

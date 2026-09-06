@@ -104,6 +104,8 @@ struct RunnerCLI {
                 try probeGPUCooperativeScheduler(arguments)
             case "probe-moe-down-pair-gpu":
                 try probeGPUMoEDownPair(arguments)
+            case "serve-gpu":
+                try serveGPU(arguments)
             case "probe-gpu-session":
                 try probeGPUSession(arguments)
             case "probe-gpu-mtp-numerics":
@@ -299,6 +301,9 @@ struct RunnerCLI {
             [--decode-burst 4] (1...64 steps; includes first-token publication)
         MoE down scheduling probe: probe-moe-down-pair-gpu --model-dir PATH
             --pair-library ABSOLUTE_DYLIB --output NEW.json [--shared-elementwise reference|fused]
+        Experimental loopback service: serve-gpu --model-dir PATH [--port 11236]
+            [--max-connections 8 --max-body-bytes 262144 --output-buffer-bytes 65536]
+            Text-only greedy chat and SSE; AR default, explicit experimental mtp_depth=2.
         Experimental draft prompt history: --mtp-draft-history full|1024 (default full); target context remains complete.
         Precision: --prefill-accumulation reference|float32 (default: reference)
         Fused causal prefill: enabled by default (M5, sequence > 8; QSA unchanged); ANERUNNER_FUSED_PREFILL=0 disables it
