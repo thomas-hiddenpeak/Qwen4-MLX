@@ -15,9 +15,9 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新已验证参考服务：PID17773，`http://127.0.0.1:11235`，MTP/drafter关闭，08:29:32恢复ready，08:32冻结B前再次核对。最新已完成恢复ledger为`results/mtp-release-window-a/run-ledger.json`。这是窗口A结束时的快照；当前参考已由B控制器暂停，后续恢复PID以B ledger为准，不能沿用17773。
+最新已验证参考服务：PID21912，`http://127.0.0.1:11235`，MTP/drafter关闭，09:19:29恢复ready；root随后核对精确argv、11235监听归属、meta及空闲指标。最新已完成恢复ledger为`results/mtp-release-window-b/run-ledger.json`。此为B结束时快照，下一controller启动前仍须重新核对。
 
-北京时间08:32，参考17773已交由窗口B控制器接管。当前唯一GPU任务是`results/mtp-release-window-b/controller-plan.json`，controller PID18230，exec session45809，ledger启动UTC00:32:11。09:04核对时已完成8进程64轮，完整IDs gate均通过，正在执行`tools-128-part1`（PID21030）。分析计划为同目录`plan.json`，当前case和后续恢复以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
+窗口B controller18230/session45809已exit0，12进程全部清理并恢复参考21912。A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通过/13漂移未定，双窗口性能门槛未通过。root完成B的91文件postflight后于09:21:32解除旧版本冻结，应用HTTP修复v3及日志验证脚本v2，release build49.91秒及36项Swift CPU/6项Python解析控制通过。新二进制为c93011f。当前唯一GPU任务是HTTP四case回归，controller22649/session27178于09:24:53启动，正在live case（harness22689）；参考21912已由controller暂停。正式plan与最新ledger在`results/http-output-fix-regression-v1/`。90文件与二进制再次冻结，运行期间不得改生产源码或构建；其他candidate均仍ignored。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -26,16 +26,16 @@
 1. 三项目调研、吸收计划、MTP成本与输出延迟统计已实现并回归。
 2. GDN prefetch、Replay及MoE双down完成局部筛选，均未提升为默认。
 3. 固定AR命令缓冲诊断及GPU档位/系统热压力采样已完成。两个独立长任务的24轮AR/MTP回归通过；初轮性能单窗口且一组AR漂移超5%，尚未通过MTP稳定性能发布门槛。
-4. loopback实验HTTP服务通过29项CPU、首轮19项live、补充15项网络边界及固定12周期的46项短soak检查。窗口A实际完成12进程96请求，完整IDs/配置/阶段通过；18组性能11组通过、7组漂移待定，不改默认。完整逐组和独立prefill数据见[两窗口执行记录](MTP_RELEASE_WINDOWS.md)。窗口B已单独冻结并按反向case顺序运行，预计约50分钟，结束后合并分析并保留所有未定组。
-5. 控制器安全中断已完成：每个case使用自有进程组，TERM宽限45秒、必要时KILL后等10秒，确认整组清空才恢复参考；SIGTERM/INT只置flag，在安全点转入finally。4项CPU控制与真实controller中断smoke通过，详见[控制器合同](EXPERIMENT_CONTROLLER.md)。窗口A以`results/controller-interrupt-v1/run-ledger.json`作为predecessor；91文件preflight通过。嵌套分析plan仅用于分析，实际执行为12case扁平controller-plan。生产Swift二进制维持f95565c，推理源码及controller/helper身份冻结；窗口A/B完成或root明确解除冻结前不得修改这些代码或构建。
+4. loopback实验HTTP服务通过29项CPU、首轮19项live、补充15项网络边界及固定12周期的46项短soak检查。窗口A实际完成12进程96请求，完整IDs/配置/阶段通过；18组性能11组通过、7组漂移待定，不改默认。完整逐组和独立prefill数据见[两窗口执行记录](MTP_RELEASE_WINDOWS.md)。窗口B已完成并合并分析：12组通过/6组漂移未定；A/B的13个未定组全部保留，包括B原256第三组原始倍率0.840651，不认定稳定加速或失败。
+5. 控制器安全中断已完成：每个case使用自有进程组，TERM宽限45秒、必要时KILL后等10秒，确认整组清空才恢复参考；SIGTERM/INT只置flag，在安全点转入finally。4项CPU控制与真实controller中断smoke通过，详见[控制器合同](EXPERIMENT_CONTROLLER.md)。窗口A以`results/controller-interrupt-v1/run-ledger.json`作为predecessor；91文件preflight通过。嵌套分析plan仅用于分析，实际执行为12case扁平controller-plan。A/B使用的Swift二进制f95565c及91文件已完成最后身份检查；旧冻结于B完成、恢复核对后解除，记录见`results/mtp-release-window-b/source-freeze-release.json`。历史计划仍保存原指纹，不随新构建改写。
 
 ## 接续记录
 
-下一次接续先跟进窗口B controller18230/session45809和ledger，不启动第二个模型或重建。B完成后确认整组清理及参考恢复，再对A/B两个正式plan合并分析；A已有7组未定，不以B替换。此前推理源码、分析器、controller/helper均冻结。
+下一次接续先跟进HTTP controller22649/session27178和`results/http-output-fix-regression-v1/run-ledger.json`，按live→edges→12周期soak→terminal-logs顺序继续；最后case含一次真实非流式output_limit尝试，未触发如实保留。90文件/二进制c93011f已冻结，期间不得改源码或构建/并行加载。全部结束后核对参考恢复与新JSON日志/正常旧gate，更新HTTP文档并提交源码。PD/async候选仅在此后再审阅整合。A/B已正式分析，不重跑替换未定组。
 
-解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过，但尚未应用、构建或运行新测试。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
+解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过；B结束后已应用并构建，36项相关Swift CPU通过，真实live回归运行中。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
 
-后续候选已经推进到可审阅副本，均未接入生产。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。该草案尚不可执行：先完成B、验证参考恢复、应用HTTP补丁并构建/CPU回归，再冻结正式plan。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
+后续候选已保存可审阅副本。HTTP修复与验证脚本已原样接入生产路径、构建和CPU通过、真实回归运行中，PD与async8仍未接入。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。这些前置已完成；正式`plan.json`已于09:24冻结并运行，草案继续保留，不能拿草案重复启动。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
 
 PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d70674b0f9c3b4a9d1c0cb8db19a61306a18e2640bf7452eada5c`，root静态审阅、manifest依赖与实际apply-check通过，未构建。新增probe及原cooperative入口7行分流，固定历史短26输入/64输出、长11057/128，先本次独立AR核对，再4/8/8/4及取消两份live状态/fresh AR。共13请求（预计11完成/2取消）；性能与正确性分开。`results/pd-fairness-v1/plan-draft.json`待HTTP阶段恢复后选择最新predecessor再正式冻结。另有vllm agent准备当前token内async8提交的ignored候选，见[限定提交研究](DECODE_SUBMISSION_FEASIBILITY.md)，同样无生产修改/build/GPU权。
 
@@ -70,3 +70,5 @@ PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d706
 - 08:40：窗口A于08:29结束，12进程96请求全通过完整IDs及阶段检查，正式分析18组为11通过/7漂移待定/0倍率失败，独立只读重算一致；不认定两窗门槛通过。参考17773恢复并核对后，于08:32启动B controller18230/session45809。B正式plan SHA256为`3409095d585414783a82cc9bb26c8955ff14944a39a41824d903ab9a01d48b77`，91文件同A，preflight通过。B已完成事实256的两进程16轮，正在工具256；继续保持冻结。HTTP候选v3仅通过静态审阅与patch应用检查，尚无新构建/运行结果。当前已推送源码阶段为`17164f3`，远程SHA已核对。
 
 - 09:04：阶段记录`634f1fb`已推送并核对远程SHA。B已完成8/12进程64/96请求，全部完整IDs通过，正在tools128part1（PID21030），controller18230/session45809继续唯一GPU任务。HTTP修复v3、日志验证v2、PD公平性候选及对应draft均已静态审阅，尚未应用/build/live。新增限定decode提交研究，避免把历史23.20%增量误当总CPU可优化空间；每8层提前提交仍只是后续候选，不改默认。
+
+- 09:25：A/B全部完成、独立复核和正式合并分析通过其正确性范围，共23性能通过/13漂移未定，含B原256第三组raw0.840651；不改默认。B最后91文件身份检查及参考21912恢复核对后，root解除旧冻结，应用HTTP v3与日志脚本v2。release49.91s、36 Swift CPU、6 Python控制通过，二进制`c93011f804dd287a7758568d69373089959a0b92408379390ea71d7294b0568a`。四case正式controller22649/session27178启动，90文件冻结，当前live；源码提交待真实回归完成，双窗文档先阶段提交。async8最新7文件候选和一步deep-state gate仍ignored，Redis正独立只读审阅；不与HTTP并行build/GPU。
