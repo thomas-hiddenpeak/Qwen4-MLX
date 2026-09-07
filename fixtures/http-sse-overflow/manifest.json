@@ -1,0 +1,62 @@
+{
+  "schema": "qwen-http-sse-overflow-fixture-v1",
+  "input_frozen_utc": "2026-09-07T02:30:22.087165+00:00",
+  "prompt_tokens": 4039,
+  "max_tokens": 4096,
+  "context_limit": 16384,
+  "prompt_plus_budget": 8135,
+  "target_characters": 8000,
+  "target_utf8_bytes": 24000,
+  "attempts": 1,
+  "stream": true,
+  "mtp_depth": 0,
+  "output_buffer_bytes": 8192,
+  "receive_buffer_requested_bytes": 1024,
+  "pause_seconds_max": 150,
+  "poll_seconds": 0.05,
+  "work_budget_seconds": 360,
+  "cleanup_term_seconds": 30,
+  "cleanup_kill_seconds": 10,
+  "total_harness_budget_seconds": 400,
+  "tokenization_runner_sha256": "836678a69f7e41d727e574d977ece6b084add32f85e57d45e2d4c3d14e8c34e7",
+  "input_files_sha256": {
+    "messages.json": "f70ae70460e73bdc2a2c82c621f6bca0e351a154755bfbc2f7afaec4e89d7ed7",
+    "tokenization.json": "d6cbf0949398387d8c56a3f1d0e12dacde69d9b272754bb9c0ce225b9c591440",
+    "prompt-token-ids.json": "88d040e2fcaced93d7a9b1b3f2d9df6995392010f463f0ab726637c95168c9e1"
+  },
+  "tokenizer_metadata_sha256": {
+    "config.json": "fd945111eba53ca88ca5aaf20c5355972fb9643b4b048bf5de271fa22064a687",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+  },
+  "helper_sha256": {
+    "test_http_server_edges.py": "949be7d18f0ddc0f1bcae740b0424541841d7813fd2297c599f37a3b6ca727be",
+    "test_http_terminal_logs.py": "db5321638ee0d31463144e86420250c496602e47f62238bb77b3f25bbdd4b6f5"
+  },
+  "repository_files_sha256": {
+    "scripts/test_http_sse_overflow.py": "8f5ecb534ebb9a1effa9957cf3ba24e1c99497afa93f179325d23474c87f13fe",
+    "scripts/test_http_sse_overflow_parser.py": "93c3c1f8d9074af6db353affce1706695a3d0c85bc3ed8b630aa4d42a4c9799f",
+    "scripts/test_http_sse_overflow_exit.py": "19d1f3c24f398cfc071ec121210441b749211f61c17ad3844421d39196ff43a0",
+    "fixtures/http-sse-overflow/README.md": "60ce5fe08d41a813bb6670998733a807197b0e2325d3539ba59e84fc99c007fa"
+  },
+  "cpu_validation": {
+    "parser_controls": 9,
+    "actual_main_exit_controls": 2,
+    "passed": true,
+    "status": "passed",
+    "commands": [
+      "python3 -B scripts/test_http_sse_overflow_parser.py -v",
+      "python3 -B scripts/test_http_sse_overflow_exit.py -v"
+    ],
+    "real_subprocesses_or_network_started": false,
+    "gpu_or_build": false,
+    "temporary_artifacts": "system_temp_directory",
+    "validated_utc": "2026-09-07T03:03:19.006207+00:00",
+    "parser_elapsed_seconds": 0.001,
+    "actual_main_exit_elapsed_seconds": 0.007
+  },
+  "gpu_validation": {
+    "status": "not_run_by_fixture_integration",
+    "evidence": "separate_controller_report_required"
+  }
+}
