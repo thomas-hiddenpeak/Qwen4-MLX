@@ -35,5 +35,22 @@ class CommandTimingTests(unittest.TestCase):
         g,c=self.fixture();c['process_id']=124
         with self.assertRaises(ValueError):analyze(g,c)
 
+    def test_mtp_round_retains_span_without_inventing_graph_boundary(self):
+        g,c=self.fixture()
+        g['gpu_command_timing']['steps'][0]['graph_boundary_available']=False
+        a=analyze(g,c)
+        s=a['steps'][0]
+        self.assertTrue(a['complete'])
+        self.assertIsNone(s['forward_wall_ms'])
+        self.assertIsNone(s['evaluation_and_readback_wall_ms'])
+        self.assertIsNone(a['decode_groups'][0]['median_forward_wall_ms'])
+        self.assertIsNone(a['decode_groups'][0]['median_evaluation_and_readback_wall_ms'])
+        self.assertAlmostEqual(s['command_buffer_span_coverage_fraction'],0.7)
+
+    def test_graph_boundary_flag_must_be_boolean(self):
+        g,c=self.fixture()
+        g['gpu_command_timing']['steps'][0]['graph_boundary_available']='false'
+        with self.assertRaises(ValueError):analyze(g,c)
+
 
 if __name__ == '__main__':unittest.main()

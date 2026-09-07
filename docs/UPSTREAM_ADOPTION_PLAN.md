@@ -49,7 +49,7 @@
 
 ## MTP 的统计与状态约束
 
-用户返回后的[同窗口五轮AR诊断](DAYTIME_DRIFT_DIAGNOSIS.md)已完成：完整输出及联合采样通过，暖decode首末下降3.777%，新增时间主要落在GPU命令跨度内。该结果允许继续单个MTP验证候选的局部筛选，不作为无采样基准或具体降速原因。[S2/S3共享专家逐元素融合](MTP_SHARED_ELEMENTWISE_EXPERIMENT.md)已完成局部筛选：83项逐位比较通过，四组约2.0%–4.7%，未达约5%可重复收益量级。仅保留算子实验入口，撤下未进入整模型验证的生成模式，不改默认。下一项先细分MTP验证阶段GPU成本，再选较大热点。
+用户返回后的[同窗口五轮AR诊断](DAYTIME_DRIFT_DIAGNOSIS.md)已完成：完整输出及联合采样通过，暖decode首末下降3.777%，新增时间主要落在GPU命令跨度内。该结果允许继续单个MTP验证候选的局部筛选，不作为无采样基准或具体降速原因。[S2/S3共享专家逐元素融合](MTP_SHARED_ELEMENTWISE_EXPERIMENT.md)已完成局部筛选：83项逐位比较通过，四组约2.0%–4.7%，未达约5%可重复收益量级。仅保留算子实验入口，撤下未进入整模型验证的生成模式，不改默认。[MTP验证热点诊断](MTP_VERIFY_HOTSPOTS.md)已完成普通/同步诊断的16-token完整输出对照；选中GPU命令跨度中MoE32.89%、GDN25.19%、Attention19.78%，不当作普通吞吐或带宽。下一项窄筛选为GDN S3 QKV的TM2配置。
 
 `accepted / drafted` 表示草稿质量。实际 decode 产出排除 prefill 已算出的首 token，EOS 和剩余预算按真正发布/提交数量处理；不能用 `1 + accepted / rounds` 代替实际产出。剩余预算为一时的 target-only 收尾也产生 verify 成本，但不一定增加现有 speculative rounds。计时摘要必须保留这一区别。
 

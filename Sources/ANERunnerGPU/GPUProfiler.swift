@@ -19,6 +19,10 @@ public final class GPUProfiler {
         /// Absent in historical reports and probes outside a model forward.
         public var phase: QwenExecutionPhase? = nil
         public var position: Int? = nil
+        /// DispatchTime uptime interval, excluding the preceding stream drain.
+        /// Missing in historical reports. Failed intervals are diagnostic only.
+        public var startedUptimeNanoseconds: UInt64? = nil
+        public var endedUptimeNanoseconds: UInt64? = nil
         public let hostBodyMilliseconds: Double
         public let outputCollectionMilliseconds: Double
         public let evaluationWaitMilliseconds: Double?
@@ -33,6 +37,7 @@ public final class GPUProfiler {
     }
     public struct Report: Codable {
         public let mode: Mode
+        public var phaseFilter: QwenExecutionPhase? = nil
         public let attentionBreakdown: Bool?
         public let moeBreakdown: Bool?
         public let stages: [Stage]
@@ -42,6 +47,7 @@ public final class GPUProfiler {
         public let notes: [String]
     }
     public let mode: Mode
+    public let phaseFilter: QwenExecutionPhase?
     public let attentionBreakdown: Bool
     public let moeBreakdown: Bool
     public var isRecording: Bool { mode != .disabled && recordingEnabled }
@@ -55,9 +61,11 @@ public final class GPUProfiler {
     private var position: Int?
 
     public init(mode: Mode = .disabled, allocatorSnapshots: Bool = false, maximumRecords: Int = 4096,
-                attentionBreakdown: Bool = false, moeBreakdown: Bool = false) throws {
+                attentionBreakdown: Bool = false, moeBreakdown: Bool = false,
+                phaseFilter: QwenExecutionPhase? = nil) throws {
         guard maximumRecords > 0 else { throw GPUError.invalid("Profiler record limit must be positive") }
         self.mode = mode
+        self.phaseFilter = phaseFilter
         self.allocatorSnapshots = allocatorSnapshots
         self.maximumRecords = maximumRecords
         self.attentionBreakdown = attentionBreakdown
@@ -86,12 +94,13 @@ public final class GPUProfiler {
     }
 
     /// `outputs` must include every newly written persistent state, not only y.
-    /// The disabled path calls only `body`, with no clocks, output extraction,
-    /// synchronization or allocator queries. No tensor readback occurs here.
+    /// Disabled or unmatched phases call only `body`, with no clocks, output
+    /// extraction, synchronization or allocator queries. A phase filter skips
+    /// work without forward context. No tensor readback occurs here.
     public func measure<T>(_ name: String, layer: Int? = nil, tokenCount: Int,
                            logicalWeightBytes: UInt64? = nil,
                            outputs: (T) -> [Tensor], _ body: () throws -> T) throws -> T {
-        if !isRecording { return try body() }
+        if !isRecording || (phaseFilter != nil && phase != phaseFilter) { return try body() }
         guard !active, !name.isEmpty, tokenCount > 0 else {
             throw GPUError.invalid("Invalid or nested profiler stage")
         }
@@ -121,10 +130,12 @@ public final class GPUProfiler {
                 try MX.synchronize()
                 waitMilliseconds = Self.milliseconds(since: evaluate)
             }
-            let elapsed = Self.milliseconds(since: start)
+            let end = Self.now()
+            let elapsed = Double(end - start) * 1e-6
             let after = allocatorSnapshots ? try MX.memory() : nil
             append(Stage(name: name,layer: layer,tokenCount: tokenCount,
                          phase: phase,position: position,
+                         startedUptimeNanoseconds: start,endedUptimeNanoseconds: end,
                          hostBodyMilliseconds: bodyMilliseconds,outputCollectionMilliseconds: collectMilliseconds,
                          evaluationWaitMilliseconds: waitMilliseconds,elapsedMilliseconds: elapsed,
                          precedingStreamDrainMilliseconds: drain,evaluatedTensorCount: count,
@@ -135,10 +146,12 @@ public final class GPUProfiler {
             // Best-effort drain on failure; preserve the original error. A
             // failed record has no valid stage timing split or bandwidth.
             if mode == .synchronizedStages { try? MX.synchronize() }
+            let end = Self.now()
             append(Stage(name: name,layer: layer,tokenCount: tokenCount,
                          phase: phase,position: position,
+                         startedUptimeNanoseconds: start,endedUptimeNanoseconds: end,
                          hostBodyMilliseconds: bodyMilliseconds,outputCollectionMilliseconds: collectMilliseconds,
-                         evaluationWaitMilliseconds: nil,elapsedMilliseconds: Self.milliseconds(since: start),
+                         evaluationWaitMilliseconds: nil,elapsedMilliseconds: Double(end - start) * 1e-6,
                          precedingStreamDrainMilliseconds: drain,evaluatedTensorCount: count,
                          logicalWeightBytes: logicalWeightBytes,allocatorBefore: memoryBefore,allocatorAfter: nil,
                          succeeded: false,error: String(describing: error)))
@@ -147,7 +160,7 @@ public final class GPUProfiler {
     }
 
     public var report: Report {
-        Report(mode: mode,attentionBreakdown: attentionBreakdown,moeBreakdown: moeBreakdown,stages: stages,droppedRecords: droppedRecords,
+        Report(mode: mode,phaseFilter: phaseFilter,attentionBreakdown: attentionBreakdown,moeBreakdown: moeBreakdown,stages: stages,droppedRecords: droppedRecords,
                actualDRAMBytesAvailable: false,deviceOnlyTimeAvailable: false,
                notes: [
                 "hostBodyMilliseconds is host closure wall time: usually lazy graph construction, but includes any explicit I/O/evaluation inside the body.",
@@ -155,6 +168,8 @@ public final class GPUProfiler {
                 "The preceding drain waits only already submitted work. Unmaterialized dependencies still run with the stage that evaluates them.",
                 "Synchronized stages remove normal overlap and may change allocator reuse. Their totals are not undisturbed prefill or decode latency.",
                 "phase and position identify the enclosing trunk forward, including a final S1 prefill. Detailed attention or MoE stages replace the corresponding outer stage and are not added to an inclusive parent.",
+                "When phaseFilter is set, unmatched or absent forward context runs without profiler clocks, synchronization, output collection or allocator snapshots.",
+                "startedUptimeNanoseconds and endedUptimeNanoseconds use DispatchTime uptime, matching command timing. They bound elapsedMilliseconds after the preceding drain and before the final allocator snapshot; failed stages are excluded from performance analysis.",
                 "Allocator active/cache/peak are capacity counters, not DRAM traffic. logicalWeightBytes is a caller-supplied estimate, not hardware bytes.",
                 "No DRAM read/write or physical SSD byte counter is exposed by this helper. No bandwidth is inferred from allocations or model sizes."
                ])

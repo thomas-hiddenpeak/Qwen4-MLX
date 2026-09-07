@@ -64,8 +64,12 @@ def analyze(generation, commands, skip_first_trials=1):
         observed = union_ns(clipped)
         # Preserve observed spans even for incomplete evidence, but suppress
         # any complete-coverage or gap inference in that case.
-        record = dict(s, step_wall_ms=(hi-lo)/1e6, forward_wall_ms=(middle-lo)/1e6,
-                      evaluation_and_readback_wall_ms=(hi-middle)/1e6,
+        graph_boundary = s.get('graph_boundary_available', True)
+        if not isinstance(graph_boundary, bool):
+            raise ValueError('Invalid graph-boundary availability flag')
+        record = dict(s, step_wall_ms=(hi-lo)/1e6,
+                      forward_wall_ms=(middle-lo)/1e6 if graph_boundary else None,
+                      evaluation_and_readback_wall_ms=(hi-middle)/1e6 if graph_boundary else None,
                       observed_gpu_buffer_span_union_ms=observed/1e6,
                       overlapping_command_buffer_count=len(overlapping),
                       contained_command_buffer_count=sum(a >= lo and b <= hi for a,b,_ in overlapping),
@@ -109,8 +113,10 @@ def analyze(generation, commands, skip_first_trials=1):
             'time_between_recorded_steps_ms': phase_wall-wall,
             'command_buffer_span_coverage_fraction': observed/wall if complete else None,
             'outside_observed_buffer_spans_sum_ms': wall-observed if complete else None,
-            'median_forward_wall_ms': statistics.median(s['forward_wall_ms'] for s in rows),
-            'median_evaluation_and_readback_wall_ms': statistics.median(s['evaluation_and_readback_wall_ms'] for s in rows),
+            'median_forward_wall_ms': statistics.median(s['forward_wall_ms'] for s in rows)
+                if all(s['forward_wall_ms'] is not None for s in rows) else None,
+            'median_evaluation_and_readback_wall_ms': statistics.median(s['evaluation_and_readback_wall_ms'] for s in rows)
+                if all(s['evaluation_and_readback_wall_ms'] is not None for s in rows) else None,
             'median_step_wall_ms': statistics.median(s['step_wall_ms'] for s in rows),
             'median_command_buffer_count': statistics.median(s['overlapping_command_buffer_count'] for s in rows),
             'gap_ms_with_next_buffer_already_committed': math.fsum(g['milliseconds'] for g in gaps if g['next_buffer_already_committed_at_gap_start']) if complete else None,
@@ -124,6 +130,7 @@ def analyze(generation, commands, skip_first_trials=1):
                 'Command-buffer spans can include memory stalls and execution gaps; coverage is not shader utilization.',
                 'Time outside command-buffer spans can include host building/encoding, driver scheduling, completion and unrelated system work; it is not all removable overhead.',
                 'CPU forward and evaluation intervals can overlap GPU spans and must not be added to them.',
+                'MTP round markers explicitly lack a graph boundary; their forward/evaluation split is null. Whole-round spans remain available.',
                 'A gap with the next buffer already committed is not caused by waiting for that particular commit; it is not a unique attribution to the GPU or driver.',
                 'buffer_ops is MLX scheduling bookkeeping; buffer_sizes_elements is not bytes or measured traffic.',
                 'This diagnostic changes completion handlers and adds clocks; uninstrumented throughput must be measured separately.']}

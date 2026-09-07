@@ -15,7 +15,19 @@ extension RunnerCLI {
     }
 
     static func generateGPU(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
+        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--profile-phase", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
+        guard let mode = GPUProfiler.Mode(rawValue: args["--profile-stages"] ?? "disabled") else {
+            throw CLIError.usage("Invalid --profile-stages mode")
+        }
+        let phaseFilter = try args["--profile-phase"].map { value -> QwenExecutionPhase in
+            guard let phase = QwenExecutionPhase(rawValue: value) else {
+                throw CLIError.usage("--profile-phase requires prefill, decode or verification")
+            }
+            return phase
+        }
+        guard phaseFilter == nil || mode != .disabled else {
+            throw CLIError.usage("--profile-phase requires a non-disabled --profile-stages mode")
+        }
         let draftHistoryTokens = try mtpDraftHistory(args)
         let draftHistoryJSON: Any = draftHistoryTokens.map { $0 as Any } ?? NSNull()
         let directory = URL(fileURLWithPath: try args.require("--model-dir"))
@@ -59,8 +71,9 @@ extension RunnerCLI {
         guard (args["--mtp-order"] == nil || requestedDepths.count == repetitions),
               (args["--mtp-depth"] == nil || requestedDepths.count == 1) else { throw CLIError.usage("MTP order must match --repeat") }
         let mtpOrder = args["--mtp-order"] == nil ? Array(repeating: requestedDepths[0], count: repetitions) : requestedDepths
-        guard !mtpOrder.contains(where: { $0 > 0 }) || args["--gpu-command-timing-output"] == nil else {
-            throw CLIError.usage("GPU command graph-boundary tracing currently supports AR only; MTP has separate draft/verify/history timers")
+        guard !mtpOrder.contains(where: { $0 > 0 }) || args["--gpu-command-timing-output"] == nil
+                || (mode == .synchronizedStages && phaseFilter == .verification) else {
+            throw CLIError.usage("MTP command tracing requires --profile-stages synchronizedStages --profile-phase verification")
         }
         guard (args["--decode-order"] == nil || requestedModes.count == repetitions),
               (args["--wired-order"] == nil || requestedWired.count == repetitions),
@@ -91,8 +104,7 @@ extension RunnerCLI {
         }
         let ssdWorkers = try positive("--ssd-workers", 1, GPUSSDReader.maximumWorkers)
         let tokenizer = try QwenTokenizer(modelDirectory: directory)
-        guard let mode = GPUProfiler.Mode(rawValue: args["--profile-stages"] ?? "disabled") else { throw CLIError.usage("Invalid --profile-stages mode") }
-        let profiler = try GPUProfiler(mode: mode, maximumRecords: 8192)
+        let profiler = try GPUProfiler(mode: mode, maximumRecords: 8192, phaseFilter: phaseFilter)
         guard let accumulation = GPUMoE.PrefillAccumulation(rawValue: args["--prefill-accumulation"] ?? "reference") else { throw CLIError.usage("Invalid --prefill-accumulation; use reference or float32") }
         // Validate the saved selection and loaded native identities before
         // allocating any model weights. No environment selector is changed.
@@ -242,7 +254,8 @@ extension RunnerCLI {
                 let commandEvaluationEnd = commandTiming == nil ? 0 : GPUCommandTimingSession.now()
                 decode.append(Double(DispatchTime.now().uptimeNanoseconds - start) * 1e-9)
                 commandTiming?.step(phase: "decode", repetition: repetition, index: decode.count - 1,
-                    inputTokens: inputCount, start: commandStart, forwardEnd: commandForwardEnd, evaluationEnd: commandEvaluationEnd)
+                    inputTokens: inputCount, start: commandStart, forwardEnd: commandForwardEnd, evaluationEnd: commandEvaluationEnd,
+                    graphBoundaryAvailable: mtpDecoder == nil)
                 if let span {
                     telemetry?.end(span, outputTokens: emitted.count,
                         forwardEndNS: forwardEnd, evaluationEndNS: GPUTelemetrySession.now(),

@@ -314,6 +314,7 @@ struct RunnerCLI {
         Interleaved trials: --decode-order CSV and/or --wired-order CSV (one value per repetition, at most 10)
         GDN tuning library: --gdn-gemv-mode reference|bm4|rows4|bm2|bm1|gemm|gemmSplit|prefetch4|prefetch4Vector or --gdn-gemv-order CSV
         Profiling: --profile-stages disabled|hostBodyOnly|synchronizedStages
+        Optional stage filter: --profile-phase prefill|decode|verification (requires profiling; default all phases)
         System telemetry: --telemetry-dir NEW_PATH [--telemetry-interval-ms 200]
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
     probe-gpu-session --model-dir PATH [--tokens-file PATH] --output NEW_REPORT_JSON

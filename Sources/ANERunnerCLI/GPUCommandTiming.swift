@@ -56,10 +56,12 @@ final class GPUCommandTimingSession {
     }
 
     func step(phase: String, repetition: Int, index: Int, inputTokens: Int,
-              start: UInt64, forwardEnd: UInt64, evaluationEnd: UInt64) {
+              start: UInt64, forwardEnd: UInt64, evaluationEnd: UInt64,
+              graphBoundaryAvailable: Bool = true) {
         steps.append(["phase": phase, "repetition": repetition, "step": index,
                       "input_tokens": inputTokens, "start_ns": start,
-                      "forward_end_ns": forwardEnd, "evaluation_end_ns": evaluationEnd])
+                      "forward_end_ns": forwardEnd, "evaluation_end_ns": evaluationEnd,
+                      "graph_boundary_available": graphBoundaryAvailable])
     }
 
     var report: [String: Any] {
