@@ -49,6 +49,8 @@
 
 ## MTP 的统计与状态约束
 
+用户返回后的[同窗口五轮AR诊断](DAYTIME_DRIFT_DIAGNOSIS.md)已完成：完整输出及联合采样通过，暖decode首末下降3.777%，新增时间主要落在GPU命令跨度内。该结果允许继续单个MTP验证候选的局部筛选，不作为无采样基准或具体降速原因。下一候选是显式S2/S3共享专家逐元素尾部融合，先局部逐位与性能门槛，保留其余验证、路由与状态路径。
+
 `accepted / drafted` 表示草稿质量。实际 decode 产出排除 prefill 已算出的首 token，EOS 和剩余预算按真正发布/提交数量处理；不能用 `1 + accepted / rounds` 代替实际产出。剩余预算为一时的 target-only 收尾也产生 verify 成本，但不一定增加现有 speculative rounds。计时摘要必须保留这一区别。
 
 阶段时间只在定义互斥时求和。未覆盖的 host 时间、回调/排队时间单独列出，不给未知值编造分布。后续自适应深度要以整轮成本与等待控制，并保持 head history；暂停 MTP 后重新启用需要明确同步规则。[现有 MTP 发布条件](MTP_RELEASE_CRITERIA.md)继续生效。
