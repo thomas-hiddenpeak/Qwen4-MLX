@@ -2,7 +2,7 @@
 
 本工程现在可以从原模型目录执行完整的 **48 层文本生成**：原生分词 → embedding → Hyper Connection → GatedDeltaNet / QSA → PLE 的 SSD 按需输入 → 动态 top-10 MoE 与共享专家 → 输出 head → 贪心采样。计算使用 Metal GPU，Swift 管理权重、状态和 SSD 读取；推理过程不启动 Python，也不调用作者的服务。
 
-Prefill 与 decode 按独立业务阶段建设，接口与 kernel 参数见 [Prefill / Decode 分离](docs/PREFILL_DECODE_SEPARATION.md)。完整的 `prefill` / `decode` / `generate` 继续可用，新增 begin/step session 可分别恢复一个 prompt chunk 或完整 AR/MTP round。共享一份权重的 `QwenLocalScheduler` 默认仍为 `wholeStages`，显式选择 `cooperative` 才在这些边界切换作业；GPU 始终串行，没有后台 worker、HTTP 或跨进程 PD。此前 20 项 CPU / 27 项实模检查属于完整阶段历史证据；本轮增量接口已通过 26 项 CPU 测试和 55 项实模检查，包含 11k 长短请求实际交错。MTP 仍按独立 decode 有效吞吐与 TPOT 验收。
+Prefill 与 decode 按独立业务阶段建设，接口与 kernel 参数见 [Prefill / Decode 分离](docs/PREFILL_DECODE_SEPARATION.md)。完整的 `prefill` / `decode` / `generate` 继续可用，新增 begin/step session 可分别恢复一个 prompt chunk 或完整 AR/MTP round。共享一份权重的 `QwenLocalScheduler` 默认仍为 `wholeStages`，显式选择 `cooperative` 才在这些边界切换作业；GPU 始终串行。调度器本身由调用者推进，不启动后台 worker 或 HTTP listener；上层已有独立的 [HTTP/SSE 适配器](docs/HTTP_SERVER_EXPERIMENT.md)，跨进程 PD 尚未实现。此前 20 项 CPU / 27 项实模检查属于完整阶段历史证据；增量接口的历史验证包括 26 项 CPU 测试和 55 项实模检查，包含 11k 长短请求实际交错。MTP 仍按独立 decode 有效吞吐与 TPOT 验收。
 
 MTP 默认关闭。当前兼容候选可显式指定 `--mtp-depth 2 --mtp-verification batchedScalarLinear`，另有 `--mtp-draft-history 1024` 的草稿头初始历史实验（默认完整历史，主干上下文始终完整）。输出分叉已在固定短/长基准修复；更广回归、适用范围及实际收益见 [MTP 与会话接口](MTP_AND_SESSIONS.md) 和 [发布标准](docs/MTP_RELEASE_CRITERIA.md)。`generate-gpu` 不使用 ANE；已有 Core ML / ANE 子图探针仍保留为独立实验，不参与这一整模型路径。底层依赖固定版本的 MLX / MLX C 原生库，部分计算内核参考作者实现并保留来源及许可，见 [源码目录](Sources/ANERunnerGPU/) 与 [上游许可](UPSTREAM-LICENSE)。
 

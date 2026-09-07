@@ -79,6 +79,6 @@ ANERUNNER_GATEUP_LIBRARY="$PWD/results/moe-prefill-expert-v1/native/lib/libaneml
 
 普通入口已通过[真实生成检查](../results/moe-prefill-expert-cli-v1/generate.json)及[汇总](../results/moe-prefill-expert-cli-v1/summary.json)：同一11057-token提示词、128个输出全部匹配golden，offset11184；prefill的gate/up、plan、down各1296次，decode全部为0。另用错误插件哈希和旧非零全局矩阵配置检查，均在模型权重加载前报错。两窗口PD加普通CLI，共1664个生成token通过对照。单次CLI冷运行不是新增性能A/B证据。
 
-最终参考服务已恢复PID90029，MTP/drafter关闭，见[恢复记录](../results/moe-prefill-expert-cli-v1/run-ledger.json)。独立Swift工程目前没有HTTP listener，本轮不会把命令行或typed API支持表述为HTTP服务支持。
+该轮参考服务恢复PID90029，MTP/drafter关闭，见[恢复记录](../results/moe-prefill-expert-cli-v1/run-ledger.json)。以上是当时命令行和 typed API 的验证；工程后来新增了 [HTTP/SSE 适配器](HTTP_SERVER_EXPERIMENT.md)，其独立验证不能从本轮 CLI 结果推导。
 
 后续与融合归约的直接组合对照及短尾回归见[组合回归](MOE_PREFILL_COMPOSITION.md)。当前参考服务PID以最新运行记录和实时状态为准。

@@ -73,7 +73,7 @@ def build(runtime, output):
                if Path(e["file"]).resolve() == quantized]
     if len(entries) != 1 or Path(entries[0]["directory"]).resolve() != old_build:
         raise ValueError("Expected one pinned Metal quantized.cpp compiler command")
-    original_files = [PACKAGE / "Native" / name for name in
+    original_files = [PACKAGE / "native" / name for name in
                       ("moe_gateup_bridge.cpp", "moe_gateup_bridge.h", "moe_gateup_fused.metal",
                        "moe_expert_grouped.metal")]
     if not all(path.is_file() for path in original_files):
