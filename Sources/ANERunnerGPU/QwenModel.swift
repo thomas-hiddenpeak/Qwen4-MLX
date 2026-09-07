@@ -20,6 +20,24 @@ public final class QwenModel {
             ple = (0..<layers).map { _ in .init() }
         }
         public mutating func reset() { self = State(layers: gdn.count, owner: owner) }
+        /// Diagnostic host values excluded from namedTensors. No tensor handles
+        /// or mutable session identity cross this snapshot.
+        public struct DiagnosticHostValues: Codable, Equatable {
+            public let offset: Int
+            public let valid: Bool
+            public let gdnOffsets, attentionOffsets: [Int]
+            public let attentionRetainedStorage: [[Int]]
+            public let pleHistory: [[UInt32]]
+            public let gdnCapturePresent, pleCapturePresent: [Bool]
+        }
+        public var diagnosticHostValues: DiagnosticHostValues {
+            DiagnosticHostValues(offset: offset, valid: valid,
+                gdnOffsets: gdn.map(\.offset), attentionOffsets: attention.map(\.offset),
+                attentionRetainedStorage: attention.map(\.diagnosticRetainedStorage),
+                pleHistory: ple.map(\.history),
+                gdnCapturePresent: gdn.map { $0.verificationCapture != nil },
+                pleCapturePresent: ple.map { $0.verificationCapture != nil })
+        }
         public var tensors: [Tensor] { gdn.flatMap(\.tensors) + attention.flatMap(\.tensors) + ple.flatMap(\.tensors) }
         public var qsaActiveLayers: Int { attention.filter { $0.pooledIndexerKeys != nil }.count }
         /// Diagnostic names only; graph handles remain read-only to callers.
@@ -55,6 +73,11 @@ public final class QwenModel {
     public let weights: GPUWeights
     public let layerCount: Int
     public let profiler: GPUProfiler
+    private let decodeAsyncSchedule: QwenDecodeAsyncSchedule
+    /// Experimental host submission policy, captured once before model loading.
+    public var experimentalDecodeAsyncEveryLayers: Int { decodeAsyncSchedule.everyLayers }
+    /// Successful asyncEval calls made by this experiment, not GPU dispatches.
+    public private(set) var experimentalDecodeAsyncSubmissions = 0
     /// Optional synchronous diagnostic observer on the single inference
     /// executor: (layer, absolute prompt offset, actual MoE input). Callers
     /// must clear it after capture and must not reenter model generation.
@@ -100,6 +123,8 @@ public final class QwenModel {
                 reservedOutputIDs: Set<Int32>? = nil, ssdWorkers: Int = 1,
                 prefillAccumulation: GPUMoE.PrefillAccumulation = .reference,
                 decodeModes: [GPUDecodeMode] = [.reference], progress: ((Int, Int) -> Void)? = nil) throws {
+        decodeAsyncSchedule = try QwenDecodeAsyncSchedule(
+            environmentValue: ProcessInfo.processInfo.environment[QwenDecodeAsyncSchedule.environmentVariable])
         let c = try QwenConfiguration(modelDirectory: modelDirectory)
         guard c.hiddenSize == 2560, c.layerCount == 48, c.hcCount == 4,
               c.pleLayerIndices == [1], c.hcLowRank == 320,
@@ -155,6 +180,39 @@ public final class QwenModel {
     public func checkpoint(state: inout State) throws -> State {
         try evaluate([], state: &state)
         return state
+    }
+
+    /// Isolated diagnostics only. checkpoint()/State assignment retain shallow
+    /// immutable handles; this method instead gathers every persistent tensor
+    /// into new storage and evaluates the copies before returning. Never used
+    /// by ordinary generation, MTP rollback or the experimental forward itself.
+    public func diagnosticPrivateStateCopy(_ source: State) throws -> State {
+        guard source.owner == identity, source.valid,
+              source.gdn.allSatisfy({ $0.verificationCapture == nil }),
+              source.ple.allSatisfy({ $0.verificationCapture == nil }) else {
+            throw GPUError.invalid("Diagnostic copy requires this model's valid AR state without captures")
+        }
+        var ready = source
+        _ = try checkpoint(state: &ready)
+        var result = makeState()
+        result.offset = source.offset
+        func clone(_ value: Tensor?) throws -> Tensor? {
+            try value.map { try GPUVerificationCopy.tensor($0) }
+        }
+        for i in layers.indices {
+            result.gdn[i] = GPUGatedDeltaNet.State(convHistory: try clone(source.gdn[i].convHistory),
+                recurrent: try clone(source.gdn[i].recurrent), offset: source.gdn[i].offset)
+            let attention = source.attention[i]
+            // Gather creates compact allocations; initializer derives retained
+            // extents from the copied logical offset/pooled shape.
+            result.attention[i] = GPUAttention.State(keys: try clone(attention.keys),
+                values: try clone(attention.values), rawIndexerKeys: try clone(attention.rawIndexerKeys),
+                pooledIndexerKeys: try clone(attention.pooledIndexerKeys), offset: attention.offset)
+            result.ple[i].history = source.ple[i].history
+            result.ple[i].convolution = try clone(source.ple[i].convolution)
+        }
+        try evaluate([], state: &result)
+        return result
     }
 
     public func restore(_ checkpoint: State, state: inout State) throws {
@@ -292,6 +350,8 @@ public final class QwenModel {
     /// Pass `phase` explicitly for new callers. A nil phase retains the old
     /// shape-based fallback (S1 decode, longer input prefill). The evaluation
     /// interval is local to this call, allowing independent stage policies.
+    /// Experimental asynchronous submission requires an explicit .decode phase.
+    /// MTP callers must pass allowExperimentalDecodeAsync: false, including S1.
     public func forward(tokens: [Int32], state: inout State, lastLogitOnly: Bool = true,
                         captureTrace: Bool = false, evaluateEveryLayers: Int = 4,
                         decodeMode: GPUDecodeMode = .reference, prefillPrefetch: PrefillPrefetch? = nil,
@@ -299,6 +359,7 @@ public final class QwenModel {
                         verifyScalarMoE: Bool = false, verifyScalarLinear: Bool = false,
                         verifyTokenMoE: Bool = false,
                         phase: QwenExecutionPhase? = nil,
+                        allowExperimentalDecodeAsync: Bool = true,
                         prefillAttention: GPUAttention.PrefillMode = .reference,
                         profileLogits: Bool = true,
                         prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil) throws -> Output {
@@ -440,6 +501,14 @@ public final class QwenModel {
                 }
                 h = try profiler.measure("hc_mlp_write", layer: i, tokenCount: n, outputs: { [$0] }) { try layer.mlpHC.write(h, output: moeOut, injection: pre2.injection!) }
                 if captureTrace { trace["layer.\(i).stream"] = h }
+                // Submit completed AR blocks while later blocks are still being
+                // built. Final selected/state evaluation remains the caller's join.
+                // MTP's scalar verify/replay and target-only calls opt out explicitly.
+                if decodeAsyncSchedule.shouldSubmit(phase: phase, tokenCount: n,
+                    completedLayers: i + 1, layerCount: layerCount, allowed: allowExperimentalDecodeAsync) {
+                    try MX.asyncEval([h] + state.tensors)
+                    experimentalDecodeAsyncSubmissions += 1
+                }
                 // Each business phase owns its evaluation interval. Defaults
                 // preserve the previous multi-token schedule and S1 behavior.
                 if executionPhase.shouldEvaluate(completedLayers: i + 1, tokenCount: n, every: evaluateEveryLayers) {
@@ -463,5 +532,27 @@ public final class QwenModel {
             state.offset += n
             return Output(logits: logits, stream: h, trace: trace, ssdWaitSeconds: waitTime, ssdLogicalBytes: logicalBytes)
         } catch { state.valid = false; throw error }
+    }
+}
+
+/// Pure CPU policy: only the literal values 0 and 8 are supported. The
+/// environment is read by QwenModel.init, never again during a forward.
+struct QwenDecodeAsyncSchedule {
+    static let environmentVariable = "ANERUNNER_EXPERIMENTAL_DECODE_ASYNC_LAYERS"
+    let everyLayers: Int
+
+    init(environmentValue: String?) throws {
+        switch environmentValue {
+        case nil, .some("0"): everyLayers = 0
+        case .some("8"): everyLayers = 8
+        default:
+            throw GPUError.invalid("\(Self.environmentVariable) requires exactly 0 or 8")
+        }
+    }
+
+    func shouldSubmit(phase: QwenExecutionPhase?, tokenCount: Int,
+                      completedLayers: Int, layerCount: Int, allowed: Bool) -> Bool {
+        allowed && everyLayers == 8 && phase == .decode && tokenCount == 1 &&
+            completedLayers > 0 && completedLayers < layerCount && completedLayers % everyLayers == 0
     }
 }

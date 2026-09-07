@@ -141,7 +141,8 @@ public final class QwenMTPDecoder {
             let draftCount = min(depth, remaining - 1)
             if draftCount == 0 {
                 let verifyStart = DispatchTime.now().uptimeNanoseconds
-                let out = try model.forward(tokens: [pending], state: &state, decodeMode: decodeMode, phase: .decode)
+                let out = try model.forward(tokens: [pending], state: &state, decodeMode: decodeMode, phase: .decode,
+                                            allowExperimentalDecodeAsync: false)
                 guard let logits = out.logits else { throw GPUError.invalid("Missing target logits") }
                 let selected = try model.greedyToken(logits)
                 try model.evaluate([selected], state: &state)
@@ -184,7 +185,8 @@ public final class QwenMTPDecoder {
                 accepted = 0; committedStreams = []
                 for i in 0...limit {
                     try checkCancellation()
-                    let out = try model.forward(tokens: [input], state: &state, decodeMode: decodeMode, phase: .decode)
+                    let out = try model.forward(tokens: [input], state: &state, decodeMode: decodeMode, phase: .decode,
+                                            allowExperimentalDecodeAsync: false)
                     guard let logits = out.logits else { throw GPUError.invalid("Missing target logits") }
                     let selected = try model.greedyToken(logits)
                     try model.evaluate([selected, out.stream], state: &state)
@@ -210,7 +212,7 @@ public final class QwenMTPDecoder {
                                             verifyScalarMoE: verification == .batchedScalarMoE || verification.usesScalarLinear,
                                             verifyScalarLinear: verification.usesScalarLinear,
                                             verifyTokenMoE: verification == .batchedTokenMoE,
-                                            phase: .verification)
+                                            phase: .verification, allowExperimentalDecodeAsync: false)
                 guard let logits = out.logits else { throw GPUError.invalid("Missing verification logits") }
                 let selected = try model.greedyToken(logits)
                 try model.evaluate([selected, out.stream], state: &state)

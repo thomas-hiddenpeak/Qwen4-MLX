@@ -57,6 +57,8 @@ public final class GPUAttention {
         // Caller-supplied aliases may already retain storage beyond these sizes.
         fileprivate var retainedRowCount: Int
         fileprivate var retainedPooledBlockCount: Int
+        /// Diagnostic allocation bookkeeping; values, not buffer identities.
+        public var diagnosticRetainedStorage: [Int] { [retainedRowCount, retainedPooledBlockCount] }
 
         public init(keys: Tensor? = nil, values: Tensor? = nil,
                     rawIndexerKeys: Tensor? = nil, pooledIndexerKeys: Tensor? = nil,

@@ -15,11 +15,11 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新已验证参考服务：PID24434，`http://127.0.0.1:11235`，MTP/drafter关闭，09:46:09恢复ready；root核对精确argv、meta、监听PID及空闲指标。最新已完成恢复ledger为`results/http-output-fix-regression-v2/run-ledger.json`。当前没有GPU实验，其他项目未停止。
+最新已验证参考服务：PID24434，`http://127.0.0.1:11235`，MTP/drafter关闭，09:46:09恢复ready；root核对精确argv、meta、监听PID及空闲指标。最新已完成恢复ledger为`results/http-output-fix-regression-v2/run-ledger.json`。async性能控制器已恢复参考26788（10:11:04ready），root精确argv/meta/listener/idle核对通过；最新恢复ledger在`results/decode-host-gap-v1/performance/`。当前无GPU实验，其他项目未停止。
 
 A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通过/13漂移未定，双窗口性能门槛未通过，已提交推送d432caa。HTTP修复c93011f完成release build、36项Swift CPU/6项Python解析控制、19项live、15项edges、12周期46项soak和6项终态日志检查。首批edges在服务启动前端口检查失败，保留原报告，续批三个独立端口完成。真实非流式output_limit已触发并验证恢复；SSE实际溢出仍未覆盖。90文件postflight与恢复核对通过，旧冻结已解除，历史结果仍绑定c930。
 
-独立审查确认同步stderr日志可在未读取的满pipe上阻塞网络与推理日志路径；当前普通文件回归不能覆盖。redis agent正在ignored路径准备最小有界异步日志候选及pipe活性验证，不改默认推理。PD/async8候选仍未应用/构建，待本阶段提交后整合。
+独立审查确认同步stderr日志可在未读取的满pipe上阻塞网络与推理日志路径；当前普通文件回归不能覆盖。redis agent正在ignored路径准备最小有界异步日志候选及pipe活性验证，不改默认推理。HTTP阶段f77f58e已推送并核对远程SHA。PD/async8候选已核对全部基线后应用，release build49.11秒、3项新增纯CPU policy测试通过；新二进制5f1321b。PD到达场景已完成：13请求正确性通过，两配对短等待改善33.39%/42.05%，但首对整体耗时+9.31%、长TTFT+11.43%超门槛，外基线漂移约18.59%，不改默认。同状态门槛已通过：完整logits、121持久张量及host信息逐位一致，原checkpoint不变，13checks通过，恢复26064。async固定4process已完成，8轮完整IDs/配置/计数通过；原始聚合倍率1.186397，但外AR基线下降30.4455%，按固定门槛判indeterminate_drift，默认0。120文件和102模型payload postflight通过后解除冻结。日志修复仍ignored。
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
 ## 进行中的工作
@@ -77,3 +77,11 @@ PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d706
 - 09:34：首批live19/19通过，随后edges在Popen服务前的端口bind检查报`OSError: [Errno48] Address already in use`，零gate/无service PID；controller按finally恢复22840。失败时未记录内核TCP状态，不能据此确证TIME_WAIT，也没有停止不明监听者。root核对同90文件及参考idle，改用预先检查空闲的11237/11238/11239独立端口启动v2 controller23104/session15161，只跑剩余edges/soak/logs；edges15/15已通过，soak进行中。新live/edges日志格式只读检查分别194/150条schema、14/8个legacy请求通过，但这项格式检查不代替逐请求终态门槛。async7文件候选已经root apply-check和Redis独立审阅；root另发现性能模板单值mtp-order与repeat2冲突，正让agent仅改ignored模板为mtp-depth0，不能带此错误直接运行。
 
 - 09:46：HTTP c930续批全部完成并恢复24434。soak797.792秒、46/46、12cycle，五次FD11不变、RSS净增1344KiB；终态6gate/8request通过，真实非流式输出超限及fresh AR/MTP恢复通过。root90文件postflight与参考核对完成，旧freeze解除。发现同步日志在满stderr pipe会阻塞的活性缺口，另准备有界writer候选。async模板已修正为合法的`--mtp-depth 0 --repeat 2`，v3 manifest核对通过，生产7文件仍未改。
+
+- 09:58：f77f58e HTTP阶段已commit/push/远程SHA核对。PD+默认关闭async8候选整合构建通过，3项纯CPU策略测试通过。唯一PD controller session80786已启动，112文件/二进制5f1321b冻结，env删除async8以保持AR默认路径。参考predecessor是HTTPv2恢复24434；结束后先检查PD correctness与性能分别结果，再决定启动async同状态门槛。
+
+- 10:02：PD控制器已exit0并恢复25852，112文件postflight通过；默认burst4维持。进入async8同checkpoint门槛（session78710），119文件SHA及102payload大小/mtime核对通过，未开始4process性能筛选。必须先查state-gate.json complete/passed及所有逐位检查，不能仅按controller退出0进入下一步。
+
+- 10:05：async同状态门槛root以独立helper复核通过（121张量+完整logits，0/5次提交），并完成119文件/102payload postflight。5项汇总CPU控制通过；现跑固定0/8/8/0，每process暖0测1，完整128 IDs检查所有8轮。Logger v2已准备并由另一agent审阅，尚未应用/构建；后续五case草案在`results/http-async-logger-regression-v1/plan-draft.json`，不得提前执行。
+
+- 10:12：async4process控制器exit0并恢复26788。正式summary complete/all_correct true、errors[]、outcome indeterminate_drift；保留原始表，不把1.186倍率当收益。120文件/102payload postflight及参考argv/meta/listener/idle完成，旧freeze解除。Logger v2 root实际apply-check、7文件baseline/candidate哈希及11CPU Python通过，待阶段提交后应用与构建。PD小型冻结fixture将随源代码提交以方便复跑。

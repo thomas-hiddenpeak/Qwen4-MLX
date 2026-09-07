@@ -39,9 +39,9 @@
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 
-[本机调度优先级补充](research/LOCAL_SCHEDULER_NEXT.md)进一步核对了当前接口：多会话FIFO交替并不合并跨请求权重读取，burst计步骤而非GPU时间，固定prefill块仍会阻塞其他decode。MTP[两窗口性能复测](MTP_RELEASE_WINDOWS.md)已完成：36组中23通过、13漂移未定，未通过发布性能门槛；后续先用确定到达时点的小实验检查PD公平性，满足MTP与生命周期前置条件后再实现AR精确checkpoint。真正跨请求batching需要改造独立位置及混合状态接口，暂不排在前缀复用之前。
+[本机调度优先级补充](research/LOCAL_SCHEDULER_NEXT.md)进一步核对了当前接口：多会话FIFO交替并不合并跨请求权重读取，burst计步骤而非GPU时间，固定prefill块仍会阻塞其他decode。MTP[两窗口性能复测](MTP_RELEASE_WINDOWS.md)已完成：36组中23通过、13漂移未定，未通过发布性能门槛；[确定到达时点的PD实验](PD_DECODE_ARRIVAL_EXPERIMENT.md)已完成13请求正确性回归：短请求等待缩短，但首对整体时间/长TTFT超限且外基线漂移明显，默认burst4保持；满足MTP与生命周期前置条件后再实现AR精确checkpoint。真正跨请求batching需要改造独立位置及混合状态接口，暂不排在前缀复用之前。
 
-[Decode提交边界核查](DECODE_SUBMISSION_FEASIBILITY.md)区分了历史漂移增量与总耗时：23.20%是跨度外增量比例，不能作为可消除CPU开销。现有PLE前已异步提交、高层generator已优化标量读回；只保留“当前AR token每八层提前提交”的关闭默认候选，明确排除MTP的S1路径，并保留最终完整状态等待。尚未构建或实测，排在服务修复和PD探针之后。
+[Decode提交边界核查](DECODE_SUBMISSION_FEASIBILITY.md)区分了历史漂移增量与总耗时：23.20%是跨度外增量比例，不能作为可消除CPU开销。现有PLE前已异步提交、高层generator已优化标量读回；只保留“当前AR token每八层提前提交”的关闭默认候选，明确排除MTP的S1路径，并保留最终完整状态等待。已构建并通过3项CPU、同checkpoint的完整logits/121张量以及8轮完整输出检查；四进程原始比值1.186397伴随30.4455%外基线漂移，性能未定，默认仍关闭。
 
 当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。新增长任务同时记录了原始GPU状态与系统thermal等级，观察到档位分布变化及nominal→fair，详见其报告；这是关联证据，尚未单独建立降速因果。
 

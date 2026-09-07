@@ -6,6 +6,9 @@ extension RunnerCLI {
     /// Compare target computations from the SAME evaluated AR checkpoint.
     /// Fixed future inputs isolate causality from draft quality and earlier drift.
     static func probeGPUMTPNumerics(_ args: Arguments) throws {
+        if args["--scenario"] == "decode-async-one-step" {
+            return try probeGPUDecodeAsyncState(args)
+        }
         try args.validate(["--model-dir", "--reference-report", "--positions", "--output", "--verify-scalar-linear"])
         guard [nil, "true", "false"].contains(args["--verify-scalar-linear"]) else {
             throw CLIError.usage("--verify-scalar-linear expects true or false")

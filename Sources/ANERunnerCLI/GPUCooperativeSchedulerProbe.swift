@@ -7,6 +7,13 @@ extension RunnerCLI {
     /// Fixed long/short requests compare whole-stage and cooperative scheduling.
     /// GPU execution remains serial; callback clocks measure observed latency.
     static func probeGPUCooperativeScheduler(_ args: Arguments) throws {
+        if let scenario = args["--scenario"] {
+            guard scenario == "decode-arrival" else {
+                throw CLIError.usage("Unknown cooperative scheduler probe scenario")
+            }
+            try probeGPUPDFairness(args)
+            return
+        }
         try args.validate(["--model-dir", "--tokens-file", "--output", "--golden-report", "--decode-burst"])
         guard let decodeBurst = Int(args["--decode-burst"] ?? "4"), (1...64).contains(decodeBurst) else {
             throw CLIError.usage("Cooperative scheduler probe --decode-burst must be in 1...64")

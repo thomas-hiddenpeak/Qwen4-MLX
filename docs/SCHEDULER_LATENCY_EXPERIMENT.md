@@ -2,6 +2,8 @@
 
 2026-09-07。已有 cooperative probe 保存了完整 callback 时钟和 `runNext` 步骤，本轮利用这些记录补齐服务效果汇总；没有修改调度器核心策略，也没有在调研期间启动模型或服务。
 
+新增固定到达场景已完成：短AR在第8个callback迎来11k长请求，4→8→8→4正确性通过、性能筛选未通过，默认4维持。完整原始复算及长TTFT/最大gap代价见[decode已活跃时的到达实验](PD_DECODE_ARRIVAL_EXPERIMENT.md)。
+
 ## 已有内容与本轮增量
 
 [原有探针](../Sources/ANERunnerCLI/GPUCooperativeSchedulerProbe.swift) 已记录每个输出 token 的 `timestampNS`、提交时刻、submit 到首/末 callback、相邻 callback 的全部间隔、每步开始/结束以及完成事件的阶段统计。已有 TTFT 可以直接使用，不需要再用 compute 时间拼算。

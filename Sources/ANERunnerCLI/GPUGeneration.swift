@@ -351,6 +351,8 @@ extension RunnerCLI {
             "fused_attention_prefill": GPUAttention.fusedPrefillEnabled,
             "experimental_fused_attention_prefill": GPUAttention.fusedPrefillEnabled,
             "experimental_blocked_gdn_prefill": ProcessInfo.processInfo.environment["ANERUNNER_BLOCKED_GDN"] == "1",
+            "experimental_decode_async_every_layers": model.experimentalDecodeAsyncEveryLayers,
+            "experimental_decode_async_submissions": model.experimentalDecodeAsyncSubmissions,
             "prefill_evaluate_every_layers": prefillEvalLayers,
             "prefill_attention_mode": prefillAttention.rawValue,
             "prefill_moe_selection": moeSelection?.provenance ?? ["enabled": false],
