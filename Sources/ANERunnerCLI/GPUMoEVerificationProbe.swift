@@ -244,7 +244,7 @@ extension RunnerCLI {
     }
 }
 
-private enum GPUMoEVerificationBytes {
+enum GPUMoEVerificationBytes {
     /// Public dtype view preserves native BF16/FP32/integer bit patterns.
     /// Contiguity converts storage strides to logical row-major order only.
     static func read(_ tensor: Tensor) throws -> Data {

@@ -118,6 +118,8 @@ struct RunnerCLI {
                 try probeGPUCommandTiming(arguments)
             case "probe-gpu-matvec":
                 try probeGPUMatvec(arguments)
+            case "probe-gpu-verification-qkv":
+                try probeGPUVerificationQKV(arguments)
             case "probe-telemetry":
                 try probeTelemetry(arguments)
             case "tokenize":
@@ -331,6 +333,8 @@ struct RunnerCLI {
         Check the optional system sampler lifecycle while idle; no model or bandwidth benchmark.
     probe-gpu-command-timing --gpu-command-timing-output NEW_JSON_PATH [--output report.json]
         Validate the isolated native timing hook with tiny matrices; no model load.
+    probe-gpu-verification-qkv --model-dir PATH --output NEW_JSON_PATH
+        Four real QKV weights, synthetic S2/S3 inputs; fixed 3 warm and 12 AB/BA pairs per layer.
     probe-gpu-matvec --model-dir PATH --output NEW_JSON_PATH [--repeats 16] [--gpu-command-timing-output NEW_JSON_PATH]
         Diagnose real BF16 GDN/head matrix-vector kernels with synthetic fixed inputs; not full-model inference.
         GDN tuning library: --gdn-gemv-order reference,bm4,rows4,bm2,bm1,gemm,gemmSplit,prefetch4,prefetch4Vector

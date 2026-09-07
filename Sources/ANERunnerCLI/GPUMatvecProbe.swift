@@ -280,7 +280,7 @@ extension RunnerCLI {
     }
 }
 
-private struct GPUMatvecCase {
+struct GPUMatvecCase {
     let name: String
     let input: Tensor
     let matrices: [Tensor]

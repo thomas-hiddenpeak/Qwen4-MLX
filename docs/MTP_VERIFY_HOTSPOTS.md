@@ -27,7 +27,7 @@ MTP原生命令跟踪仅在 `--profile-stages synchronizedStages --profile-phase
 | PLE | 7 | 8.558 | 2.575 | 1.05% |
 | 其余embedding/HC write | 679 | 128.702 | 2.013 | 0.82% |
 
-GPU列是逐段与原生GPU命令区间求交后取并集，分母合计245.475ms；不是将evaluationWait当成GPU时间。2037个阶段、22901个原生命令记录完整，无丢弃、未完成或错误。6个S3和1个S2验证forward全部保留；不同shape的首次编译/初始化和后续调用须分开观察。
+GPU列是逐段与原生GPU命令区间求交后取并集，分母合计245.475ms；不是将evaluationWait当成GPU时间。2037个阶段、22901个原生命令记录完整，无丢弃、未完成或错误。6个S3和1个S2验证forward全部保留；S3后续五轮的GPU排序仍为MoE、GDN、Attention，S2只有一次，后续统计明确为空。
 
 普通运行target prefill为19.317秒、MTP prompt history为0.193秒、decode为0.472秒；诊断对应19.668秒、0.195秒、0.935秒。分段同步明显扰动decode，这些GPU份额只能用于诊断排序，不能直接套回普通decode来预测加速。
 
@@ -39,4 +39,6 @@ Release构建通过；23项profiler、阶段、MTP成本CPU测试和6项命令�
 
 原始数据位于 `results/mtp-verify-hotspots-v1/run/`：`normal.json`、`profile.json`、`commands.json`、`plan.json`、`run-ledger.json`和`postflight-and-release.json`。实测二进制SHA为 `ac2774982896b467d0f1be6be9f38ec3ea07350b9c662171937f4bb59b03b37f`。冻结275个文件SHA及102个模型payload大小/mtime，运行后全部核对通过；原参考服务PID40188的参数、监听归属、空闲状态及MTP/drafter关闭已核对。
 
-下一项选择GDN的S3 QKV投影作局部筛选：尝试TM4→TM2以减少每线程累加器数量，同时保留每个输出的原K/FMA/归约顺序。它不复制权重，也不代表已证明存在寄存器瓶颈；先要求真实四层权重下逐位正确和约5%可重复收益，再考虑接入整模型。
+独立分析见同目录 `analysis-v2.json` 与 `independent-checks.json`：原始区间的另一种事件扫描算法重算出245,474,613ns，9项CPU分析控制通过。首版 `analysis.json` 因错误假设派生golden16含有prompt而失败，已保留；有效版本先核对原golden路径/SHA，再取得完整prompt与前16个输出。
+
+随后完成[GDN S3 QKV的TM2局部筛选](VERIFICATION_QKV_TM2_EXPERIMENT.md)：42项逐位比较通过，四层未出现可重复加速，保留算子实验入口且不接入整模型。后续应继续区分较大块中的具体计算和访存成本，不以增加线程组或减少源码累加器数量替代实际收益。

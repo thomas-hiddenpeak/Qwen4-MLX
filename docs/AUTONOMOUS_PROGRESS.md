@@ -13,6 +13,8 @@
 
 ## 当前状态
 
+- 2026-09-07 16:28：MTP验证诊断已提交推送`0b24db9`，远程SHA核对通过；独立事件扫描复算245,474,613ns及9项分析CPU控制通过，有效报告为run/analysis-v2.json（首版golden元数据设置错误保留）。GDN QKV S3 TM2候选随后release46.10秒、CPU dispatch契约及42项实权重逐位检查通过，48暖/192测量完整；S3四层倍率0.957720/1.009808/0.898387/1.012265，S2未改参数对照也有方向性波动，未建立可重复收益，不扩大整模型或改默认。140文件SHA+102payload stat已复核释放；参考41069精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验，heartbeat仍暂停；最终源码保留显式算子probe，未接生成mode。见VERIFICATION_QKV_TM2_EXPERIMENT.md。
+
 - 2026-09-07 16:20：用户继续授权MTP验证热点研究。增加profiler phaseFilter与uptime时间戳，MTP原生跟踪限定synchronized verification，粗round明确无graph boundary；release46.89秒、23项Swift CPU和6项Python通过。原11k、D2/max16的普通/诊断完整IDs及MTP计数相同，2037阶段/22901原生命令无丢弃；诊断GPU跨度MoE32.89%、GDN25.19%、Attention19.78%，不是普通执行的带宽/速度指标。275文件SHA+102payload stat已复核释放，参考40188恢复、空闲及身份已核对。当前无GPU实验；GDN agent在ignored目录准备S3 QKV TM2局部候选，尚未应用/构建/实测。见MTP_VERIFY_HOTSPOTS.md。
 
 - 2026-09-07 15:58：用户白天授权的三项推进已完成首轮。真实SSE溢出通过并推送`8b8f702`；固定11k五轮AR联合诊断已推送`9750d70`，暖decode首末下降3.777%，新增时间90.95%在GPU跨度内，不归因于适配器。共享专家S2/S3融合候选release及23项CPU通过，83项真实层逐位比较通过；四组局部倍率1.038665/1.047143/1.023566/1.020307，含时序波动，未达约5%可重复收益筛选量级。停止该候选的整模型扩展，仅保留三文件算子探针，撤下未验证的新生成模式。实测结果在`results/daytime-mtp-v1/run`，139文件SHA与102payload stat复核释放；参考PID37847已恢复并核对空闲、精确argv、监听和MTP/drafter关闭。当前无GPU实验，heartbeat保持暂停；16:01已确认缩小源码范围后的release重新构建通过（44.80秒），最终二进制`045b7bcc`；新二进制未重复微测，实测证据仍绑定`9cb13917`，见MTP_SHARED_ELEMENTWISE_EXPERIMENT.md。

@@ -38,10 +38,14 @@ import Foundation
 /// Bitwise parity is a test gate, not a guarantee about other Metal compilers
 /// or separately tuned scalar GEMV implementations.
 public final class GPUVerificationLinear {
+    /// Operator probe only; production callers keep the reference default.
+    public enum Experiment: String, Sendable { case reference, qkvS3TM2 }
+    public let experiment: Experiment
     private let kernel: mlx_fast_metal_kernel
     private var configurations: [[Int]: Configuration] = [:]
 
-    public init() throws {
+    public init(experiment: Experiment = .reference) throws {
+        self.experiment = experiment
         let inputs = mlx_vector_string_new(), outputs = mlx_vector_string_new()
         defer { _ = mlx_vector_string_free(inputs); _ = mlx_vector_string_free(outputs) }
         for name in ["x", "w"] {
@@ -68,7 +72,7 @@ public final class GPUVerificationLinear {
         let configuration: Configuration
         if let cached = configurations[key] { configuration = cached }
         else {
-            let parameters = try Self.parameters(inputSize: ws[0], outputSize: ws[1])
+            let parameters = try selectedParameters(tokens: shape[1], inputSize: ws[0], outputSize: ws[1])
             configuration = try Configuration(tokens: shape[1], inputSize: ws[0],
                                               outputSize: ws[1], parameters: parameters)
             configurations[key] = configuration
@@ -83,6 +87,21 @@ public final class GPUVerificationLinear {
             throw GPUError.invalid("Verification linear output count mismatch")
         }
         return try MX.output("Verification linear result") { mlx_vector_array_get(&$0, outputs, 0) }
+    }
+
+    /// The probe reports the same immutable policy used to build its configs.
+    /// This is a dispatch-parameter witness, not a GPU shader invocation counter.
+    public func rowsPerThread(tokens: Int, inputSize: Int, outputSize: Int) throws -> Int {
+        try selectedParameters(tokens: tokens, inputSize: inputSize, outputSize: outputSize).tm
+    }
+
+    private func selectedParameters(tokens: Int, inputSize: Int, outputSize: Int) throws -> Parameters {
+        guard (2...5).contains(tokens) else { throw GPUError.invalid("Verification parameters require S2...5") }
+        let reference = try Self.parameters(inputSize: inputSize, outputSize: outputSize)
+        guard experiment == .qkvS3TM2, tokens == 3, inputSize == 2560,
+              outputSize == 10240, reference.bn == 1 else { return reference }
+        return Parameters(bm: reference.bm, bn: reference.bn, sm: reference.sm,
+            sn: reference.sn, tm: 2, tn: reference.tn)
     }
 
     /// Supported source projections only. N=1 is deliberately excluded: the
