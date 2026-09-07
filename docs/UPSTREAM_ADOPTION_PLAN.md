@@ -41,6 +41,8 @@
 
 [本机调度优先级补充](research/LOCAL_SCHEDULER_NEXT.md)进一步核对了当前接口：多会话FIFO交替并不合并跨请求权重读取，burst计步骤而非GPU时间，固定prefill块仍会阻塞其他decode。MTP[两窗口性能复测](MTP_RELEASE_WINDOWS.md)正在执行；后续先用确定到达时点的小实验检查PD公平性，满足MTP与生命周期前置条件后再实现AR精确checkpoint。真正跨请求batching需要改造独立位置及混合状态接口，暂不排在前缀复用之前。
 
+[Decode提交边界核查](DECODE_SUBMISSION_FEASIBILITY.md)区分了历史漂移增量与总耗时：23.20%是跨度外增量比例，不能作为可消除CPU开销。现有PLE前已异步提交、高层generator已优化标量读回；只保留“当前AR token每八层提前提交”的关闭默认候选，明确排除MTP的S1路径，并保留最终完整状态等待。尚未构建或实测，排在服务修复和PD探针之后。
+
 当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。新增长任务同时记录了原始GPU状态与系统thermal等级，观察到档位分布变化及nominal→fair，详见其报告；这是关联证据，尚未单独建立降速因果。
 
 新增[状态与阶段对齐分析](GPU_STATE_PHASE_ANALYSIS.md)把这项采样变为可复用的只读工具，保留完整包络覆盖与原始状态权重。服务线另排[限额错误归因与关闭原因](HTTP_OUTPUT_BOUNDARIES.md)的小修复；先保留错误原因，再补实际触发验证，不能用暂停读客户端替代真实应用溢出。两项均不改变正在冻结测试的推理路径。

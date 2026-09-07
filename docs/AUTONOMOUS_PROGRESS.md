@@ -17,7 +17,7 @@
 
 最新已验证参考服务：PID17773，`http://127.0.0.1:11235`，MTP/drafter关闭，08:29:32恢复ready，08:32冻结B前再次核对。最新已完成恢复ledger为`results/mtp-release-window-a/run-ledger.json`。这是窗口A结束时的快照；当前参考已由B控制器暂停，后续恢复PID以B ledger为准，不能沿用17773。
 
-北京时间08:32，参考17773已交由窗口B控制器接管。当前唯一GPU任务是`results/mtp-release-window-b/controller-plan.json`，controller PID18230，exec session45809，ledger启动UTC00:32:11。08:40核对时已完成2进程16轮，完整IDs gate均通过，正在执行`tools-256-part1`（PID18612）。分析计划为同目录`plan.json`，当前case和后续恢复以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
+北京时间08:32，参考17773已交由窗口B控制器接管。当前唯一GPU任务是`results/mtp-release-window-b/controller-plan.json`，controller PID18230，exec session45809，ledger启动UTC00:32:11。09:04核对时已完成8进程64轮，完整IDs gate均通过，正在执行`tools-128-part1`（PID21030）。分析计划为同目录`plan.json`，当前case和后续恢复以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -33,7 +33,11 @@
 
 下一次接续先跟进窗口B controller18230/session45809和ledger，不启动第二个模型或重建。B完成后确认整组清理及参考恢复，再对A/B两个正式plan合并分析；A已有7组未定，不以B替换。此前推理源码、分析器、controller/helper均冻结。
 
-解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过，但尚未应用、构建或运行新测试。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。redis agent正准备ignored验证脚本；gdn agent按[限定调度研究](research/LOCAL_SCHEDULER_NEXT.md)准备ignored PD公平性probe，二者无生产修改/build/GPU权。缓存前置条件不变。
+解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过，但尚未应用、构建或运行新测试。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
+
+后续候选已经推进到可审阅副本，均未接入生产。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。该草案尚不可执行：先完成B、验证参考恢复、应用HTTP补丁并构建/CPU回归，再冻结正式plan。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
+
+PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d70674b0f9c3b4a9d1c0cb8db19a61306a18e2640bf7452eada5c`，root静态审阅、manifest依赖与实际apply-check通过，未构建。新增probe及原cooperative入口7行分流，固定历史短26输入/64输出、长11057/128，先本次独立AR核对，再4/8/8/4及取消两份live状态/fresh AR。共13请求（预计11完成/2取消）；性能与正确性分开。`results/pd-fairness-v1/plan-draft.json`待HTTP阶段恢复后选择最新predecessor再正式冻结。另有vllm agent准备当前token内async8提交的ignored候选，见[限定提交研究](DECODE_SUBMISSION_FEASIBILITY.md)，同样无生产修改/build/GPU权。
 
 - 05:20左右：分派三路研究/实现；参考服务保持运行；GDN agent只允许独立编译，尚未获得GPU运行权。
 - 05:31：三份上游固定版本已核对，两个调研文档和[综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)完成。开始请求级 MTP 成本摘要和调度输出延迟统计，不改变在线策略。
@@ -64,3 +68,5 @@
 - 08:06：完成独立GPU状态阶段分析器与HTTP输出边界核查。新工具只读已有报告，不改冻结的91文件/运行版本；两真实报告逐值重算一致，30控制及2次坏/好文件CLI保留检查通过。原始AR从30.786降到21.108 token/s期间，GPUPH主要标签由P12/P11变为P3/P4，thermal从nominal变为fair；仅作关联，不推算MHz/因果，原MTP门槛不变。见GPU_STATE_PHASE_ANALYSIS.md。HTTP已确认非流式文本超限被泛化generation_failed，关闭路径缺少15/300秒原因；见HTTP_OUTPUT_BOUNDARIES.md。解冻后优先补本地错误原因/结构化终态日志，再选择真实可确定触发的短fixture；本轮未捏造overflow测试或运行另一GPU任务。窗口A此时已完成6/12进程48/96轮，继续原256及工具/事实256，先做完A/B再改源码。
 
 - 08:40：窗口A于08:29结束，12进程96请求全通过完整IDs及阶段检查，正式分析18组为11通过/7漂移待定/0倍率失败，独立只读重算一致；不认定两窗门槛通过。参考17773恢复并核对后，于08:32启动B controller18230/session45809。B正式plan SHA256为`3409095d585414783a82cc9bb26c8955ff14944a39a41824d903ab9a01d48b77`，91文件同A，preflight通过。B已完成事实256的两进程16轮，正在工具256；继续保持冻结。HTTP候选v3仅通过静态审阅与patch应用检查，尚无新构建/运行结果。当前已推送源码阶段为`17164f3`，远程SHA已核对。
+
+- 09:04：阶段记录`634f1fb`已推送并核对远程SHA。B已完成8/12进程64/96请求，全部完整IDs通过，正在tools128part1（PID21030），controller18230/session45809继续唯一GPU任务。HTTP修复v3、日志验证v2、PD公平性候选及对应draft均已静态审阅，尚未应用/build/live。新增限定decode提交研究，避免把历史23.20%增量误当总CPU可优化空间；每8层提前提交仍只是后续候选，不改默认。
