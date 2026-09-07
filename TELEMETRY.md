@@ -182,4 +182,6 @@ python3 -m unittest discover -s scripts -p test_analyze_gpu_telemetry.py
 
 每路保存本次及前次读取的 start/end。做阶段归属时只使用整个端点包络落在阶段内的增量；发生失败会断开差值链。baseline 没有 delta，不能记成零。采样循环仍由目标 PID 身份控制，但这些 GPU 状态是系统范围，不能归属该 PID；多个通道不能相加。P1…P15 尚无经过核对的频率映射，不导出 MHz、shader 利用率或实际 DRAM 带宽。thermalState 是操作系统压力等级，不是摄氏温度；nominal 也不证明 GPU 没有调节频率。
 
-固定 AR [命令跨度诊断](docs/GPU_DRIFT_TRACE.md)把主要漂移收窄到 GPU 执行跨度内，因而补上这两路原始证据。新增采样已构建，并在空闲参考服务旁完成 baseline+3次采样：端点包络有效、两路 delta 完整、thermal nominal。原始记录 `results/gpu-states-v1/idle.jsonl`。这只是读取能力检查，尚不是生成阶段的降速解释；下一轮真实 workload 将同时记录这些字段。
+固定 AR [命令跨度诊断](docs/GPU_DRIFT_TRACE.md)把主要漂移收窄到 GPU 执行跨度内，因而补上这两路原始证据。新增采样已构建，并在空闲参考服务旁完成 baseline+3次采样：端点包络有效、两路 delta 完整、thermal nominal。原始记录 `results/gpu-states-v1/idle.jsonl`。这项空闲检查只证明读取能力。
+
+真实长任务已经记录这些字段。[阶段状态分析](docs/GPU_STATE_PHASE_ANALYSIS.md)提供独立只读脚本，从生成报告追溯到同次sidecar，按完整端点包络报告状态原值、权重与覆盖率。窗口A前16轮观察到AR降速与GPU状态标签/thermal等级变化同时发生；这是关联，不能直接换算成频率或独立确定原因，MTP门槛保持原定判据。

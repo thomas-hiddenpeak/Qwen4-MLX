@@ -43,6 +43,8 @@
 
 当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。新增长任务同时记录了原始GPU状态与系统thermal等级，观察到档位分布变化及nominal→fair，详见其报告；这是关联证据，尚未单独建立降速因果。
 
+新增[状态与阶段对齐分析](GPU_STATE_PHASE_ANALYSIS.md)把这项采样变为可复用的只读工具，保留完整包络覆盖与原始状态权重。服务线另排[限额错误归因与关闭原因](HTTP_OUTPUT_BOUNDARIES.md)的小修复；先保留错误原因，再补实际触发验证，不能用暂停读客户端替代真实应用溢出。两项均不改变正在冻结测试的推理路径。
+
 ## MTP 的统计与状态约束
 
 `accepted / drafted` 表示草稿质量。实际 decode 产出排除 prefill 已算出的首 token，EOS 和剩余预算按真正发布/提交数量处理；不能用 `1 + accepted / rounds` 代替实际产出。剩余预算为一时的 target-only 收尾也产生 verify 成本，但不一定增加现有 speculative rounds。计时摘要必须保留这一区别。

@@ -17,7 +17,7 @@
 
 最新已验证参考服务：PID13611，`http://127.0.0.1:11235`，MTP/drafter关闭，核对时刻为北京时间07:35:54。最新恢复ledger为`results/controller-interrupt-v1/run-ledger.json`。这是控制器中断smoke结束时的快照；执行前必须与`../qwen38-ssd/results/experiment-status.json`及实际进程重新核对。
 
-北京时间07:41，参考13611已交由窗口A控制器接管。当前唯一GPU任务是`results/mtp-release-window-a/controller-plan.json`，controller PID13960，exec session33813，ledger启动UTC23:41:19。首个`original-128-part1`（PID/PGID13990）已于07:44:49完成，控制器继续`original-128-part2`。分析计划为同目录`plan.json`，运行状态以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
+北京时间07:41，参考13611已交由窗口A控制器接管。当前唯一GPU任务是`results/mtp-release-window-a/controller-plan.json`，controller PID13960，exec session33813，ledger启动UTC23:41:19。08:06核对时已完成6进程48轮，全部完整IDs gate通过，正在执行`original-256-part1`（PID16176）。分析计划为同目录`plan.json`，当前case和后续恢复以同目录`run-ledger.json`为准。root持有唯一GPU所有权，不得并行启动另一模型。
 
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
@@ -58,3 +58,5 @@
 - 07:44:49：窗口A首进程10轮完整输出ID通过。root独立手算前两测量组：G1 AR30.4056/MTP35.4031 tokens/s，倍率1.16436，AR漂移2.4416%，该组通过；G2 AR27.9262/MTP35.8636，倍率1.28423，AR漂移12.3403%，按冻结门槛应为无法判定。保留该组，不重划或补换；这是首进程局部观察，不能作为整窗或发布结论。
 
 - 07:50：控制器收尾提交`84a7436`已推送并核对远程SHA。窗口A的original128两进程共16轮完整IDs/阶段合同通过；三组比值1.1644/1.2842/1.2815，AR漂移2.4416%/12.3403%/0.4213%，第二组仍为indeterminate。增量分析保存在`results/mtp-release-window-a/partial-after-original128.json`；窗口未完成时其全窗口all_correct=false包含缺失报告，不能误读为已完成请求错误。controller已进入tools128part1，继续按原计划保留所有组。新增调度优先级文档，仅研究与两个后续实验设计，没有实现跨请求batch或prefix cache。
+
+- 08:06：完成独立GPU状态阶段分析器与HTTP输出边界核查。新工具只读已有报告，不改冻结的91文件/运行版本；两真实报告逐值重算一致，30控制及2次坏/好文件CLI保留检查通过。原始AR从30.786降到21.108 token/s期间，GPUPH主要标签由P12/P11变为P3/P4，thermal从nominal变为fair；仅作关联，不推算MHz/因果，原MTP门槛不变。见GPU_STATE_PHASE_ANALYSIS.md。HTTP已确认非流式文本超限被泛化generation_failed，关闭路径缺少15/300秒原因；见HTTP_OUTPUT_BOUNDARIES.md。解冻后优先补本地错误原因/结构化终态日志，再选择真实可确定触发的短fixture；本轮未捏造overflow测试或运行另一GPU任务。窗口A此时已完成6/12进程48/96轮，继续原256及工具/事实256，先做完A/B再改源码。
