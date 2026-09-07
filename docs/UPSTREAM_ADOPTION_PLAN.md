@@ -35,7 +35,7 @@
 | 2C，单层筛选未达门槛 | [shared/routed down 调度](MOE_BRANCH_OVERLAP_FEASIBILITY.md) | 合并两个down节点的输入hazard，再调用原primitive；MLX本来已用concurrent encoder | 三行逐位与编码计数通过，reference/fused约+3.04%/+4.16%，未达5%，pair未稳定胜过串行/原recipe，不进入整模 |
 | 3，依赖 MTP/生命周期稳定 | 不可变内存 checkpoint | 先有界精确系统提示词表、私有恢复，再加最长前缀索引 | 10k 公共前缀 + 不同后缀，A/B/A 无污染；节省的 prefill 大于保存/恢复成本 |
 | 4，依赖内存 checkpoint | SSD 状态缓存 | 有版本、身份与完整性校验的文件，独立磁盘额度，有界读写 | 冷盘恢复快于重算，损坏/中断写入正常回退，不拖慢 PLE 读取 |
-| 服务交付线，输出原因与有界日志已回归 | [HTTP/SSE、背压和断连](HTTP_SERVER_EXPERIMENT.md) | 固定推理线程、独立网络队列、有界响应/诊断日志；43项CPU、19+15项live、12周期46项soak、6项终态和3项满日志pipe检查 | AR/MTP、断连、真实非流式超限恢复和满日志pipe活性通过；850.75秒soak中FD稳定、RSS净增320KiB；SSE应用溢出及其他期限仍待测 |
+| 服务交付线，输出原因与有界日志已回归 | [HTTP/SSE、背压和断连](HTTP_SERVER_EXPERIMENT.md) | 固定推理线程、独立网络队列、有界响应/诊断日志；43项CPU、19+15项live、12周期46项soak、6项终态和3项满日志pipe检查 | AR/MTP、断连、真实非流式超限恢复和满日志pipe活性通过；850.75秒soak中FD稳定、RSS净增320KiB；真实SSE应用溢出、error/DONE/EOF和新AR/MTP恢复已通过，其他期限仍待测 |
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 
@@ -45,11 +45,11 @@
 
 当前插入一项有明确原因的诊断：11k深度对照出现持续降速，allocator计数稳定且已记录PLE等待不足以解释主要下降。[固定AR驻留对照](RESIDENCY_DRIFT_DIAGNOSIS.md)中fit未阻止降速，进程分页和footprint未发现对应增长；[命令缓冲诊断](GPU_DRIFT_TRACE.md)把暖轮prefill/decode主要漂移定位到GPU跨度内。新增长任务同时记录了原始GPU状态与系统thermal等级，观察到档位分布变化及nominal→fair，详见其报告；这是关联证据，尚未单独建立降速因果。
 
-新增[状态与阶段对齐分析](GPU_STATE_PHASE_ANALYSIS.md)把这项采样变为可复用的只读工具，保留完整包络覆盖与原始状态权重。服务线已完成[限额错误归因、关闭原因及有界诊断日志](HTTP_OUTPUT_BOUNDARIES.md)，真实非流式text_limit和未读日志pipe均已验证恢复；SSE真实应用溢出仍需单独尝试，不能用暂停读取本身判定通过。
+新增[状态与阶段对齐分析](GPU_STATE_PHASE_ANALYSIS.md)把这项采样变为可复用的只读工具，保留完整包络覆盖与原始状态权重。服务线已完成[限额错误归因、关闭原因及有界诊断日志](HTTP_OUTPUT_BOUNDARIES.md)，真实非流式text_limit和未读日志pipe均已验证恢复；真实SSE应用溢出已用固定输入在约60秒暂停后触发，收到slow_consumer、DONE、EOF并通过新AR/MTP恢复；15/300秒发送相关期限仍未覆盖。
 
 ## MTP 的统计与状态约束
 
-用户返回后的[同窗口五轮AR诊断](DAYTIME_DRIFT_DIAGNOSIS.md)已完成：完整输出及联合采样通过，暖decode首末下降3.777%，新增时间主要落在GPU命令跨度内。该结果允许继续单个MTP验证候选的局部筛选，不作为无采样基准或具体降速原因。下一候选是显式S2/S3共享专家逐元素尾部融合，先局部逐位与性能门槛，保留其余验证、路由与状态路径。
+用户返回后的[同窗口五轮AR诊断](DAYTIME_DRIFT_DIAGNOSIS.md)已完成：完整输出及联合采样通过，暖decode首末下降3.777%，新增时间主要落在GPU命令跨度内。该结果允许继续单个MTP验证候选的局部筛选，不作为无采样基准或具体降速原因。[S2/S3共享专家逐元素融合](MTP_SHARED_ELEMENTWISE_EXPERIMENT.md)已完成局部筛选：83项逐位比较通过，四组约2.0%–4.7%，未达约5%可重复收益量级。仅保留算子实验入口，撤下未进入整模型验证的生成模式，不改默认。下一项先细分MTP验证阶段GPU成本，再选较大热点。
 
 `accepted / drafted` 表示草稿质量。实际 decode 产出排除 prefill 已算出的首 token，EOS 和剩余预算按真正发布/提交数量处理；不能用 `1 + accepted / rounds` 代替实际产出。剩余预算为一时的 target-only 收尾也产生 verify 成本，但不一定增加现有 speculative rounds。计时摘要必须保留这一区别。
 

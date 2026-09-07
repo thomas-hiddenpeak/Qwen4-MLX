@@ -7,7 +7,13 @@ import Foundation
 extension RunnerCLI {
     static func probeGPUMoEVerification(_ args: Arguments) throws {
         try args.validate(["--model-dir", "--output", "--layer", "--warmups", "--runs",
-                           "--prefill-fixture", "--decode-fixture"])
+                           "--prefill-fixture", "--decode-fixture", "--candidate"])
+        let candidatePolicy = args["--candidate"] ?? "tokenAxis"
+        guard ["tokenAxis", "sharedElementwise"].contains(candidatePolicy) else {
+            throw CLIError.usage("--candidate must be tokenAxis or sharedElementwise")
+        }
+        let sharedElementwise = candidatePolicy == "sharedElementwise"
+        let lengths = sharedElementwise ? [2, 3] : [2, 3, 5]
         let output = try args.require("--output")
         guard !FileManager.default.fileExists(atPath: output),
               let layer = Int(args["--layer"] ?? "0"), layer >= 0,
@@ -17,14 +23,19 @@ extension RunnerCLI {
         }
         var cases: [[String: Any]] = []
         var report: [String: Any] = [
-            "schema": "qwen38-moe-verification-token-axis-v1", "complete": false, "passed": false,
+            "schema": sharedElementwise ? "qwen38-moe-verification-shared-elementwise-v1" : "qwen38-moe-verification-token-axis-v1",
+            "complete": false, "passed": false, "candidate_policy": candidatePolicy,
             "layer_index": layer, "warmups_per_variant": warmups, "samples_per_variant": runs,
             "baseline": "verificationLinear enabled; routed experts run existing per-token S1 kernels",
-            "candidate": "verificationLinear enabled; verificationTokenAxis=true",
+            "candidate": sharedElementwise
+                ? "verificationLinear enabled; per-token routed experts unchanged; verificationSharedElementwise=true for S2/S3"
+                : "verificationLinear enabled; verificationTokenAxis=true",
             "full_model_generation": false, "performance_threshold_applied": false,
             "timing_scope": "Resident BF16 input and original Q4 weights; Swift forward construction plus GPU execution and y.eval. No diagnostics, host output copies, input parsing, or model loading in samples.",
             "physical_dram_bandwidth_gbps": NSNull(),
-            "notes": ["Six cases: S2/S3/S5 with mixed captured rows and repeated captured rows.",
+            "notes": [sharedElementwise
+                        ? "Four cases: S2/S3 mixed/repeated captured rows; reference initialization leaves S1 shared fusion disabled. Only the new explicit verification selector can select the candidate tails."
+                        : "Six cases: S2/S3/S5 with mixed captured rows and repeated captured rows.",
                       "Default activations are actual layer-0 rows, reordered/repeated for an independent MoE operator test, not a new autoregressive trajectory.",
                       "Expert overlap counts logical routing assignments; hardware weight-cache reuse is not measured.",
                       "Passed means bitwise correctness and completed timing collection, not a whole-model speedup gate."]
@@ -93,14 +104,16 @@ extension RunnerCLI {
             report["mlx_version"] = try GPUProbeSupport.mlxVersion()
             report["operating_system"] = ProcessInfo.processInfo.operatingSystemVersionString
 
-            for length in [2, 3, 5] {
+            var firstSharedCase: (x: Tensor, reference: GPUMoEOutput)?
+            for length in lengths {
                 for pattern in ["mixed", "repeated"] {
                     let rowIDs = (0..<length).map { pattern == "mixed" ? $0 % rows.count : rows.count - 1 }
                     let x = try MX.array(rowIDs.flatMap { rows[$0] }, shape: [1,length,c.hiddenSize], dtype: MLX_BFLOAT16)
                     try x.eval()
                     func forward(_ candidate: Bool, diagnostics: Bool) throws -> GPUMoEOutput {
                         try moe.forward(x, diagnostics: diagnostics, verificationLinear: linear,
-                                        verificationTokenAxis: candidate)
+                                        verificationTokenAxis: candidate && !sharedElementwise,
+                                        verificationSharedElementwise: candidate && sharedElementwise)
                     }
                     func diagnostics(_ candidate: Bool) throws -> GPUMoEOutput {
                         let out = try forward(candidate, diagnostics: true)
@@ -108,6 +121,7 @@ extension RunnerCLI {
                         return out
                     }
                     let a = try diagnostics(false), b = try diagnostics(true)
+                    if sharedElementwise, firstSharedCase == nil { firstSharedCase = (x, a) }
                     var at = a.diagnostics, bt = b.diagnostics
                     at["y"] = a.y; bt["y"] = b.y
                     guard !at.isEmpty, Set(at.keys) == Set(bt.keys),
@@ -151,6 +165,7 @@ extension RunnerCLI {
                     }
                     var item: [String: Any] = [
                         "name": "s\(length)_\(pattern)", "input_shape": x.shape, "row_bank_indices": rowIDs,
+                        "candidate_shared_elementwise_sequence": sharedElementwise ? length : NSNull(),
                         "input_bf16_sha256": GPUProbeSupport.digest(try GPUMoEVerificationBytes.read(x)),
                         "bitwise_passed": exact, "diagnostic_tensor_count_including_y": at.count,
                         "comparisons": comparisons, "routing_expert_ids_per_token": perToken,
@@ -158,6 +173,12 @@ extension RunnerCLI {
                         "repeated_assignment_count": ids.count - Set(ids).count,
                         "expert_overlap_between_tokens": pairOverlap
                     ]
+                    if sharedElementwise {
+                        let gates = try a.diagnostics["shared_gate"]!.floats()
+                        item["baseline_shared_gate_values"] = gates
+                        item["baseline_shared_gate_logits"] = try a.diagnostics["shared_gate_logits"]!.floats()
+                        item["distinct_shared_gate_bit_patterns"] = Set(gates.map { $0.bitPattern }).count
+                    }
                     guard exact else {
                         cases.append(item)
                         throw GPUError.invalid("Bitwise verification failed for s\(length)_\(pattern); timing stopped")
@@ -195,8 +216,24 @@ extension RunnerCLI {
                     try save()
                 }
             }
+            if let firstSharedCase {
+                // Return to S2 after S3 on the same object: catch cache/config
+                // cross-talk without adding another benchmark or input fixture.
+                let diagnostic = try moe.forward(firstSharedCase.x, diagnostics: true,
+                    verificationLinear: linear, verificationSharedElementwise: true)
+                let ordinary = try moe.forward(firstSharedCase.x, diagnostics: false,
+                    verificationLinear: linear, verificationSharedElementwise: true)
+                let comparisons = [
+                    "diagnostic_y": try GPUMoEVerificationBytes.compare(firstSharedCase.reference.y, diagnostic.y),
+                    "diagnostic_gate": try GPUMoEVerificationBytes.compare(firstSharedCase.reference.diagnostics["shared_gate"]!, diagnostic.diagnostics["shared_gate"]!),
+                    "ordinary_y": try GPUMoEVerificationBytes.compare(firstSharedCase.reference.y, ordinary.y)
+                ]
+                let exact = comparisons.values.allSatisfy { $0["exact"] as? Bool == true }
+                report["cache_return_s2"] = ["comparisons": comparisons, "passed": exact]
+                guard exact else { throw GPUError.invalid("S2 shared-tail cache return after S3 was not bitwise exact") }
+            }
             report["final_memory"] = try MX.memory()
-            report["complete"] = true; report["passed"] = cases.count == 6
+            report["complete"] = true; report["passed"] = cases.count == lengths.count * 2
             try save()
         } catch {
             report["fatal_error"] = String(describing: error)

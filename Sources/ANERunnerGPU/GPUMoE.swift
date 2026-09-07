@@ -243,6 +243,7 @@ public final class GPUMoE {
                         useFusedSharedElementwise: Bool? = nil,
                         verificationLinear: GPUVerificationLinear? = nil,
                         verificationTokenAxis: Bool = false,
+                        verificationSharedElementwise: Bool = false,
                         profiler: GPUProfiler? = nil,
                         prefillReductionThreadgroup: Int? = nil,
                         prefillGateUpVariant: Int? = nil,
@@ -287,6 +288,9 @@ public final class GPUMoE {
         let verification = batch == 1 && (2...5).contains(sequence) ? verificationLinear : nil
         guard !verificationTokenAxis || verification != nil else {
             throw GPUMoEError.invalidConfiguration("Token-axis MoE requires verification linear kernels and [1,S,H] with S in 2...5")
+        }
+        guard !verificationSharedElementwise || (verification != nil && !verificationTokenAxis) else {
+            throw GPUMoEError.invalidConfiguration("Verification shared tails require scalar-linear MoE and per-token routed experts")
         }
         let routing: (x: Tensor,logits: Tensor,indices: Tensor,weights: Tensor) = try measure(
             "moe.router",profiler: profiler,tokens: tokens,
@@ -488,9 +492,15 @@ public final class GPUMoE {
                 // The explicit verification policy above independently selects dense
                 // scalar-order projections; no weight bank is copied or repacked.
                 let sharedFusion = tokens == 1 && useSharedFusion ? fused : nil
+                // This explicit policy reuses the already prepared fused/LUT
+                // object. It does not depend on the opt-in S1 initialization flag.
+                // The verification branch above requires fused to be non-nil.
+                let verificationSharedFusion = verificationSharedElementwise && (2...3).contains(sequence) ? fused : nil
                 let sharedActivation: Tensor
                 if let sharedFusion {
                     sharedActivation = try sharedFusion.sharedActivation(sharedGateProjection, up: sharedUpProjection)
+                } else if let verificationSharedFusion {
+                    sharedActivation = try verificationSharedFusion.verificationSharedActivation(sharedGateProjection, up: sharedUpProjection)
                 } else {
                     sharedActivation = try swiglu(sharedGateProjection, sharedUpProjection)
                 }
@@ -512,6 +522,10 @@ public final class GPUMoE {
                 let sharedGate: Tensor?, sharedGated: Tensor?, y: Tensor
                 if let sharedFusion {
                     let result = try sharedFusion.sharedOutput(routed: routed, down: sharedDown,
+                        gateLogits: sharedGateLogits, diagnostics: diagnostics)
+                    y = result.y; sharedGate = result.gate; sharedGated = result.gated
+                } else if let verificationSharedFusion {
+                    let result = try verificationSharedFusion.verificationSharedOutput(routed: routed, down: sharedDown,
                         gateLogits: sharedGateLogits, diagnostics: diagnostics)
                     y = result.y; sharedGate = result.gate; sharedGated = result.gated
                 } else {

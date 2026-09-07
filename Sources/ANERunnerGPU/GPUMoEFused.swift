@@ -59,6 +59,9 @@ final class GPUMoEFused {
     private var prefillPrograms: [[Int]: Program] = [:]
     private var sharedActivationPrograms: [Int: Program] = [:]
     private var sharedOutputPrograms: [Bool: Program] = [:]
+    // Separate S2/S3 caches leave the original S1 programs and keys unchanged.
+    private var verificationSharedActivationPrograms: [Int: Program] = [:]
+    private var verificationSharedOutputPrograms: [VerificationKey: Program] = [:]
     private struct VerificationKey: Hashable {
         let sequence: Int
         let diagnostics: Bool
@@ -295,6 +298,66 @@ final class GPUMoEFused {
                 grid: [(hidden + 255) / 256 * 256, 1, 1], threadgroup: [256, 1, 1],
                 template: ["COUNT": hidden])
             sharedOutputPrograms[diagnostics] = program
+        }
+        let values = try program.apply([routed, down, gateLogits, sigmoidTable])
+        return SharedOutput(y: values[0], gate: diagnostics ? values[1] : nil,
+            gated: diagnostics ? values[2] : nil)
+    }
+
+    /// Explicit S2/S3 verification only. Reuse the S1 source and sigmoid LUT;
+    /// flattening independent rows changes neither the BF16 operation order nor
+    /// any projection, routing, or expert reduction.
+    func verificationSharedActivation(_ gate: Tensor, up: Tensor) throws -> Tensor {
+        let shape = gate.shape
+        guard shape.count == 3, shape[0] == 1, (2...3).contains(shape[1]),
+              shape[2] == intermediate, intermediate <= (Int(Int32.max) - 255) / 3,
+              up.shape == shape, gate.dtype == MLX_BFLOAT16, up.dtype == MLX_BFLOAT16 else {
+            throw GPUError.invalid("Verification shared activation requires matching BF16 [1,S,I], S2/S3")
+        }
+        let sequence = shape[1], count = sequence * intermediate
+        let program: Program
+        if let cached = verificationSharedActivationPrograms[sequence] { program = cached }
+        else {
+            program = try Program(name: "ane_runner_verify_shared_swiglu_bf16",
+                source: Self.sharedActivationSource, inputs: ["gate", "up", "sigtab"],
+                outputs: ["y"], outputShapes: [shape],
+                grid: [(count + 255) / 256 * 256, 1, 1], threadgroup: [256, 1, 1],
+                template: ["COUNT": count])
+            verificationSharedActivationPrograms[sequence] = program
+        }
+        return try program.apply([gate, up, sigmoidTable])[0]
+    }
+
+    /// Reindex only the scalar router gate and its diagnostic store per token.
+    /// Each multiply/add still rounds to BF16 at exactly the S1 boundaries.
+    func verificationSharedOutput(routed: Tensor, down: Tensor, gateLogits: Tensor,
+                                  diagnostics: Bool) throws -> SharedOutput {
+        let shape = routed.shape
+        guard shape.count == 3, shape[0] == 1, (2...3).contains(shape[1]),
+              shape[2] == hidden, hidden <= (Int(Int32.max) - 255) / 3,
+              down.shape == shape, gateLogits.shape == [1, shape[1], 1],
+              routed.dtype == MLX_BFLOAT16, down.dtype == MLX_BFLOAT16,
+              gateLogits.dtype == MLX_BFLOAT16 else {
+            throw GPUError.invalid("Verification shared output requires BF16 [1,S,H]/[1,S,1], S2/S3")
+        }
+        let sequence = shape[1], count = sequence * hidden
+        let key = VerificationKey(sequence: sequence, diagnostics: diagnostics)
+        let program: Program
+        if let cached = verificationSharedOutputPrograms[key] { program = cached }
+        else {
+            let source = try Self.reindex(Self.sharedOutputSource, [
+                ("gate_logits[0]", "gate_logits[i / uint(H)]"),
+                ("// DIAGNOSTIC_STORES", diagnostics
+                    ? "if (i % uint(H) == 0) gate_value[i / uint(H)] = sig;\n    gated_value[i] = product;" : "")
+            ])
+            program = try Program(
+                name: diagnostics ? "ane_runner_verify_shared_output_bf16_diagnostic" : "ane_runner_verify_shared_output_bf16",
+                source: source, inputs: ["routed", "down", "gate_logits", "sigtab"],
+                outputs: diagnostics ? ["y", "gate_value", "gated_value"] : ["y"],
+                outputShapes: diagnostics ? [shape, [1, sequence, 1], shape] : [shape],
+                grid: [(count + 255) / 256 * 256, 1, 1], threadgroup: [256, 1, 1],
+                template: ["COUNT": count, "H": hidden])
+            verificationSharedOutputPrograms[key] = program
         }
         let values = try program.apply([routed, down, gateLogits, sigmoidTable])
         return SharedOutput(y: values[0], gate: diagnostics ? values[1] : nil,
