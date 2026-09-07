@@ -39,7 +39,7 @@
 
 1A/1C 是测量与可用性补足，1B 是性能实验，可以并行写代码，但 GPU 实测串行。微测平或更慢就停止扩大该候选；完整模型没有可重复收益就维持现有默认。初步以局部约 5%、整模型约 3% 作为值得继续的筛选量级，最终决策结合运行漂移，不能因一次跨过阈值宣布成功。
 
-[本机调度优先级补充](research/LOCAL_SCHEDULER_NEXT.md)进一步核对了当前接口：多会话FIFO交替并不合并跨请求权重读取，burst计步骤而非GPU时间，固定prefill块仍会阻塞其他decode。MTP[两窗口性能复测](MTP_RELEASE_WINDOWS.md)正在执行；后续先用确定到达时点的小实验检查PD公平性，满足MTP与生命周期前置条件后再实现AR精确checkpoint。真正跨请求batching需要改造独立位置及混合状态接口，暂不排在前缀复用之前。
+[本机调度优先级补充](research/LOCAL_SCHEDULER_NEXT.md)进一步核对了当前接口：多会话FIFO交替并不合并跨请求权重读取，burst计步骤而非GPU时间，固定prefill块仍会阻塞其他decode。MTP[两窗口性能复测](MTP_RELEASE_WINDOWS.md)已完成：36组中23通过、13漂移未定，未通过发布性能门槛；后续先用确定到达时点的小实验检查PD公平性，满足MTP与生命周期前置条件后再实现AR精确checkpoint。真正跨请求batching需要改造独立位置及混合状态接口，暂不排在前缀复用之前。
 
 [Decode提交边界核查](DECODE_SUBMISSION_FEASIBILITY.md)区分了历史漂移增量与总耗时：23.20%是跨度外增量比例，不能作为可消除CPU开销。现有PLE前已异步提交、高层generator已优化标量读回；只保留“当前AR token每八层提前提交”的关闭默认候选，明确排除MTP的S1路径，并保留最终完整状态等待。尚未构建或实测，排在服务修复和PD探针之后。
 

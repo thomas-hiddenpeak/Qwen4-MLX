@@ -15,10 +15,11 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新已验证参考服务：PID21912，`http://127.0.0.1:11235`，MTP/drafter关闭，09:19:29恢复ready；root随后核对精确argv、11235监听归属、meta及空闲指标。最新已完成恢复ledger为`results/mtp-release-window-b/run-ledger.json`。此为B结束时快照，下一controller启动前仍须重新核对。
+最新已验证参考服务：PID24434，`http://127.0.0.1:11235`，MTP/drafter关闭，09:46:09恢复ready；root核对精确argv、meta、监听PID及空闲指标。最新已完成恢复ledger为`results/http-output-fix-regression-v2/run-ledger.json`。当前没有GPU实验，其他项目未停止。
 
-窗口B controller18230/session45809已exit0，12进程全部清理并恢复参考21912。A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通过/13漂移未定，双窗口性能门槛未通过。root完成B的91文件postflight后于09:21:32解除旧版本冻结，应用HTTP修复v3及日志验证脚本v2，release build49.91秒及36项Swift CPU/6项Python解析控制通过。新二进制为c93011f。当前唯一GPU任务是HTTP四case回归，controller22649/session27178于09:24:53启动，正在live case（harness22689）；参考21912已由controller暂停。正式plan与最新ledger在`results/http-output-fix-regression-v1/`。90文件与二进制再次冻结，运行期间不得改生产源码或构建；其他candidate均仍ignored。
+A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通过/13漂移未定，双窗口性能门槛未通过，已提交推送d432caa。HTTP修复c93011f完成release build、36项Swift CPU/6项Python解析控制、19项live、15项edges、12周期46项soak和6项终态日志检查。首批edges在服务启动前端口检查失败，保留原报告，续批三个独立端口完成。真实非流式output_limit已触发并验证恢复；SSE实际溢出仍未覆盖。90文件postflight与恢复核对通过，旧冻结已解除，历史结果仍绑定c930。
 
+独立审查确认同步stderr日志可在未读取的满pipe上阻塞网络与推理日志路径；当前普通文件回归不能覆盖。redis agent正在ignored路径准备最小有界异步日志候选及pipe活性验证，不改默认推理。PD/async8候选仍未应用/构建，待本阶段提交后整合。
 本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
 
 ## 进行中的工作
@@ -31,11 +32,11 @@
 
 ## 接续记录
 
-下一次接续先跟进HTTP controller22649/session27178和`results/http-output-fix-regression-v1/run-ledger.json`，按live→edges→12周期soak→terminal-logs顺序继续；最后case含一次真实非流式output_limit尝试，未触发如实保留。90文件/二进制c93011f已冻结，期间不得改源码或构建/并行加载。全部结束后核对参考恢复与新JSON日志/正常旧gate，更新HTTP文档并提交源码。PD/async候选仅在此后再审阅整合。A/B已正式分析，不重跑替换未定组。
+下一次接续先查看Git及各agent候选状态。HTTP controller23104/session15161已exit0、恢复24434；v2完整结果与90文件postflight/解除冻结记录已保存，无需重跑这些历史case。先提交HTTP原因/日志修复及准确文档，再整合阻塞日志修复、PD公平性和async8候选。每次新构建重新冻结身份和参考predecessor，先CPU/状态门槛，再有限GPU实验；A/B已正式分析，不重跑替换未定组。
 
-解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过；B结束后已应用并构建，36项相关Swift CPU通过，真实live回归运行中。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
+解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过；B结束后已应用并构建，36项相关Swift CPU通过，后续真实回归已完成。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
 
-后续候选已保存可审阅副本。HTTP修复与验证脚本已原样接入生产路径、构建和CPU通过、真实回归运行中，PD与async8仍未接入。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。这些前置已完成；正式`plan.json`已于09:24冻结并运行，草案继续保留，不能拿草案重复启动。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
+后续候选已保存可审阅副本。HTTP修复与验证脚本已原样接入生产路径，构建、CPU与真实回归通过，PD与async8仍未接入。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。这些前置已完成；首批正式plan在live后遇到边界harness启动前端口检查失败，保留报告后以相同90文件/二进制和三个独立空闲端口冻结v2续跑，未改服务、helper或验收条件。草案不能重复启动。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
 
 PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d70674b0f9c3b4a9d1c0cb8db19a61306a18e2640bf7452eada5c`，root静态审阅、manifest依赖与实际apply-check通过，未构建。新增probe及原cooperative入口7行分流，固定历史短26输入/64输出、长11057/128，先本次独立AR核对，再4/8/8/4及取消两份live状态/fresh AR。共13请求（预计11完成/2取消）；性能与正确性分开。`results/pd-fairness-v1/plan-draft.json`待HTTP阶段恢复后选择最新predecessor再正式冻结。另有vllm agent准备当前token内async8提交的ignored候选，见[限定提交研究](DECODE_SUBMISSION_FEASIBILITY.md)，同样无生产修改/build/GPU权。
 
@@ -72,3 +73,7 @@ PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d706
 - 09:04：阶段记录`634f1fb`已推送并核对远程SHA。B已完成8/12进程64/96请求，全部完整IDs通过，正在tools128part1（PID21030），controller18230/session45809继续唯一GPU任务。HTTP修复v3、日志验证v2、PD公平性候选及对应draft均已静态审阅，尚未应用/build/live。新增限定decode提交研究，避免把历史23.20%增量误当总CPU可优化空间；每8层提前提交仍只是后续候选，不改默认。
 
 - 09:25：A/B全部完成、独立复核和正式合并分析通过其正确性范围，共23性能通过/13漂移未定，含B原256第三组raw0.840651；不改默认。B最后91文件身份检查及参考21912恢复核对后，root解除旧冻结，应用HTTP v3与日志脚本v2。release49.91s、36 Swift CPU、6 Python控制通过，二进制`c93011f804dd287a7758568d69373089959a0b92408379390ea71d7294b0568a`。四case正式controller22649/session27178启动，90文件冻结，当前live；源码提交待真实回归完成，双窗文档先阶段提交。async8最新7文件候选和一步deep-state gate仍ignored，Redis正独立只读审阅；不与HTTP并行build/GPU。
+
+- 09:34：首批live19/19通过，随后edges在Popen服务前的端口bind检查报`OSError: [Errno48] Address already in use`，零gate/无service PID；controller按finally恢复22840。失败时未记录内核TCP状态，不能据此确证TIME_WAIT，也没有停止不明监听者。root核对同90文件及参考idle，改用预先检查空闲的11237/11238/11239独立端口启动v2 controller23104/session15161，只跑剩余edges/soak/logs；edges15/15已通过，soak进行中。新live/edges日志格式只读检查分别194/150条schema、14/8个legacy请求通过，但这项格式检查不代替逐请求终态门槛。async7文件候选已经root apply-check和Redis独立审阅；root另发现性能模板单值mtp-order与repeat2冲突，正让agent仅改ignored模板为mtp-depth0，不能带此错误直接运行。
+
+- 09:46：HTTP c930续批全部完成并恢复24434。soak797.792秒、46/46、12cycle，五次FD11不变、RSS净增1344KiB；终态6gate/8request通过，真实非流式输出超限及fresh AR/MTP恢复通过。root90文件postflight与参考核对完成，旧freeze解除。发现同步日志在满stderr pipe会阻塞的活性缺口，另准备有界writer候选。async模板已修正为合法的`--mtp-depth 0 --repeat 2`，v3 manifest核对通过，生产7文件仍未改。

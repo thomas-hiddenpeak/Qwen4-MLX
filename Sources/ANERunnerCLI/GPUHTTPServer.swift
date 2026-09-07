@@ -79,7 +79,7 @@ private struct GPUHTTPHealth: Sendable {
 /// Mutable connection state is confined to GPUHTTPServer.network. The only
 /// fields passed to the worker are the immutable Sendable GPUHTTPWork value.
 private final class GPUHTTPClient: @unchecked Sendable {
-    let id = UUID()
+    let id: UUID
     let connection: NWConnection
     let openedAt = DispatchTime.now().uptimeNanoseconds
     var parser: QwenHTTPRequestParser
@@ -88,9 +88,11 @@ private final class GPUHTTPClient: @unchecked Sendable {
     var sendingSimple = false
     var sendStartedAt: UInt64?
     var sendID: UInt64?
+    var rejectionStatus: Int?
+    var rejectionCode: String?
     var work: GPUHTTPWork?
-    init(_ connection: NWConnection, maxBodyBytes: Int) throws {
-        self.connection = connection
+    init(_ connection: NWConnection, id: UUID, maxBodyBytes: Int) throws {
+        self.id = id; self.connection = connection
         parser = try QwenHTTPRequestParser(maxBodyBytes: maxBodyBytes)
     }
 }
@@ -99,12 +101,32 @@ private final class GPUHTTPClient: @unchecked Sendable {
 private final class GPUHTTPActive {
     let work: GPUHTTPWork
     var utf8 = IncrementalUTF8Decoder()
-    var text = "", textBytes = 0
+    var text = ""
+    var textBudget: QwenHTTPTextBudget
     var schedulerID: UUID?
-    init(_ work: GPUHTTPWork) { self.work = work }
+    init(_ work: GPUHTTPWork, maxTextBytes: Int) {
+        self.work = work; textBudget = QwenHTTPTextBudget(maxBytes: maxTextBytes)
+    }
 }
 
 private enum GPUHTTPOutputError: Error { case tooLarge }
+
+private enum GPUHTTPCloseReason: String {
+    case connectionLimit = "connection_limit", serverStopping = "server_stopping"
+    case clientInitializationFailed = "client_initialization_failed"
+    case transportFailed = "transport_failed", transportCancelled = "transport_cancelled"
+    case receiveFailed = "receive_failed", responseConflict = "response_conflict"
+    case simpleSent = "simple_sent", simpleSendFailed = "simple_send_failed"
+    case rejectedAfterResponse = "rejected_after_response", errorEncodingFailed = "error_encoding_failed"
+    case headerSendFailed = "header_send_failed", sendFailed = "send_failed", terminalSent = "terminal_sent"
+    case sendDeadline = "send_deadline", connectionDeadline = "connection_deadline"
+    case shutdown, outputEncodingFailed = "output_encoding_failed"
+}
+
+private enum GPUHTTPLogEvent: String {
+    case modelTerminal = "model_terminal", outputTerminal = "output_terminal", connectionClose = "connection_close"
+    case closedSendReleased = "closed_send_released"
+}
 
 /// Network objects are queue-confined; inbox/health are synchronized. The worker
 /// creates and destroys all non-Sendable inference objects as thread-local vars.
@@ -116,6 +138,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private let health = Mutex(GPUHTTPHealth())
     private let finished = DispatchSemaphore(value: 0)
     private let failure = Mutex<String?>(nil)
+    private let logLock = Mutex(())
     private let listener: NWListener
     private var clients: [UUID: GPUHTTPClient] = [:]
     private var signals: [DispatchSourceSignal] = []
@@ -163,7 +186,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 let thread = Thread { self.inferenceMain() }
                 thread.name = "ane-runner.http.inference"
                 thread.start()
-            case .failed(let error): self.shutdown(error: "HTTP listener failed: \(error)")
+            case .failed: self.shutdown(error: "HTTP listener failed")
             default: break
             }
         }
@@ -171,30 +194,37 @@ private final class GPUHTTPServer: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
+        let id = UUID()
         guard !stopping, clients.count < configuration.maxConnections else {
             // Admission before receive prevents unbounded parsers/send callbacks.
+            logLifecycle(.connectionClose, connectionID: id,
+                reason: (stopping ? GPUHTTPCloseReason.serverStopping : .connectionLimit).rawValue)
             connection.cancel(); return
         }
         do {
-            let client = try GPUHTTPClient(connection, maxBodyBytes: configuration.maxBodyBytes)
+            let client = try GPUHTTPClient(connection, id: id, maxBodyBytes: configuration.maxBodyBytes)
             clients[client.id] = client
             connection.stateUpdateHandler = { [weak self, weak client] state in
                 guard let self, let client else { return }
                 switch state {
                 case .ready: self.receive(client)
-                case .failed, .cancelled: self.close(client)
+                case .failed: self.close(client, reason: .transportFailed)
+                case .cancelled: self.close(client, reason: .transportCancelled)
                 default: break
                 }
             }
             connection.start(queue: network)
-        } catch { connection.cancel() }
+        } catch {
+            logLifecycle(.connectionClose, connectionID: id, reason: GPUHTTPCloseReason.clientInitializationFailed.rawValue)
+            connection.cancel()
+        }
     }
 
     private func receive(_ client: GPUHTTPClient) {
         guard !client.closed else { return }
         client.connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self, weak client] data, _, eof, error in
             guard let self, let client, !client.closed else { return }
-            if error != nil { self.close(client); return }
+            if error != nil { self.close(client, reason: .receiveFailed); return }
             do {
                 if let data, !data.isEmpty, let request = try client.parser.feed(data) {
                     client.parsed = true
@@ -268,25 +298,27 @@ private final class GPUHTTPServer: @unchecked Sendable {
     }
 
     private func simple(_ client: GPUHTTPClient, data: Data) {
-        guard !client.closed, !client.sendingSimple, !client.responseStarted else { close(client); return }
+        guard !client.closed, !client.sendingSimple, !client.responseStarted else { close(client, reason: .responseConflict); return }
         client.sendingSimple = true; client.responseStarted = true
         client.sendStartedAt = DispatchTime.now().uptimeNanoseconds
-        client.connection.send(content: data, completion: .contentProcessed { [weak self, weak client] _ in
-            guard let self, let client else { return }; self.close(client)
+        client.connection.send(content: data, completion: .contentProcessed { [weak self, weak client] error in
+            guard let self, let client else { return }
+            self.close(client, reason: error == nil ? .simpleSent : .simpleSendFailed)
         })
     }
 
     private func reject(_ client: GPUHTTPClient, status: Int, message: String, code: String) {
+        client.rejectionStatus = status; client.rejectionCode = code
         if let work = client.work {
             work.cancellation.cancel()
             _ = work.output.disconnect()
         }
-        guard !client.responseStarted else { close(client); return }
+        guard !client.responseStarted else { close(client, reason: .rejectedAfterResponse); return }
         do {
             simple(client, data: try QwenHTTPFrames.response(status: status, contentType: "application/json",
                 body: QwenHTTPFrames.error(message: String(message.prefix(512)), code: code,
                     type: status >= 500 ? "server_error" : (status == 429 ? "rate_limit_error" : "invalid_request_error"))))
-        } catch { close(client) }
+        } catch { close(client, reason: .errorEncodingFailed) }
     }
 
     /// Called only after scheduler admission, before role/content wakeups.
@@ -299,8 +331,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
             client.sendStartedAt = DispatchTime.now().uptimeNanoseconds
             client.connection.send(content: QwenHTTPFrames.streamHeader(), completion: .contentProcessed { [weak self, weak client] error in
                 guard let self, let client, !client.closed else { return }
+                if error != nil { self.close(client, reason: .headerSendFailed); return }
                 client.headerInFlight = false; client.sendStartedAt = nil
-                if error != nil { self.close(client); return }
                 client.headerProcessed = true
                 self.sendNext(client)
             })
@@ -323,20 +355,37 @@ private final class GPUHTTPServer: @unchecked Sendable {
         client.connection.send(content: send.data, completion: .contentProcessed { [weak self, client] error in
             let next = work.output.acknowledgeSend(send.id, succeeded: error == nil)
             if next.cancelProducer { work.cancellation.cancel() }
+            if let self, client.closed {
+                // At most one outstanding send remains after close. Its actual
+                // callback releases retained Data; close itself cannot do that.
+                self.logLifecycle(.closedSendReleased, connectionID: client.id, work: work,
+                    reason: error == nil ? "send_processed" : "send_failed", fields: ["lease_id": send.id])
+            }
             guard let self, !client.closed, client.sendID == send.id else { return }
+            if error != nil { self.close(client, reason: .sendFailed); return }
+            if send.isTerminal { self.close(client, reason: .terminalSent); return }
             client.sendID = nil; client.sendStartedAt = nil
-            if error != nil || send.isTerminal { self.close(client); return }
             if next.scheduleSend { self.sendNext(client) }
         })
     }
 
-    private func close(_ client: GPUHTTPClient) {
+    private func close(_ client: GPUHTTPClient, reason: GPUHTTPCloseReason) {
         guard !client.closed else { return }
         client.closed = true
+        let now = DispatchTime.now().uptimeNanoseconds
+        let priorOutcome = client.work?.output.snapshot().outcome?.rawValue
         if let work = client.work {
             let effect = work.output.disconnect()
             if effect.cancelProducer { work.cancellation.cancel() }
         }
+        logLifecycle(.connectionClose, connectionID: client.id, work: client.work, reason: reason.rawValue,
+            fields: ["connection_age_seconds": Double(now - client.openedAt) * 1e-9,
+                     "send_elapsed_seconds": client.sendStartedAt.map { Double(now - $0) * 1e-9 } as Any? ?? NSNull(),
+                     "lease_id": client.sendID as Any? ?? NSNull(),
+                     "send_kind": client.headerInFlight ? "header" : (client.sendingSimple ? "simple" : (client.sendID == nil ? "none" : "body")),
+                     "rejection_status": client.rejectionStatus as Any? ?? NSNull(),
+                     "rejection_code": client.rejectionCode as Any? ?? NSNull(),
+                     "output_outcome_before_close": priorOutcome as Any? ?? NSNull()])
         client.connection.stateUpdateHandler = nil
         client.connection.cancel()
         clients.removeValue(forKey: client.id)
@@ -348,8 +397,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
             let age = Double(now - client.openedAt) * 1e-9
             // One periodic observer reads the current lease's start, rather
             // than scheduling uncancellable timers for past sends/requests.
-            if let start = client.sendStartedAt, Double(now - start) * 1e-9 >= 15 { close(client) }
-            else if age >= 300 { close(client) }
+            if let start = client.sendStartedAt, Double(now - start) * 1e-9 >= 15 { close(client, reason: .sendDeadline) }
+            else if age >= 300 { close(client, reason: .connectionDeadline) }
             else if !client.parsed && age >= 15 {
                 reject(client, status: 408, message: "Request receive deadline exceeded", code: "request_timeout")
             }
@@ -363,13 +412,13 @@ private final class GPUHTTPServer: @unchecked Sendable {
         health.withLock { $0.state = error == nil ? "stopping" : "failed"; $0.detail = error; $0.idle = false }
         listener.newConnectionHandler = nil; listener.cancel()
         timer?.cancel(); timer = nil
-        for client in Array(clients.values) { close(client) }
+        for client in Array(clients.values) { close(client, reason: .shutdown) }
         inbox.stop()
         if !workerStarted { inferenceStopped() }
     }
 
     private func inferenceStopped(error: String? = nil) {
-        if let error { failure.withLock { $0 = error }; log("inference failed: \(error)") }
+        if let error { failure.withLock { $0 = error }; log("HTTP inference failed") }
         shutdown(error: error)
         for signal in signals { signal.cancel() }; signals.removeAll()
         listener.stateUpdateHandler = nil
@@ -381,7 +430,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private func inferenceMain() {
         var message: String?
         do { try autoreleasepool { try inferenceLoop() } }
-        catch { message = String(describing: error) }
+        catch { message = "HTTP inference failed" }
         // All local MLX/model values were released on this OS thread above.
         let result = message
         network.async { self.inferenceStopped(error: result) }
@@ -434,7 +483,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
                         contextLimit: 16_384, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
                         verification: work.chat.mtpDepth == 2 ? .batchedScalarLinear : .scalar,
                         draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil)
-                    let active = GPUHTTPActive(work)
+                    let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
                         self.health.withLock { $0.runningJob = active.schedulerID?.uuidString }
                         let text = active.utf8.append(try tokenizer.decodeBytes([token], skipSpecialTokens: true))
@@ -444,6 +493,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     admitted(work)
                     if work.chat.stream {
                         let offered = work.output.enqueue(try QwenHTTPFrames.role(id: work.id, created: work.created, model: work.chat.model))
+                        if offered.status == .overflow { logOutput(work, reason: "slow_consumer") }
                         actions(offered.actions, work: work)
                         if offered.status != .accepted { work.cancellation.cancel() }
                     }
@@ -481,25 +531,39 @@ private final class GPUHTTPServer: @unchecked Sendable {
         let work = active.work
         try work.cancellation.check()
         if work.chat.stream {
-            let frame = try QwenHTTPFrames.content(id: work.id, created: work.created, model: work.chat.model, text: text)
+            let frame: Data
+            do { frame = try QwenHTTPFrames.content(id: work.id, created: work.created, model: work.chat.model, text: text) }
+            catch { active.textBudget.record(.encodingFailed); throw error }
             let offered = work.output.enqueue(frame)
+            if offered.status == .overflow { logOutput(work, reason: "slow_consumer") }
             actions(offered.actions, work: work)
             guard offered.status == .accepted else { work.cancellation.cancel(); throw QwenGenerationError.cancelled }
         } else {
             // Leave JSON/header headroom; check the actual final encoding too.
-            let count = text.utf8.count
-            guard count <= configuration.outputBytes - 2048 - active.textBytes else { throw GPUHTTPOutputError.tooLarge }
-            active.text += text; active.textBytes += count
+            guard active.textBudget.accept(byteCount: text.utf8.count) else { throw GPUHTTPOutputError.tooLarge }
+            active.text += text
         }
     }
 
     private func complete(_ event: QwenLocalScheduler.Event, active: GPUHTTPActive) {
         let work = active.work
+        var modelFields: [String: Any] = ["model_kind": event.kind.rawValue, "stage": event.stage.rawValue,
+            "scheduler_elapsed_seconds": finite(event.timing.elapsedSeconds)]
+        if let result = event.result {
+            modelFields["model_finish_reason"] = result.finishReason.rawValue
+            modelFields["prompt_tokens"] = result.statistics.promptTokenCount
+            modelFields["completion_tokens"] = result.tokens.count
+            modelFields["prefill_seconds"] = (result.phases?.prefill.targetSeconds).map(finite) ?? NSNull()
+            modelFields["decode_seconds"] = finite(result.decodeSeconds)
+        }
+        logLifecycle(.modelTerminal, connectionID: work.connectionID, work: work,
+            reason: active.textBudget.failure?.rawValue, fields: modelFields)
         do {
             let completion: QwenSSEOutputBuffer.Completion
+            let outputReason: String
             let frame: Data
             if event.kind == .completed, let result = event.result {
-                log("HTTP request id=\(work.id) mtp_depth=\(work.chat.mtpDepth) finish=\(result.finishReason.rawValue) prompt_tokens=\(result.statistics.promptTokenCount) completion_tokens=\(result.tokens.count) prefill_seconds=\(result.phases?.prefill.targetSeconds ?? 0) decode_seconds=\(result.decodeSeconds) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds)")
+                log("HTTP request id=\(work.id) mtp_depth=\(work.chat.mtpDepth) finish=\(result.finishReason.rawValue) prompt_tokens=\(result.statistics.promptTokenCount) completion_tokens=\(result.tokens.count) prefill_seconds=\(result.phases?.prefill.targetSeconds ?? 0) decode_seconds=\(result.decodeSeconds) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds) event=model_terminal")
                 try publish(active.utf8.finish(), active: active)
                 let reason = result.finishReason == .eos ? "stop" : "length"
                 if work.chat.stream {
@@ -512,22 +576,37 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     frame = try QwenHTTPFrames.response(status: 200, contentType: "application/json", body: body)
                 }
                 completion = .completed
+                outputReason = "completed"
             } else {
-                log("HTTP request id=\(work.id) terminal=\(event.kind.rawValue) stage=\(event.stage.rawValue) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds)")
+                log("HTTP request id=\(work.id) terminal=\(event.kind.rawValue) stage=\(event.stage.rawValue) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds) event=model_terminal")
                 completion = event.kind == .cancelled ? .cancelled : .failed
-                frame = try failureFrame(work, message: event.kind == .cancelled ? "Generation cancelled" : "Generation failed",
-                    code: event.kind == .cancelled ? "cancelled" : "generation_failed")
+                let failure = active.textBudget.errorResponse(cancelled: event.kind == .cancelled)
+                frame = try failureFrame(work, message: failure.message, code: failure.code)
+                outputReason = active.textBudget.failure?.rawValue ?? failure.code
             }
             let finished = work.output.finish(completion, frame: frame)
-            if finished.status == .invalidFrame { throw GPUHTTPOutputError.tooLarge }
+            if finished.status == .invalidFrame {
+                active.textBudget.record(.responseLimit)
+                throw GPUHTTPOutputError.tooLarge
+            }
+            if finished.status == .accepted { logOutput(work, reason: outputReason, budget: active.textBudget) }
             actions(finished.actions, work: work)
         } catch {
             work.cancellation.cancel()
-            if let frame = try? failureFrame(work, message: "Output exceeds configured limit or could not be encoded", code: "output_limit") {
-                actions(work.output.finish(.failed, frame: frame).actions, work: work)
+            let cancelled = (error as? QwenGenerationError) == .cancelled
+            if !cancelled && active.textBudget.failure == nil { active.textBudget.record(.encodingFailed) }
+            let failure = active.textBudget.errorResponse(cancelled: cancelled)
+            if let frame = try? failureFrame(work, message: failure.message, code: failure.code) {
+                let finished = work.output.finish(cancelled ? .cancelled : .failed, frame: frame)
+                if finished.status == .accepted {
+                    logOutput(work, reason: active.textBudget.failure?.rawValue ?? failure.code, budget: active.textBudget)
+                }
+                actions(finished.actions, work: work)
+                if finished.status == .invalidFrame {
+                    network.async { if let client = self.clients[work.connectionID] { self.close(client, reason: .outputEncodingFailed) } }
+                }
             } else {
-                _ = work.output.disconnect()
-                network.async { if let client = self.clients[work.connectionID] { self.close(client) } }
+                network.async { if let client = self.clients[work.connectionID] { self.close(client, reason: .outputEncodingFailed) } }
             }
         }
     }
@@ -538,5 +617,57 @@ private final class GPUHTTPServer: @unchecked Sendable {
             body: QwenHTTPFrames.error(message: message, code: code, type: "server_error"))
     }
 
-    private func log(_ text: String) { FileHandle.standardError.write(Data((text + "\n").utf8)) }
+    private func finite(_ value: Double) -> Any { value.isFinite ? value as Any : NSNull() }
+
+    private func logOutput(_ work: GPUHTTPWork, reason: String, budget: QwenHTTPTextBudget? = nil) {
+        // Only the operation that selected the buffer terminal logs this event.
+        // A late scheduler finish returns alreadyTerminal and never rewrites it.
+        let code = budget?.failure?.code ?? (reason == "completed" ? nil : reason)
+        // Streaming retains local encoding failures but never charges this
+        // cumulative text budget. These fields are inapplicable, not zero.
+        let textBudget = work.chat.stream ? nil : budget
+        logLifecycle(.outputTerminal, connectionID: work.connectionID, work: work, reason: reason,
+            fields: ["text_bytes": textBudget?.acceptedBytes as Any? ?? NSNull(),
+                     "text_limit_bytes": textBudget?.maxBytes as Any? ?? NSNull(),
+                     "error_code": code as Any? ?? NSNull()])
+    }
+
+    private func logLifecycle(_ event: GPUHTTPLogEvent, connectionID: UUID, work: GPUHTTPWork? = nil,
+                              reason: String? = nil, fields: [String: Any] = [:]) {
+        // Call sites supply finite reason codes and numeric metadata only.
+        // Never pass prompts, content, token IDs, or an Error's description.
+        var record = fields
+        record["schema"] = "qwen-http-lifecycle-v1"
+        record["pid"] = Int(getpid())
+        record["event"] = event.rawValue
+        record["connection_id"] = connectionID.uuidString.lowercased()
+        record["request_id"] = work?.id as Any? ?? NSNull()
+        record["reason"] = reason as Any? ?? NSNull()
+        record["uptime_seconds"] = Double(DispatchTime.now().uptimeNanoseconds) * 1e-9
+        if let work {
+            let state = work.output.snapshot()
+            record["stream"] = work.chat.stream
+            record["mtp_depth"] = work.chat.mtpDepth
+            record["output_outcome"] = state.outcome?.rawValue as Any? ?? NSNull()
+            record["buffered_bytes"] = state.bufferedBytes
+            record["buffered_events"] = state.bufferedEvents
+            record["queued_events"] = state.queuedEvents
+            record["in_flight_bytes"] = state.inFlightBytes
+            record["has_in_flight"] = state.hasInFlight
+            record["producer_finished"] = state.producerFinished
+            record["transport_closed"] = state.transportClosed
+            record["cancellation_requested"] = state.cancellationRequested
+            record["output_drained"] = state.isDrained
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: record, options: .sortedKeys),
+              let line = String(data: data, encoding: .utf8) else {
+            log("HTTP lifecycle record encoding failed")
+            return
+        }
+        log(line)
+    }
+
+    private func log(_ text: String) {
+        logLock.withLock { _ in FileHandle.standardError.write(Data((text + "\n").utf8)) }
+    }
 }

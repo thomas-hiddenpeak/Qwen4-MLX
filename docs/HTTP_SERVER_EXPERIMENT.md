@@ -1,6 +1,6 @@
 # 本机文字 HTTP/SSE 实验服务
 
-此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE 与模型回归及一轮补充网络边界检查。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
+此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE、补充网络边界及固定12轮短测。2026-09-07的c930版本还修复了非流式文本超限归因，并实测到HTTP500 / output_limit及后续恢复；各版本证据分列如下。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
 
 ```bash
 .build/release/ane-runner serve-gpu --model-dir /absolute/path/to/model
@@ -45,17 +45,21 @@ model 必须精确匹配。messages 仅允许 role/content，两者是字符串�
 
 ## 慢读、取消与关闭
 
-onToken 只做有限的 CPU 解码/编码与入队，不等待网络。发送端一次只有一个 in-flight lease，送出后仍计入额度，实际 send callback 才释放；终态由 QwenSSEOutputBuffer 只选择一次。输出超限取消该请求，并尽可能发送已接受前缀之后的 error/[DONE]。发送失败或超时会断开并取消，不能保证死连接收到终态。非流式只缓存有界文字与一个最终响应，不建立额外发送队列。
+onToken常规路径做有限的CPU解码/编码与入队，不等待网络发送确认；overflow和终态的同步stderr日志仍有满pipe阻塞缺口，见后文。发送端一次只有一个 in-flight lease，送出后仍计入额度，实际 send callback 才释放；终态由 QwenSSEOutputBuffer 只选择一次。SSE缓冲overflow请求取消，并在连接可发送时保留已接受前缀，再发error/[DONE]；非流式文本超限终止生成，返回HTTP500/output_limit，不发送正文前缀。发送失败或超时会断开并取消，不能保证死连接收到终态。非流式只缓存有界文字与一个最终响应，不建立额外发送队列。
 
 HTTP 请求后 TCP write half-close 仍可能是合法的读响应客户端，所以 EOF 本身不当作“对方已死”。真正断连通过 NW failed、发送错误或期限处理；非流式计算途中若无法及时区分 half-close/full-close，取消可能延后。暂停客户端读取的一次测试也不保证触发应用缓冲 overflow：OS 可能容纳全部短输出，必须把“其他请求继续运行”与“应用额度超限”分别记录。
 
 SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等待当前 tokenization / GPU / SSD 操作返回后清理 scheduler 与 MLX 状态。模型加载中也需要等待当前同步加载结束；没有从另一线程释放 GPU handle 或强行中断 kernel。
 
-每个请求完成/取消会写不含提示词内容的日志；成功记录分别含 prefill 秒数、decode 秒数与 scheduler elapsed，不把网络发送回调称作客户端实际送达或 TTFT。
+c930增加`qwen-http-lifecycle-v1`结构化日志，将model_terminal、output_terminal和connection_close分开；按PID、请求ID、连接ID关联，不记录提示词、正文或token内容。旧`HTTP request id=...`仍保留为同一模型终态的兼容表示，不能与新model_terminal相加计数。output_terminal只代表缓冲首次选定结果；断连或准入前拒绝不保证出现这个事件，模型完成也不保证最终编码/发送成功。prefill、decode与scheduler elapsed分别记录，不把网络确认当客户端实际读取或TTFT。
 
 ## 验证状态
 
-2026-09-07（本机时间）release 构建通过；29 项 CPU 测试全部通过：HTTP parser / chat DTO / framing 11 项、有界输出与生命周期 10 项、增量 UTF-8 8 项。真实 loopback 回归的 19 项检查也全部通过，使用 `Qwen3.8-Flash-Next-MLX-SSD-Stream`、8 连接上限和 8192 字节输出额度。
+当前c930版本完成36项Swift CPU、6项Python日志解析控制、19项live、15项edges、46项soak及6项终态检查；真实生成text_limit已覆盖，同步日志满pipe、SSE overflow和发送/连接期限尚未覆盖。当前完整结果见下方“c930输出原因与终态回归”。以下先保留早期f955基线，不能把两版本计数混合。
+
+### 早期f955服务基线
+
+2026-09-07（本机时间）release构建通过；29项CPU测试全部通过：HTTP parser / chat DTO / framing 11 项、有界输出与生命周期 10 项、增量 UTF-8 8 项。真实 loopback 回归的 19 项检查也全部通过，使用 `Qwen3.8-Flash-Next-MLX-SSD-Stream`、8 连接上限和 8192 字节输出额度。
 
 | 实测范围 | 结果与边界 |
 | --- | --- |
@@ -70,7 +74,7 @@ SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等�
 
 复现入口为 `scripts/test_http_server_live.py`；本机原始记录在 `results/http-service-v1/live.json`、`live.server.log` 与 `run-ledger.json`，这些运行产物不随源码提交。冻结对照为 `results/mtp-agent-expansion-v1/tools-128.json` 的首轮结果。服务二进制 SHA-256：`f95565cb2bcb32b494c2fe9d3a6397f69c01e4433a761c7d910887ff874dd4be`。这轮用于正确性和生命周期验收，运行顺序与负载没有为性能比较设计，不据其中耗时宣布 AR/MTP 加速比例。
 
-### 补充网络边界回归
+### 早期f955补充网络边界回归
 
 同日补充的 15 项检查全部通过，使用与首轮相同 SHA-256 的服务二进制；这一轮设置 `--max-connections 4`，仍为 8192 字节输出额度。独立脚本 `scripts/test_http_server_edges.py` 只启动、关闭自己的一份服务并管理自己的连接，SIGTERM/KeyboardInterrupt 进入 finally 清理；外层 controller 统一安排 GPU 窗口和参考服务恢复。
 
@@ -86,7 +90,7 @@ SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等�
 
 原始记录在 `results/http-service-edges-v1/edges.json`、`edges.server.log` 与 `run-ledger.json`。报告保留了取消请求原文、观察到的完整 SSE 帧、唯一请求 ID、匹配日志及清理后的计数；脚本与 runner 的 SHA-256 均已独立核对。该轮没有交错重复或冷热控制，不从短请求的耗时推断性能收益。
 
-### 固定 12 轮短时持续回归
+### 早期f955固定12轮短时持续回归
 
 同日 `scripts/test_http_server_soak.py` 完成预先固定的 **12 轮、46 项检查，全部通过**；总脚本时间 808.770 秒（约 13 分 29 秒，含加载、基线和退出），未重试或因中途结果调整轮数。仍使用同一服务二进制、4 连接上限和 8192 字节输出额度。脚本设置 1150 秒工作期限，为自有服务的有界清理预留时间，总预算 1200 秒。
 
@@ -113,12 +117,49 @@ RSS 末值比基线增加 **1552 KiB，约 1.516 MiB**；五次数字 FD 计数�
 
 原始记录在 `results/http-service-soak-v1/soak.json`、`soak.server.log` 与 `run-ledger.json`，包含每轮完整结果、取消前的 SSE 帧、唯一请求 ID、匹配日志、恢复观察时间及空闲计数。脚本、复用的 edge helper、runner、冻结对照的 SHA-256，以及实际 fixture 文本均已独立核对。这一轮的结论限于固定 12 轮短时持续回归。
 
+### c930输出原因与终态回归
+
+MTP双窗口结束并解除旧冻结后，加入每请求`QwenHTTPTextBudget`、明确关闭原因和结构化终态记录；不改变模型数值路径。新服务二进制SHA-256为`c93011f804dd287a7758568d69373089959a0b92408379390ea71d7294b0568a`。release构建、36项相关Swift CPU（原29项加7项文本限额测试）与6项Python日志解析控制通过。CPU解析还确认旧43-request日志可读；这不是新schema或新的模型请求证据。
+
+| c930实测 | 结果与原始记录 |
+| --- | --- |
+| live 19项 | 全部通过；[`v1/live.json`](../results/http-output-fix-regression-v1/live.json)保留长AR SSE/MTP非流式、Unicode、并发、配额、half-close、RST、后续恢复与活动shutdown。paused-reader仍未触发应用overflow。 |
+| edges 15项 | 全部通过；[`v2/edges.json`](../results/http-output-fix-regression-v2/edges.json)保留4连接硬上限、header/body接收期限、截断请求、AR/MTP的1/2/4输出预算、MTP257拒绝、两条非空content后的唯一ID decode取消和fresh恢复。实际header/body接收期限约15.343/15.344秒，不是发送期限。 |
+| 12轮soak 46项 | 全部通过；[`v2/soak.json`](../results/http-output-fix-regression-v2/soak.json)实际797.792412416秒，未追加替换轮。31个正常完成、12个decode RST取消，每轮fresh MTP/短请求与第3/6/9/12轮AR均匹配文本、usage、stop；每次恢复和轮末所有任务/资源计数归零。 |
+| 终态6项、8请求 | 全部通过；[`v2/terminal-logs.json`](../results/http-output-fix-regression-v2/terminal-logs.json)逐ID关联6个正常length完成、1个decode RST取消、1个真实非流式text_limit失败。超限收到HTTP500/output_limit后，再次AR/MTP均恢复。 |
+
+首次v1的edges在服务加载前因`Address already in use`停止，失败记录仍保留于`v1/edges.json`和ledger；续批使用各自独立端口执行edges、soak、terminal三项，不把首次失败抹掉或算作通过。三份自有服务均以0退出，控制器清理自有进程组并恢复参考PID24434，UTC01:46:09.163439（北京时间09:46:09.163439）确认ready；90文件postflight、精确argv、listener/meta/idle后续核对通过，见[`恢复核对`](../results/http-output-fix-regression-v2/restoration-verification.json)与[`身份核对`](../results/http-output-fix-regression-v2/postflight-identity.json)。该版本冻结已结束；历史结果仍绑定c930。
+
+此次12轮soak的五次空闲进程采样如下，必须与早期f955表分开：
+
+| 已完成轮数 | RSS（KiB） | 数字FD数 |
+| --- | ---: | ---: |
+| 0 | 21411328 | 11 |
+| 3 | 21412048 | 11 |
+| 6 | 21412336 | 11 |
+| 9 | 21412720 | 11 |
+| 12 | 21412672 | 11 |
+
+末值增加1344 KiB（1.3125 MiB），采样峰值比基线增加1392 KiB；FD五次均11。12次取消到首次idle观测的最小/中位/最大为0.004207/0.108743/0.114620秒，只是受轮询时点影响的观察量，不是kernel中断时间或延迟保证。五个外部RSS样本不证明没有泄漏或稳定运行八小时。
+
+#### 新日志实际记录的边界
+
+| c930记录 | 旧兼容model日志 | 新model_terminal | 新output_terminal | 新connection_close |
+| --- | ---: | ---: | ---: | ---: |
+| live | 14 | 14 | 9 | 171 |
+| edges | 8 | 8 | 7 | 135 |
+| soak | 43 | 43 | 31 | 197 |
+| terminal | 8 | 8 | 7 | 135 |
+
+soak旧43条与新model43条对应同一组31完成+12取消，不能算86个请求；connection_close还包含health和参数拒绝连接。此次每个正常请求只选一次output终态，记录时尚有待发送数据；断连先选disconnected，迟到scheduler cancelled保留它，通常没有output_terminal。此次没有closed_send_released实例，真实晚到lease确认仍不算已覆盖。旧43-request格式兼容控制也与上述新43-request实测分开。
+
+真实超限请求使用AR、非流式、4096-token预算、8192字节总输出额度。43.664788375秒后客户端收到HTTP500/output_limit；同一请求记录`model_terminal failed/decode reason=text_limit`，随后`output_terminal failed error_code=output_limit text_bytes=6144 text_limit_bytes=6144`，最后`connection_close terminal_sent`且额度归零。6144是已接受字节，跨限的下一段被拒绝。本次命中的是**生成时累计文本限制**，不是final JSON/header编码超限、最后UTF-8 flush跨限、SSE slow_consumer或模型数值错误。后续AR非流式与MTP2 SSE均返回`1,2,`、prompt35/output4/total39、length。更完整的来源、first-terminal-wins与未覆盖分支见[输出边界](HTTP_OUTPUT_BOUNDARIES.md)。
+
 仍需分开补齐以下边界，不能由上述通过结果外推：
 
-- MTP verify / replay 内部的精确取消位置尚未覆盖；已有证据限于 decode 阶段观察到内容后的网络断连、取消及后续恢复。
-- 真实应用输出 overflow、15 秒发送期限、300 秒连接期限尚未触发；邮箱满与邮箱槽位回收也未独立验证。暂停客户端读取不等于观察到了应用 overflow，CPU 缓冲测试不能代替真实 TCP 期限测试。
-- 长期运行的内存/文件描述符增长、模型运行故障后的服务状态，以及故障发生在 SSE 已发送之后的错误终态，仍需后续回归。
+- c930仍在共享锁内同步写stderr，满且无人读取的pipe可阻塞网络或推理日志路径。普通文件回归不覆盖这种活性问题；最小有界日志写入候选及pipe验证正在准备，尚未应用/验证，不能称为已修复。
+- 真实SSE应用缓冲overflow、15秒发送期限、300秒连接期限、晚到send确认仍未触发；邮箱满与槽位回收也未独立验证。非流式text_limit已覆盖，不再把全部输出限制一概标为未覆盖。
+- MTP verify/replay内部的精确取消位置尚未覆盖；已有证据限于decode内容后的网络断连、取消及后续恢复。
+- 长期内存/FD增长、模型运行故障后的服务状态，以及SSE已经发送之后的生成错误终态，仍需后续回归。
 
-当前可作为本机文字客户端的实验入口；缓存、前缀复用、认证与远程部署尚未纳入此服务。
-
-后续[输出限额与发送期限核查](HTTP_OUTPUT_BOUNDARIES.md)还确认了一个错误归因缺口：非流式累计文本超限会被泛化为`generation_failed`，发送/连接关闭也未记录具体期限原因。修复安排在固定MTP性能窗口结束后，三个未命中边界仍保留为未覆盖。
+当前可作为本机文字客户端的实验入口；缓存、前缀复用、认证与远程部署尚未纳入此服务。这些HTTP结果不替代MTP双窗口性能门槛，也不是性能对比或生产发布通过。

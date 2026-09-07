@@ -1,36 +1,60 @@
-# HTTP 输出限额与发送期限：未覆盖边界
+# HTTP 输出限额、终态与未覆盖边界
 
-2026-09-07 的 CPU 只读检查确认：已有 19 项 live、15 项网络边界、46 项短 soak 检查通过，但**真实应用输出 overflow、15 秒发送期限、300 秒连接期限仍未覆盖**。CPU 缓冲测试证明的是状态机合同，不能替代实际 HTTP 触发证据。本轮未运行模型、修改服务或新增猜测性的长输出 harness；MTP 窗口 A/B 期间源码和二进制保持冻结。
+2026-09-07。MTP双窗口结束后，HTTP adapter已修复非流式累计文本超限原因丢失，并增加可关联的模型、输出和连接终态记录。服务二进制`c93011f804dd287a7758568d69373089959a0b92408379390ea71d7294b0568a`完成36项Swift CPU、6项Python日志解析控制、19项live、15项edges、固定12轮46项soak及6项真实终态检查。**真实非流式生成过程中的`text_limit → HTTP 500 / output_limit`已触发并验证后续恢复；SSE应用缓冲overflow、15秒发送期限、300秒连接期限仍未覆盖。**
 
-## 当前真实路径
+完整服务合同与历史结果见[HTTP实验服务](HTTP_SERVER_EXPERIMENT.md)。本页区分此次实测、源码合同与尚未触发的分支，不把正常请求或CPU状态机通过当作全部网络边界通过。
 
-| 边界 | 实现及当前可见结果 | 缺失的证据 |
+## 当前路径与覆盖
+
+| 边界 | 实现与此次证据 | 仍不能声称的范围 |
 | --- | --- | --- |
-| SSE 应用缓冲 overflow | [服务配置](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L244)在最低 8192 字节总限额内预留 4096 字节终态；[enqueue](../Sources/ANERunnerCore/QwenSSEOutputBuffer.swift#L95)在未释放的普通帧加新帧超过剩余普通额度，或普通事件达到 255 条时，选择 `slowConsumer` 并请求取消。若连接仍可发送，已接受前缀后跟 `code=slow_consumer` 错误和一次 `[DONE]`。 | 尚未从真实 HTTP 收到该错误或取得服务侧明确的 overflow 原因记录。 |
-| 单次发送期限 15 秒 | [sendNext](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L317)保存当前 lease ID 和起始时间；[周期检查](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L345)在发送仍未完成且持续至少 15 秒时关闭连接并取消请求。header/simple 响应发送也使用该时间字段。 | 尚未证明实际有一次发送保持未完成达到期限；关闭路径不记录原因和对应 lease。 |
-| 整个连接期限 300 秒 | 同一[周期检查](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L345)从 accept 时刻计算连接年龄，在没有先命中发送期限时，于年龄达到 300 秒后关闭。 | 尚未观察一份已解析、仍在计算或排队的请求命中该分支。未完成 header/body 会先命中 15 秒接收期限，不能用于代测。 |
+| 非流式累计文本限额 | 每请求[QwenHTTPTextBudget](../Sources/ANERunnerCore/QwenHTTPTextBudget.swift)先检查UTF-8字节，再接受文本；保留首个本地失败原因。最低8192字节配置减去2048字节JSON/header余量，允许6144字节文本。真实AR生成在decode中命中`text_limit`，scheduler failed之后仍返回`output_limit`；随后新AR/MTP成功。 | 只覆盖生成时累计文本检查，不覆盖最后UTF-8 flush才跨限或最终JSON/header编码超限；也不是模型数值故障恢复。 |
+| SSE应用缓冲overflow | [QwenSSEOutputBuffer](../Sources/ANERunnerCore/QwenSSEOutputBuffer.swift)在普通帧字节或事件额度不足时选择`slowConsumer`并请求取消；若还能发送，保留已接受前缀，再发`slow_consumer`错误和一次`[DONE]`。scheduler迟到终态不能覆盖这个选择。 | 尚无真实HTTP/SSE `slow_consumer`或对应overflow记录。非流式`output_limit`不补成此项通过。 |
+| 单次发送期限15秒 | [sendNext](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L349)记录lease和发送起点；[checkDeadlines](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L394)检查未完成发送并以`send_deadline`关闭，记录lease/发送经过时间。header/simple发送也使用此计时。 | 尚未观察真实发送保持未完成达到期限；CPU缓冲检查和暂停读取均不能代替。 |
+| 整个连接期限300秒 | 从accept时刻计算年龄；未先命中发送期限时，以`connection_deadline`关闭，记录连接年龄。 | 尚未观察已解析、计算中或排队请求命中；未完成header/body会先遇到接收期限。 |
+| 晚到的send确认 | 关闭保留真实in-flight lease，确认回调释放它并可记录`closed_send_released`。 | 此次终态日志没有该事件实例，不能称为真实晚确认分支已覆盖。 |
 
-周期观察每秒执行一次，15/300 秒是检查阈值，不是承诺精确到点关闭。两个期限当前都调用相同的 `close`；只有“约在该时刻断开”不能排除发送错误、另一期限或先前取消。
+周期检查每秒执行，15/300秒是阈值，不保证精确到点关闭。当前已有有限的关闭原因枚举，可以区分发送错误、接收失败、期限、正常终态和shutdown；这些字段存在不等于每个分支都已经实测。
 
-## SSE 与非流式限额不是同一条错误路径
+## 真实非流式超限证据
 
-SSE `slow_consumer` 由缓冲的入队失败选择。[publish](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L479)随后抛取消，scheduler 的迟到 cancelled 终态保留已选中的 overflow 结果。取得 role/content 中的请求 ID 后，收到同连接的 `slow_consumer` 和 `[DONE]`，才可作为可见的 SSE 溢出证据；它不应被要求返回 `output_limit`。
+[`terminal-logs.json`](../results/http-output-fix-regression-v2/terminal-logs.json)及[原始服务日志](../results/http-output-fix-regression-v2/terminal-logs.server.log)来自同一自有服务PID24196，4连接、8192字节输出额度。测试为真实模型AR、非流式、4096-token预算；请求意图抄写7200字节文本，但**是否触发以实际HTTP和日志为准，不能由提示词意图推定**。
 
-非流式没有中间帧队列：[publish 的累计文本检查](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L488)保留 2048 字节 JSON/header 余量，最低配置下文本最多 6144 字节。超出时抛 `GPUHTTPOutputError.tooLarge`，但 [scheduler](../Sources/ANERunnerGPU/QwenLocalScheduler.swift#L350)将它转换为 failed，随后 [complete](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L515)仅返回 `generation_failed`，丢失了明确的限额原因。这是已确认的错误归因缺口。
+此次于43.664788375秒收到HTTP500，body为`code=output_limit`、`type=server_error`。唯一请求`chatcmpl-5f320b77-880c-4347-9f12-4e144ea9548e`对应同一连接，实际顺序为：
 
-当前 `output_limit` 出现在 [complete 的 fallback](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L521)：例如最终编码后的完整响应超过终态额度，或最后 UTF-8 flush/编码失败。成功生成日志在最终响应检查之前写出，因此日志中的 `finish=eos/length` 也不能单独证明客户端收到成功终态。构造大量需 JSON 转义的文本可能使最终编码先超限，但现无已验证、稳定且足够短的模型输出 fixture，不能据提示词意图保证触发。
+1. `model_terminal`：`model_kind=failed`、`stage=decode`、`reason=text_limit`。没有先记录模型成功，属于生成时文本限额。
+2. `output_terminal`：`output_outcome=failed`、`reason=text_limit`、`error_code=output_limit`，`text_bytes=6144`、`text_limit_bytes=6144`。计数是已接受字节；跨限的下一段未接受，不将计数解释为越界后的总输出。
+3. `connection_close`：`reason=terminal_sent`，已选`failed`保持不变，buffered/in-flight字节和事件为零、output_drained为true。
 
-## 为什么暂停读取不够
+超限后所有队列、resident、reserved tokens归零；新AR非流式和MTP2 SSE均再次返回`1,2,`、prompt35/output4/total39、`finish_reason=length`。这些是文本、usage与HTTP终态回归，HTTP没有输出完整token IDs。本次不是SSE溢出、编码错误、最终响应超限或GPU运行故障的覆盖。
 
-[发送额度](../Sources/ANERunnerCore/QwenSSEOutputBuffer.swift#L163)在 `contentProcessed` 回调后释放；这表示传输处理了内容，不表示远端应用已经读取。客户端暂停读取或缩小接收缓冲，仍可能由 Network/TCP/内核容纳全部短输出，并持续释放应用 lease。必须区分“另一个请求仍能推进”和“本请求应用额度确实超限”。
+## 三种终态不能混成一次“成功送达”
 
-目前最小配置仍有 4096 字节普通 SSE 额度；MTP 输出预算最高 256 token，模型还可能提前 EOS。当前二进制没有可直接固定传输确认进度的参数，也没有已知必然超大的单 token 帧。因此没有确定的短触发条件，增加长生成或等待时间不能自动补成有效覆盖。慢读一旦产生积压，也可能先触发 overflow，再等待终态发送而命中 15 秒期限；两次原因应分别保留。
+[complete](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L548)先记录模型终态，再执行最后UTF-8 flush及最终响应编码，所以`model_terminal completed`或旧`HTTP request ... finish=eos/length`只证明模型完成。adapter最后一步仍可能失败。
 
-## 解冻后的最小补齐
+[logOutput](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L622)只由首次overflow或`finish.accepted`记录`output_terminal`；它表示输出缓冲选定结果，**不表示客户端已经读取**。本次live/edges/soak/terminal的所有output_terminal记录当时均`output_drained=false`。后续`connection_close reason=terminal_sent`来自Network的contentProcessed确认；客户端完整收到响应的证据仍来自测试端解析，不能只凭发送回调推定。
 
-1. 在 HTTP adapter 的每请求本地状态中保留累计文本超限原因，令 scheduler 返回 failed 后仍能发出 `output_limit`；不改变 GPU 数值路径或把普通推理故障都改写成限额错误。最终编码超限也应保留明确原因。
-2. 补少量可关联记录：请求 ID、选中的输出 outcome/原因、bytes/events/in-flight 额度、关闭原因、当前 lease ID/发送经过时间和连接年龄。输出限额与网络关闭可能是先后两个事件，应避免混成一个成功终态。**不记录提示词、输出正文或 token 内容。**
-3. 先选择真实冻结输出已知的短 fixture，使原始文本或最终编码能确定跨过配置限额，再写有界 HTTP 测试；SSE 应验证 `slow_consumer`，非流式应验证 `output_limit`。若当前参数仍不能确定触发，明确保留未覆盖，不加伪造推理或服务延迟开关来凑通过。
-4. 对发送/连接期限，需先证明命中条件并取得服务侧对应原因，不能只以客户端停止读取、耗时或 EOF 判定通过。每次测试还须唯一关联请求 ID，检查 idle 与所有任务/预留计数归零，再运行固定短 AR 和 MTP 请求核对文本、实际 usage 与终止原因；已有 edge/soak helper 可复用。
+[close](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L372)记录网络终态和关闭前/后outcome。RST经常先选择`disconnected`，随后scheduler报告cancelled；迟到`finish`返回alreadyTerminal，不再产生output_terminal。未进入scheduler的拒绝请求也可能只有connection_close。不能承诺每份请求都有三个事件，或把缺少output_terminal直接当作丢日志。
 
-本轮结论只收紧验证边界，不撤销已有正常请求、取消恢复与短 soak 的通过记录，也不将这些未覆盖分支算作已通过。
+日志schema为`qwen-http-lifecycle-v1`，用PID、request ID和connection ID关联，只含有限原因、计数与时间；不写提示词、正文或token内容。SSE的累计`text_bytes/text_limit_bytes`不适用，记录null而非伪造0。旧`HTTP request id=...`仍保留给已有取消gate，但它与新的model_terminal是同一模型事件的两种表示。
+
+| 本次c930报告 | 旧model日志 | 新model_terminal | 新output_terminal | 新connection_close |
+| --- | ---: | ---: | ---: | ---: |
+| v1 live | 14 | 14：9完成、5 prefill取消 | 9 | 171 |
+| v2 edges | 8 | 8：7完成、1 decode取消 | 7 | 135 |
+| v2 soak | 43 | 43：31完成、12 decode取消 | 31 | 197 |
+| v2 terminal | 8 | 8：6完成、1 decode取消、1 text_limit失败 | 7 | 135 |
+
+connection_close还包含health、参数拒绝等非生成连接，不能当作生成请求数。旧43-request日志的CPU格式兼容检查只证明旧格式可读，不是新schema实测；此表soak的43则来自c930新的一次真实运行。同一行的新旧model计数不能相加。
+
+## 为什么暂停读取仍不够
+
+发送额度在实际contentProcessed回调后释放；这表示传输处理了内容，不表示远端应用已读取。OS/TCP可能容纳全部短输出并持续释放应用lease，因此“暂停读取后另一请求仍能推进”与“应用缓冲确实溢出”必须分开。MTP最高256-token预算还可能提前EOS；此次live的`live_overflow_observed=false`，不能依赖长输出意图、等待或缩小接收缓冲补成SSE通过。
+
+后续SSE溢出测试需要取得请求ID、明确的slow_consumer选择及同连接错误/[DONE]；期限测试需要服务侧send_deadline或connection_deadline、对应lease/年龄与恢复证据。若触发条件不成立，继续记未覆盖，不伪造推理或延迟凑通过。
+
+## 同步stderr仍有活性缺口
+
+c930的[log](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L670)仍在共享mutex内同步写stderr。若stderr接到无人读取且已满的pipe，写入能阻塞调用它的网络或推理线程；独立网络队列不消除共享日志阻塞。此次服务日志写普通文件，以上通过结果没有覆盖满pipe行为。
+
+最小有界日志写入候选及pipe活性验证正在准备，**尚未应用或验证，不能声称该缺口已经修复**。保持c930历史证据与后续候选分开。真实SSE overflow、发送/连接期限、晚到send确认、长期稳定及精确MTP verify/replay取消也仍有各自门槛。
