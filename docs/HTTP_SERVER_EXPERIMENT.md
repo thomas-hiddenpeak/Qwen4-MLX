@@ -1,6 +1,6 @@
 # 本机文字 HTTP/SSE 实验服务
 
-此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE、补充网络边界及固定12轮短测。2026-09-07的c930版本还修复了非流式文本超限归因，并实测到HTTP500 / output_limit及后续恢复；各版本证据分列如下。当前b039版本已接入有界异步诊断日志，43项Swift CPU、11项Python控制及五组真实服务回归（19/15/46/6/3项）全部通过，包括真实未读满stderr管道下的健康检查、AR/MTP及退出；各版本独立验收，不累计成同一批。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
+此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE、补充网络边界及固定12轮短测。2026-09-07的c930版本还修复了非流式文本超限归因，并实测到HTTP500 / output_limit及后续恢复；各版本证据分列如下。当前b039版本已接入有界异步诊断日志，43项Swift CPU、11项Python控制及五组真实服务回归（19/15/46/6/3项）全部通过，包括真实未读满stderr管道下的健康检查、AR/MTP及退出。同一b039二进制随后单独完成一次真实AR SSE缓冲溢出与恢复，4项检查通过；各版本和运行窗口分列，不累计成同一批。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
 
 ```bash
 .build/release/ane-runner serve-gpu --model-dir /absolute/path/to/model
@@ -57,7 +57,7 @@ c930增加`qwen-http-lifecycle-v1`结构化日志，将model_terminal、output_t
 
 ## 验证状态
 
-已完成的c930版本证据为36项Swift CPU、6项Python日志解析控制、19项live、15项edges、46项soak及6项终态检查；真实生成text_limit已覆盖，当时同步日志满pipe、SSE overflow和发送/连接期限未覆盖。当前b039有界日志版本已完成release构建、43项Swift CPU、11项Python控制及19/15/46/6/3项五组实模回归；冻结身份和参考服务恢复已核对。下方分别保留f955、c930历史及b039当前状态，不混合各版本计数。
+已完成的c930版本证据为36项Swift CPU、6项Python日志解析控制、19项live、15项edges、46项soak及6项终态检查；真实生成text_limit已覆盖，当时同步日志满pipe、SSE overflow和发送/连接期限未覆盖。当前b039有界日志版本已完成release构建、43项Swift CPU、11项Python控制及19/15/46/6/3项五组实模回归；之后独立AR SSE溢出窗口另通过4项检查，两次冻结身份和参考服务恢复分别核对。下方分别保留f955、c930历史及b039当前状态，不混合各版本计数。
 
 ### 早期f955服务基线
 
@@ -160,7 +160,7 @@ soak旧43条与新model43条对应同一组31完成+12取消，不能算86个请
 仍需分开补齐以下边界，不能由上述通过结果外推：
 
 - c930在共享锁内同步写stderr，满且无人读取的pipe可阻塞网络或推理日志路径；当时的普通文件回归没有覆盖它。后续b039已替换此实现并通过下述真实满pipe活性回归；这不改变c930当时的覆盖范围。
-- 真实SSE应用缓冲overflow、15秒发送期限、300秒连接期限、晚到send确认仍未触发；邮箱满与槽位回收也未独立验证。非流式text_limit已覆盖，不再把全部输出限制一概标为未覆盖。
+- c930这批尚未触发真实SSE应用缓冲overflow；后续b039独立AR窗口已补齐下述一次溢出与恢复。15秒发送期限、300秒连接期限、晚到send确认仍未触发；邮箱满与槽位回收也未独立验证。非流式text_limit与SSE slow_consumer分开登记。
 - MTP verify/replay内部的精确取消位置尚未覆盖；已有证据限于decode内容后的网络断连、取消及后续恢复。
 - 长期内存/FD增长、模型运行故障后的服务状态，以及SSE已经发送之后的生成错误终态，仍需后续回归。
 
@@ -200,6 +200,18 @@ soak旧43条与新model43条对应同一组31完成+12取消，不能算86个请
 
 pipe项的自有stderr读端直到进程退出前保持打开且不读取，stdout独立普通文件。161次填充health后日志达到128条事件额度；连续3个额外health样本均显示管道未读65536字节、written固定165、in-flight419字节、总保留52926字节，drops从2升到3再到4。真实AR/MTP分别完成后队列/模型额度归零，日志仍堵塞，累计丢弃13条/6581字节、write_failures为0。两份响应均为`1,2,`、prompt35/output4/total39、length；随后SIGTERM在0.7258455秒内正常退出，父Python的SIGPIPE策略不变。退出后才捕获65536字节stderr，原始165行没有任何请求终态；这与报告明确的`lifecycle_attribution_complete=false`一致，不从缺失诊断记录推断完整归因。详见[输出边界](HTTP_OUTPUT_BOUNDARIES.md#b039实测诊断归因与满管道活性)。
 
-[postflight](../results/http-async-logger-regression-v2/postflight-and-release.json)核对133份冻结文件、102份模型payload及二进制身份，控制器五项均退出0；[ledger](../results/http-async-logger-regression-v2/run-ledger.json)记录参考服务按原完整argv恢复为PID31650，127.0.0.1:11235监听归属、meta及running/waiting为0均已核对。冻结解除后才执行上述Python包装路径修正。尚未执行新的SSE溢出尝试；15秒发送期限、300秒连接期限和晚到send确认也仍未覆盖。
+[postflight](../results/http-async-logger-regression-v2/postflight-and-release.json)核对133份冻结文件、102份模型payload及二进制身份，控制器五项均退出0；[ledger](../results/http-async-logger-regression-v2/run-ledger.json)记录参考服务按原完整argv恢复为PID31650，127.0.0.1:11235监听归属、meta及running/waiting为0均已核对。冻结解除后才执行上述Python包装路径修正。这五项当时没有触发SSE溢出，之后由下述独立窗口补测；15秒发送期限、300秒连接期限和晚到send确认仍未覆盖。
+
+### b039独立SSE溢出：一次真实AR窗口通过
+
+2026-09-07，沿用同一b039二进制，独立[`计划`](../results/http-sse-overflow-public-v1/plan.json)只做一次真实AR SSE尝试：冻结prompt4039 token、输出预算4096 token、输出额度8192字节、4连接，客户端实际SO_RCVBUF为1024字节。先收到两条非空content帧后暂停读取，观察到服务选择slow_consumer才恢复读取；未加入推理延迟或伪造GPU输出。[报告](../results/http-sse-overflow-public-v1/attempt.json)的4项检查全部通过，服务正常退出0。
+
+[原始SSE](../results/http-sse-overflow-public-v1/attempt.sse)共480541字节：一条role、2052条非空content、一条slow_consumer错误和唯一`[DONE]`，随后正常EOF。暂停60.267929166秒；暂停前已收到的702字节（role及两条content）在最终记录中逐字节一致，完整wire/text SHA与报告匹配。2052是内容帧数，不是token数；错误流没有正常finish/usage，不能推导实际生成token总数，也未将每条成功enqueue与收到的内容逐项对照。
+
+唯一请求`chatcmpl-7b88d73e-3f24-48d6-bbea-4186dd34ac64`在[原始服务日志](../results/http-sse-overflow-public-v1/attempt.server.log)中先选择`output_outcome=slowConsumer`、reason/error_code=slow_consumer并请求取消；记录时保留4117字节/18事件，其中234字节in-flight。随后model_terminal为cancelled/decode，最终connection_close为terminal_sent，保持slowConsumer，buffered/in-flight/事件全部归零。旧取消日志与同一模型事件一致。超限日志快照是在选定错误终态之后读取，不能用4117字节反推越界瞬间或每个enqueue的交付情况。
+
+恢复后fresh AR非流式和MTP2 SSE均返回`1,2,`、prompt35/output4/total39、length；最后idle的请求与模型额度归零，logging written/enqueued为141/141、零丢弃/写入失败、无保留记录。此次覆盖的是**AR SSE应用输出限额、已收到前缀的保持、错误尾帧、decode取消和后续恢复**，不是MTP SSE溢出、完整已入队前缀的交付证明、长期背压或性能测量。
+
+[postflight](../results/http-sse-overflow-public-v1/postflight-and-release.json)核对141份冻结文件、102模型payload及同一二进制；[ledger](../results/http-sse-overflow-public-v1/run-ledger.json)确认自有进程组清空，参考服务按原完整argv恢复为PID35281，11235监听归属和idle已核对。本次没有send_deadline、connection_deadline或closed_send_released记录；15/300秒期限及晚到确认仍未覆盖。更细口径见[输出边界](HTTP_OUTPUT_BOUNDARIES.md#b039独立ar-sse溢出实测)。
 
 当前可作为本机文字客户端的实验入口；缓存、前缀复用、认证与远程部署尚未纳入此服务。这些HTTP结果不替代MTP双窗口性能门槛，也不是性能对比或生产发布通过。

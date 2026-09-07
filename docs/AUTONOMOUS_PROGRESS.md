@@ -13,6 +13,10 @@
 
 ## 当前状态
 
+2026-09-07 15:31用户授权继续。新的真实AR SSE溢出单次测试已经通过4项检查；恢复读取后收到唯一slow_consumer错误、DONE和EOF，后续AR/MTP及资源清理通过。141文件/102模型payload核对后解除冻结，结果在`results/http-sse-overflow-public-v1/`。
+
+随后同进程固定11k AR五请求联合command timing与500ms telemetry已完成，完整输出一致、775个步骤窗口、226045条原生命令记录且无丢失。287文件/102payload核对后解除冻结，参考35851按原参数恢复并确认空闲；当前无GPU实验运行。数据在`results/daytime-drift-v1/run/`，分阶段分析正在进行。共享专家S2/S3尾部融合仅在ignored目录准备，未应用或构建。以下保留此前阶段记录，接续以本段及最新ledger为准。
+
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
 最新参考服务PID31650，`http://127.0.0.1:11235`，MTP/drafter关闭，10:56:42 ready；root精确argv/meta/listener/idle核对通过，ledger与postflight在`results/http-async-logger-regression-v2/`。没有其他GPU实验运行，其他项目未停止。
