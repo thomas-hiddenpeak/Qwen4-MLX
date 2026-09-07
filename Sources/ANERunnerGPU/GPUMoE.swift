@@ -244,6 +244,7 @@ public final class GPUMoE {
                         verificationLinear: GPUVerificationLinear? = nil,
                         verificationTokenAxis: Bool = false,
                         verificationSharedElementwise: Bool = false,
+                        routingObserver: ((Tensor) throws -> Void)? = nil,
                         profiler: GPUProfiler? = nil,
                         prefillReductionThreadgroup: Int? = nil,
                         prefillGateUpVariant: Int? = nil,
@@ -322,6 +323,7 @@ public final class GPUMoE {
             }
         let x = routing.x, logits = routing.logits
         let indices = routing.indices, routingWeights = routing.weights
+        try routingObserver?(indices)
 
         let expertOutputs: Tensor?
         let routed: Tensor

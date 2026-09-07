@@ -84,6 +84,11 @@ public final class QwenModel {
     /// It is never invoked for decode or verification. Materializing an input
     /// here perturbs scheduling; captured runs are not throughput benchmarks.
     public var prefillMoEObserver: ((Int, Int, Tensor) throws -> Void)?
+    /// Optional verification-only observer: layer, position, S and selected IDs.
+    /// Called on the inference executor before evaluation. A diagnostic can
+    /// retain the small IDs tensor and read it after the request, without a
+    /// per-layer synchronization. Retention can still affect allocation reuse.
+    public var verificationRoutingObserver: ((Int, Int, Int, Tensor) throws -> Void)?
     /// Host graph constructions, not physical GPU or bandwidth counters.
     public private(set) var prefillMoEReductionCalls = 0
     public private(set) var prefillMoEGateUpCalls = 0
@@ -472,9 +477,15 @@ public final class QwenModel {
                 } else {
                     moeOut = try profiler.measure("moe", layer: i, tokenCount: n, outputs: { [$0] }) {
                         if let linear, n > 1 {
+                            let observer: ((Tensor) throws -> Void)?
+                            if executionPhase == .verification, let capture = verificationRoutingObserver {
+                                let position = state.offset
+                                observer = { indices in try capture(i, position, n, indices) }
+                            } else { observer = nil }
                             return try layer.moe.forward(pre2.mixed,
                                 useFusedSharedElementwise: decodeMode.fusesSharedElementwise,
-                                verificationLinear: linear, verificationTokenAxis: verifyTokenMoE).y
+                                verificationLinear: linear, verificationTokenAxis: verifyTokenMoE,
+                                routingObserver: observer).y
                         }
                         if verifyScalarMoE, n > 1 {
                             let outputs = try (0..<n).map { row in

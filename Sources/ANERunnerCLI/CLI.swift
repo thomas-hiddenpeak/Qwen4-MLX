@@ -317,6 +317,7 @@ struct RunnerCLI {
         GDN tuning library: --gdn-gemv-mode reference|bm4|rows4|bm2|bm1|gemm|gemmSplit|prefetch4|prefetch4Vector or --gdn-gemv-order CSV
         Profiling: --profile-stages disabled|hostBodyOnly|synchronizedStages
         Optional stage filter: --profile-phase prefill|decode|verification (requires profiling; default all phases)
+        Routing diagnostic: --capture-verification-routing true (D2 scalar-linear, one request, at most 128 output tokens; profiling disabled)
         System telemetry: --telemetry-dir NEW_PATH [--telemetry-interval-ms 200]
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
     probe-gpu-session --model-dir PATH [--tokens-file PATH] --output NEW_REPORT_JSON

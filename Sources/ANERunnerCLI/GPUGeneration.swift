@@ -15,7 +15,7 @@ extension RunnerCLI {
     }
 
     static func generateGPU(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--profile-phase", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
+        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--profile-phase", "--capture-verification-routing", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
         guard let mode = GPUProfiler.Mode(rawValue: args["--profile-stages"] ?? "disabled") else {
             throw CLIError.usage("Invalid --profile-stages mode")
         }
@@ -28,6 +28,11 @@ extension RunnerCLI {
         guard phaseFilter == nil || mode != .disabled else {
             throw CLIError.usage("--profile-phase requires a non-disabled --profile-stages mode")
         }
+        let captureValue = args["--capture-verification-routing"] ?? "false"
+        guard captureValue == "true" || captureValue == "false" else {
+            throw CLIError.usage("--capture-verification-routing requires true or false")
+        }
+        let captureRouting = captureValue == "true"
         let draftHistoryTokens = try mtpDraftHistory(args)
         let draftHistoryJSON: Any = draftHistoryTokens.map { $0 as Any } ?? NSNull()
         let directory = URL(fileURLWithPath: try args.require("--model-dir"))
@@ -92,6 +97,12 @@ extension RunnerCLI {
         guard !(0..<repetitions).contains(where: { mtpOrder[$0] > 0 && verificationOrder[$0].usesScalarLinear && decodeOrder[$0] != .reference }) else {
             throw CLIError.usage("Scalar-linear verification policies require reference decode kernels")
         }
+        guard !captureRouting || (repetitions == 1 && count <= 128 && mtpOrder == [2]
+                && verificationOrder == [.batchedScalarLinear] && mode == .disabled
+                && args["--gpu-command-timing-output"] == nil) else {
+            throw CLIError.usage("Routing capture requires one D2 batchedScalarLinear request, at most 128 output tokens, and no profiling or native trace")
+        }
+        let routingCapture = captureRouting ? try GPUVerificationRoutingCapture() : nil
         let wiredOrder = args["--wired-order"] == nil ? Array(repeating: requestedWired[0], count: repetitions) : requestedWired
         let gemvOrder = args["--gdn-gemv-order"] == nil ? Array(repeating: requestedGEMV[0], count: repetitions) : requestedGEMV
         let prefetchOrder = args["--ssd-prefetch-order"] == nil ? Array(repeating: requestedPrefetch[0], count: repetitions) : requestedPrefetch
@@ -142,6 +153,13 @@ extension RunnerCLI {
         let model = try QwenModel(modelDirectory: directory, profiler: profiler, reservedOutputIDs: tokenizer.reservedOutputTokenIDs, ssdWorkers: ssdWorkers, prefillAccumulation: accumulation, decodeModes: decodeOrder) { current, total in
             if current % 4 == 0 || current == total { FileHandle.standardError.write(Data("Loaded \(current)/\(total) layers\n".utf8)) }
         }
+        if let routingCapture {
+            model.verificationRoutingObserver = { layer, position, count, indices in
+                try routingCapture.append(repetition: 0, phase: .verification, position: position,
+                    tokenCount: count, layer: layer, indices: indices)
+            }
+        }
+        defer { model.verificationRoutingObserver = nil }
         let mtpHead = mtpOrder.contains(where: { $0 > 0 }) ? try QwenMTP(weights: model.weights, configuration: model.configuration) : nil
         let loadSeconds = Double(DispatchTime.now().uptimeNanoseconds - loadStart) * 1e-9
         let loadedMemory = try MX.memory()
@@ -349,6 +367,17 @@ extension RunnerCLI {
                 "memory": try MX.memory()
             ])
         }
+        // All request/phase durations have ended. Captured IDs were already
+        // dependencies of evaluated expert outputs; readback is diagnostic only.
+        model.verificationRoutingObserver = nil
+        let routesJSON: Any
+        if let routingCapture {
+            let report = try routingCapture.finish()
+            guard report.finished, report.droppedRecords == 0 else {
+                throw CLIError.usage("Routing capture was incomplete; its overlap cannot be analyzed")
+            }
+            routesJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(report))
+        } else { routesJSON = ["enabled": false] }
         try commandTiming?.finish()
         inferenceSucceeded = true
         telemetry?.finish(succeeded: true)
@@ -376,6 +405,7 @@ extension RunnerCLI {
             "mtp_enabled": mtpHead != nil, "mtp_order": mtpOrder, "ane_used": false,
             "mtp_verification_order": verificationOrder.map(\.rawValue),
             "mtp_weights_loaded": model.weights.ledger.contains { $0.name.contains(".mtp.") },
+            "mtp_expert_routes": routesJSON,
             "profiler": try JSONSerialization.jsonObject(with: JSONEncoder().encode(profiler.report)),
             "telemetry": telemetry?.report ?? ["enabled": false],
             "gpu_command_timing": commandTiming?.report ?? ["enabled": false],

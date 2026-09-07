@@ -13,6 +13,8 @@
 
 ## 当前状态
 
+- 2026-09-07 19:50：默认关闭的验证routing capture已release构建并通过19项选定CPU检查。原11k/128普通与采集两请求完整golden一致，55轮全部S3、2640层记录完整无丢失；实测同轮同层重复选择26.7184%，gate/up-only逻辑节省上限17.8123%，未测实际DRAM或宣称生成收益。141文件SHA+102payload stat已复核释放，参考49817的精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验；gdn agent正在ignored目录实现共享gate/up局部候选，root保持唯一build/GPU/Git所有者。见MTP_EXPERT_OVERLAP.md。
+
 - 2026-09-07 16:28：MTP验证诊断已提交推送`0b24db9`，远程SHA核对通过；独立事件扫描复算245,474,613ns及9项分析CPU控制通过，有效报告为run/analysis-v2.json（首版golden元数据设置错误保留）。GDN QKV S3 TM2候选随后release46.10秒、CPU dispatch契约及42项实权重逐位检查通过，48暖/192测量完整；S3四层倍率0.957720/1.009808/0.898387/1.012265，S2未改参数对照也有方向性波动，未建立可重复收益，不扩大整模型或改默认。140文件SHA+102payload stat已复核释放；参考41069精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验，heartbeat仍暂停；最终源码保留显式算子probe，未接生成mode。见VERIFICATION_QKV_TM2_EXPERIMENT.md。
 
 - 2026-09-07 16:20：用户继续授权MTP验证热点研究。增加profiler phaseFilter与uptime时间戳，MTP原生跟踪限定synchronized verification，粗round明确无graph boundary；release46.89秒、23项Swift CPU和6项Python通过。原11k、D2/max16的普通/诊断完整IDs及MTP计数相同，2037阶段/22901原生命令无丢弃；诊断GPU跨度MoE32.89%、GDN25.19%、Attention19.78%，不是普通执行的带宽/速度指标。275文件SHA+102payload stat已复核释放，参考40188恢复、空闲及身份已核对。当前无GPU实验；GDN agent在ignored目录准备S3 QKV TM2局部候选，尚未应用/构建/实测。见MTP_VERIFY_HOTSPOTS.md。
