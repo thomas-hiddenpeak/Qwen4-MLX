@@ -2,9 +2,11 @@
 
 2026-09-07，M5 Max。接续 [gate/up 融合](MOE_PREFILL_GATEUP.md)，本轮将全局 BM 块内的专家段循环改成每块只计算一个专家，并让可选 down 投影复用相同的分块计划。原 affine Q4/group64 权重、BF16 运算边界、路由顺序和共享专家保持原实现。
 
+2026-09-08 已随分支整合纳入主线，新增[不依赖历史结果文件的配置命令](../README.md#可选-expert32--grouped-down)。[后续两窗复测与普通 CLI 回归](PREFILL_MAINLINE_RECHECK.md)通过完整输出检查，仍因一窗漂移保持显式启用；下文保留首轮实验的原始记录。
+
 ## GPU 分块与计算
 
-`Native/moe_expert_grouped.metal` 包含 BM16/BM32 的 planner、融合 gate/up/SwiGLU、down，共6个 kernel。一个512线程组对已排序的专家 IDs 做 lower_bound，得到各专家区间；扫描每个专家需要的块数，生成 `{expert,start,count,0}` 描述符。全部计算在 GPU 完成，不读回活动专家数，不额外整理完整权重库。
+`native/moe_expert_grouped.metal` 包含 BM16/BM32 的 planner、融合 gate/up/SwiGLU、down，共6个 kernel。一个512线程组对已排序的专家 IDs 做 lower_bound，得到各专家区间；扫描每个专家需要的块数，生成 `{expert,start,count,0}` 描述符。全部计算在 GPU 完成，不读回活动专家数，不额外整理完整权重库。
 
 M是排序后的 token-expert assignments 数，本模型为token数×10。计划容量为 `ceil(M/BM)+512` 行，每行4个Int32；首行记录实际块数。后续矩阵kernel使用固定容量dispatch，超出有效块数的线程组直接返回。gate/up和down共享这一个惰性计划，只生成一次。输出保留原sorted行位置，因此down之后的逆排序及top10归约不变。
 

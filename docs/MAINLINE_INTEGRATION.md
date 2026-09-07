@@ -1,6 +1,6 @@
 # 主线整合与候选状态
 
-GitHub 默认分支为 `codex/runner-baseline`。2026-09-08 整合前，它停在 `4722b0b`；`codex/moe-composition` 的 `9a60fbd` 和 `codex/upstream-adoption` 的 `0309521` 是其连续后继，共 33 个提交，没有分叉冲突。本次保留这段完整历史，以快进方式纳入默认分支。
+GitHub 默认分支为 `codex/runner-baseline`。2026-09-08 整合前，它停在 `4722b0b`；`codex/moe-composition` 的 `9a60fbd` 和 `codex/upstream-adoption` 的 `0309521` 是其连续后继，共 33 个提交，没有分叉冲突。本次保留这段完整历史，加上包装整理提交 `af6a445`，已快进并推送默认分支，远端 HEAD 核实一致。两个实验分支没有任何独有提交遗漏在主线之外。
 
 ## 本次纳入内容
 
@@ -24,6 +24,8 @@ chunk416、eval4、SSD nextChunk、单读取 worker、符合条件的 causal att
 最近的普通 AR/D2 整模型回归属于 `0309521` 对应记录，见[专家共享实验](MTP_GROUPED_GATEUP_EXPERIMENT.md)。各历史实模测试的输入、二进制和覆盖范围保留在对应文档，不把它们合并称为当前版本已重跑的完整服务测试。
 
 本轮 prefill 重测使用完整 11,057-token 输入及 128-token AR 输出；两个独立进程都先 A/B 暖机，随后分别测量 ABBA、BAAB。A 为默认路径，B 为新建配置的 expert32/grouped down；保留原归约。只有输出、阶段边界、路径计数通过，并且两个窗口均至少提升 3%、各窗口两次基线时间漂移不超过 5%，才继续评估默认启用。所有原始样本保留，漂移窗口不以跨窗平均替代。
+
+[本轮实测](PREFILL_MAINLINE_RECHECK.md)已完成：12 请求全部通过，prefill 两窗观察到 +10.96% / +44.87%，ABBA 的 27.03% 基线漂移未通过稳定性条件。另一次普通 CLI 新配置回归通过，合计 13 请求、1664 个输出 IDs 精确匹配；参考服务已恢复。候选保持显式启用，代码、复现命令与实际结果均在主线，不启用为默认。
 
 ## 后续阶段收尾
 

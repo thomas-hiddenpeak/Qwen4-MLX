@@ -65,6 +65,8 @@ MTP的[两窗口回归](docs/MTP_RELEASE_WINDOWS.md)保留完整输出检查及�
 
 [按专家分组的prefill MoE](docs/MOE_PREFILL_EXPERT.md)已接普通生成入口，只影响符合条件的prefill块；[叠加归约](docs/MOE_PREFILL_COMPOSITION.md)未建立稳定的额外整模型收益。以下显式预设选择 expert32 gate/up和grouped down，保持原归约，**不执行autotune，也不宣称当前设备已获性能验收**。
 
+[主线整合后复测](docs/PREFILL_MAINLINE_RECHECK.md)的 13 个完整请求全部匹配参考。两个性能窗口分别观察到 +10.96% / +44.87% prefill 吞吐变化，第一窗基线漂移 27.03%，因此保持显式选择；decode 单独统计，完整样本随文档保存。
+
 先构建与本机固定MLX匹配的插件，再生成绑定当前模型路径和库哈希的配置。所有输出路径选用新的位置，不依赖作者本机历史 `results/` 文件：
 
 ```sh
