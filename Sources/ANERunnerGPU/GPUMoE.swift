@@ -249,6 +249,45 @@ public final class GPUMoE {
                         prefillReductionThreadgroup: Int? = nil,
                         prefillGateUpVariant: Int? = nil,
                         groupedDown: Bool = false) throws -> GPUMoEOutput {
+        try forwardImpl(input, diagnostics: diagnostics, useFusedSharedElementwise: useFusedSharedElementwise,
+            verificationLinear: verificationLinear, verificationTokenAxis: verificationTokenAxis,
+            verificationSharedElementwise: verificationSharedElementwise, routingObserver: routingObserver,
+            profiler: profiler, prefillReductionThreadgroup: prefillReductionThreadgroup,
+            prefillGateUpVariant: prefillGateUpVariant, groupedDown: groupedDown)
+    }
+
+    public enum GroupedGateUpProbeMode: String, CaseIterable {
+        case scalarLoop, tokenAxis, groupedGateUp
+    }
+
+    /// Operator-only forced-routing control. The real router still runs; its
+    /// ordinary BF16 scores are retained by slot, while the frozen IDs select
+    /// actual expert weights. This combination is not a captured trajectory.
+    /// IDs are validated by the narrow CLI probe before constructing this graph.
+    public func probeGroupedGateUp(_ input: Tensor, indices: Tensor,
+                                  mode: GroupedGateUpProbeMode, linear: GPUVerificationLinear,
+                                  diagnostics: Bool = false) throws -> GPUMoEOutput {
+        guard input.shape == [1,3,2560], input.dtype == MLX_BFLOAT16,
+              indices.shape == [1,3,10], indices.dtype == MLX_UINT32,
+              hiddenSize == 2560, intermediateSize == 640, expertCount == 512,
+              topK == 10, bits == 4, groupSize == 64 else {
+            throw GPUMoEError.invalidConfiguration("Grouped gate/up probe requires fixed S3 BF16/U32 geometry")
+        }
+        return try forwardImpl(input, diagnostics: diagnostics, verificationLinear: linear,
+            verificationTokenAxis: mode != .scalarLoop, probeRouting: (indices,mode))
+    }
+
+    private func forwardImpl(_ input: Tensor, diagnostics: Bool = false,
+                        useFusedSharedElementwise: Bool? = nil,
+                        verificationLinear: GPUVerificationLinear? = nil,
+                        verificationTokenAxis: Bool = false,
+                        verificationSharedElementwise: Bool = false,
+                        routingObserver: ((Tensor) throws -> Void)? = nil,
+                        profiler: GPUProfiler? = nil,
+                        prefillReductionThreadgroup: Int? = nil,
+                        prefillGateUpVariant: Int? = nil,
+                        groupedDown: Bool = false,
+                        probeRouting: (indices: Tensor, mode: GroupedGateUpProbeMode)? = nil) throws -> GPUMoEOutput {
         let useSharedFusion = useFusedSharedElementwise ?? fuseSharedElementwise
         guard !useSharedFusion || fuseSharedElementwise else {
             throw GPUMoEError.invalidConfiguration("Shared fusion must be enabled at initialization before selecting it per request")
@@ -322,12 +361,13 @@ public final class GPUMoE {
                 return (x,logits,indices,routingWeights)
             }
         let x = routing.x, logits = routing.logits
-        let indices = routing.indices, routingWeights = routing.weights
+        let indices = probeRouting?.indices ?? routing.indices, routingWeights = routing.weights
         try routingObserver?(indices)
 
         let expertOutputs: Tensor?
         let routed: Tensor
         var prefillActivation: Tensor?
+        var verificationActivation: Tensor?, groupMembership: Tensor?
         if verification != nil {
             guard let fused else {
                 throw GPUMoEError.invalidConfiguration("Verification linear MoE requires the scalar affine-Q4 fused expert path")
@@ -338,14 +378,17 @@ public final class GPUMoE {
                     gate: .init(weight: gate.weight, scales: gate.scales, biases: gate.biases),
                     up: .init(weight: up.weight, scales: up.scales, biases: up.biases),
                     down: .init(weight: down.weight, scales: down.scales, biases: down.biases),
-                    diagnostics: diagnostics)
+                    diagnostics: diagnostics,
+                    groupedGateUp: probeRouting?.mode == .groupedGateUp,
+                    activationDiagnostics: diagnostics && probeRouting != nil)
                 routed = result.routed
                 expertOutputs = result.expertOutputs
+                verificationActivation = result.activation; groupMembership = result.membership
             } else {
                 // Share the router and dense shared-expert work across tokens,
                 // while keeping each routed expert's original S1 arithmetic.
                 // No sorting, gather-QMM, or different expert reduction is used.
-                var rows: [Tensor] = [], diagnosticRows: [Tensor] = []
+                var rows: [Tensor] = [], diagnosticRows: [Tensor] = [], activationRows: [Tensor] = []
                 rows.reserveCapacity(sequence)
                 if diagnostics { diagnosticRows.reserveCapacity(sequence) }
                 for token in 0..<sequence {
@@ -357,8 +400,9 @@ public final class GPUMoE {
                         gate: .init(weight: gate.weight, scales: gate.scales, biases: gate.biases),
                         up: .init(weight: up.weight, scales: up.scales, biases: up.biases),
                         down: .init(weight: down.weight, scales: down.scales, biases: down.biases),
-                        diagnostics: diagnostics)
+                        diagnostics: diagnostics, activationDiagnostics: diagnostics && probeRouting != nil)
                     rows.append(result.routed)
+                    if let activation = result.activation { activationRows.append(activation) }
                     if diagnostics {
                         guard let experts = result.expertOutputs else {
                             throw GPUError.invalid("Missing requested scalar expert diagnostics during verification")
@@ -368,6 +412,7 @@ public final class GPUMoE {
                 }
                 routed = try MX.concat(rows, axis: 1)
                 expertOutputs = diagnostics ? try MX.concat(diagnosticRows, axis: 1) : nil
+                if !activationRows.isEmpty { verificationActivation = try MX.concat(activationRows, axis: 1) }
             }
         } else if tokens > 1 {
             // Sort and invert entirely on-device, grouping assignments by
@@ -555,6 +600,9 @@ public final class GPUMoE {
                 "shared_gate": sharedGate, "shared_gated": sharedGated, "output": y,
             ]
             if let prefillActivation { values["prefill_activation"] = prefillActivation }
+            if let verificationActivation { values["verification_activation"] = verificationActivation }
+            if let groupMembership { values["group_membership"] = groupMembership }
+            if probeRouting != nil { values["unmodified_router_experts"] = routing.indices }
         }
         return GPUMoEOutput(y: y, diagnostics: values)
     }

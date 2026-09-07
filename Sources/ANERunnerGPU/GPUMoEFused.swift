@@ -40,6 +40,8 @@ final class GPUMoEFused {
     struct DecodeResult {
         let routed: Tensor
         let expertOutputs: Tensor?
+        let activation: Tensor?
+        let membership: Tensor?
     }
     struct SharedOutput {
         let y: Tensor
@@ -71,6 +73,7 @@ final class GPUMoEFused {
         let downReduce: Program
     }
     private var verificationPrograms: [VerificationKey: VerificationPrograms] = [:]
+    private var groupedVerificationPrograms: (plan: Program, gateUp: Program)?
 
     init(hidden: Int, intermediate: Int, topK: Int, groupSize: Int, bits: Int) throws {
         guard hidden > 0, hidden % 4 == 0, intermediate > 0, intermediate % 8 == 0,
@@ -110,7 +113,8 @@ final class GPUMoEFused {
     }
 
     func decode(_ x: Tensor, indices: Tensor, scores: Tensor,
-                gate: Projection, up: Projection, down: Projection, diagnostics: Bool) throws -> DecodeResult {
+                gate: Projection, up: Projection, down: Projection, diagnostics: Bool,
+                activationDiagnostics: Bool = false) throws -> DecodeResult {
         guard x.count == hidden, x.dtype == MLX_BFLOAT16,
               indices.count == topK, scores.count == topK, scores.dtype == MLX_BFLOAT16 else {
             throw GPUError.invalid("Fused decode input/dtype mismatch")
@@ -125,7 +129,9 @@ final class GPUMoEFused {
         let values = try program.apply([activation, down.weight, down.scales, down.biases,
                                         flatIDs, flatScores, intermediateScalar, hiddenScalar])
         return DecodeResult(routed: try MX.reshape(values[0], [1, 1, hidden]),
-                            expertOutputs: diagnostics ? try MX.reshape(values[1], [1, 1, topK, hidden]) : nil)
+                            expertOutputs: diagnostics ? try MX.reshape(values[1], [1, 1, topK, hidden]) : nil,
+                            activation: activationDiagnostics ? try MX.reshape(activation, [1, 1, topK, intermediate]) : nil,
+                            membership: nil)
     }
 
     /// Experimental recipe only. The ordinary decode above stays unchanged.
@@ -156,7 +162,8 @@ final class GPUMoEFused {
     /// Program's ensureRowContiguous setting makes the flat offsets below valid.
     func verifyTokens(_ x: Tensor, indices: Tensor, scores: Tensor,
                       gate: Projection, up: Projection, down: Projection,
-                      diagnostics: Bool) throws -> DecodeResult {
+                      diagnostics: Bool, groupedGateUp: Bool = false,
+                      activationDiagnostics: Bool = false) throws -> DecodeResult {
         guard x.shape.count == 3, x.shape[0] == 1,
               (2...5).contains(x.shape[1]), x.shape[2] == hidden,
               x.dtype == MLX_BFLOAT16,
@@ -180,6 +187,10 @@ final class GPUMoEFused {
               valid(up, output: intermediate, input: hidden),
               valid(down, output: hidden, input: intermediate) else {
             throw GPUError.invalid("Verification expert packed weights/scales/biases do not match the affine Q4 bank")
+        }
+        guard !groupedGateUp || (sequence == 3 && hidden == 2560 && intermediate == 640 &&
+                                  topK == 10 && experts == 512) else {
+            throw GPUError.invalid("Grouped gate/up probe requires the fixed S3 H2560/I640/top10/E512 bank")
         }
         let key = VerificationKey(sequence: sequence, diagnostics: diagnostics)
         let programs: VerificationPrograms
@@ -231,12 +242,40 @@ final class GPUMoEFused {
         let flatX = try MX.reshape(x, [sequence, hidden])
         let flatIDs = try MX.reshape(indices, [sequence, topK])
         let flatScores = try MX.reshape(scores, [sequence, topK])
-        let activation = try programs.gateUp.apply([flatX, gate.weight, gate.scales, gate.biases,
-            up.weight, up.scales, up.biases, flatIDs, sigmoidTable, hiddenScalar, intermediateScalar])[0]
+        let activation: Tensor
+        var membership: Tensor?
+        if groupedGateUp {
+            let grouped: (plan: Program, gateUp: Program)
+            if let cached = groupedVerificationPrograms { grouped = cached }
+            else {
+                let plan = try Program(name: "ane_runner_q4_gateup_s3_membership",
+                    source: Self.groupedMembershipSource, inputs: ["inds"], outputs: ["members"],
+                    outputShapes: [[30,3]], grid: [32,1,1], threadgroup: [32,1,1],
+                    template: [:], outputDType: MLX_INT32)
+                let gateUp = try Program(name: "ane_runner_q4_gateup_s3_grouped",
+                    source: Self.groupedGateUpSource,
+                    inputs: ["x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases",
+                             "inds", "members", "sigtab", "K_size", "N_size"],
+                    outputs: ["y"], outputShapes: [[3,topK,intermediate]],
+                    grid: [32,intermediate,30], threadgroup: [32,8,1],
+                    template: ["GS":64,"BITS":4,"TOPK":topK])
+                grouped = (plan,gateUp); groupedVerificationPrograms = grouped
+            }
+            // The plan is a real lazy dependency. No host U/readback or weight copy.
+            let plan = try grouped.plan.apply([flatIDs])[0]
+            activation = try grouped.gateUp.apply([flatX,gate.weight,gate.scales,gate.biases,
+                up.weight,up.scales,up.biases,flatIDs,plan,sigmoidTable,hiddenScalar,intermediateScalar])[0]
+            if activationDiagnostics { membership = plan }
+        } else {
+            activation = try programs.gateUp.apply([flatX, gate.weight, gate.scales, gate.biases,
+                up.weight, up.scales, up.biases, flatIDs, sigmoidTable, hiddenScalar, intermediateScalar])[0]
+        }
         let values = try programs.downReduce.apply([activation, down.weight, down.scales, down.biases,
             flatIDs, flatScores, intermediateScalar, hiddenScalar])
         return DecodeResult(routed: try MX.reshape(values[0], [1, sequence, hidden]),
-            expertOutputs: diagnostics ? try MX.reshape(values[1], [1, sequence, topK, hidden]) : nil)
+            expertOutputs: diagnostics ? try MX.reshape(values[1], [1, sequence, topK, hidden]) : nil,
+            activation: activationDiagnostics ? try MX.reshape(activation, [1,sequence,topK,intermediate]) : nil,
+            membership: membership)
     }
 
     private static func reindex(_ original: String, _ replacements: [(String, String)]) throws -> String {
@@ -394,7 +433,8 @@ final class GPUMoEFused {
         private let outputCount: Int
 
         init(name: String, source: String, inputs: [String], outputs: [String], outputShapes: [[Int]],
-             grid: [Int], threadgroup: [Int], template: [String: Int]) throws {
+             grid: [Int], threadgroup: [Int], template: [String: Int],
+             outputDType: mlx_dtype = MLX_BFLOAT16) throws {
             let namesIn = mlx_vector_string_new(), namesOut = mlx_vector_string_new()
             defer { _ = mlx_vector_string_free(namesIn); _ = mlx_vector_string_free(namesOut) }
             for value in inputs { try MX.check(mlx_vector_string_append_value(namesIn, value), "Metal input name") }
@@ -405,7 +445,7 @@ final class GPUMoEFused {
             do {
                 for shape in outputShapes {
                     let dimensions = shape.map(Int32.init)
-                    try MX.check(mlx_fast_metal_kernel_config_add_output_arg(configuration, dimensions, dimensions.count, MLX_BFLOAT16), "Metal output")
+                    try MX.check(mlx_fast_metal_kernel_config_add_output_arg(configuration, dimensions, dimensions.count, outputDType), "Metal output")
                 }
                 try MX.check(mlx_fast_metal_kernel_config_set_grid(configuration, Int32(grid[0]), Int32(grid[1]), Int32(grid[2])), "Metal grid")
                 try MX.check(mlx_fast_metal_kernel_config_set_thread_group(configuration, Int32(threadgroup[0]), Int32(threadgroup[1]), Int32(threadgroup[2])), "Metal threadgroup")
@@ -463,6 +503,100 @@ final class GPUMoEFused {
         total += float(product);
     }
     y[i] = T(total);
+    """
+
+    // Explicit S3 operator probe only. Original gate/up and down source remain
+    // byte-for-byte unchanged. Ordered IDs must be valid and unique per row.
+    private static let groupedMembershipSource = """
+    // One thread owns all three membership cells for one potential owner.
+    uint e = thread_position_in_grid.x;
+    if (e >= 30) return;
+    uint expert = inds[e];
+    bool owner = true;
+    for (uint previous = 0; previous < e; ++previous) {
+      if (inds[previous] == expert) { owner = false; break; }
+    }
+    for (int token = 0; token < 3; ++token) {
+      int slot = -1;
+      if (owner) {
+        for (int candidate = 0; candidate < 10; ++candidate) {
+          if (inds[token * 10 + candidate] == expert) { slot = candidate; break; }
+        }
+      }
+      members[e * 3 + token] = slot;
+    }
+    """
+
+    private static let groupedGateUpSource = """
+    auto lane = thread_index_in_simdgroup;
+    uint n = thread_position_in_grid.y;      // output row within the expert
+    uint e = thread_position_in_grid.z;      // potential owner in original assignment order
+    int slots[3] = {members[e * 3 + 0], members[e * 3 + 1], members[e * 3 + 2]};
+    // Every lane/SIMD in this group takes the same branch, before weight loads.
+    if (slots[0] < 0 && slots[1] < 0 && slots[2] < 0) return;
+
+    int K = int(K_size);
+    int N = int(N_size);
+    int VPW = 32 / BITS;
+    int K_by_p = K / VPW;
+    int K_by_gs = K / GS;
+    uint mask = (1u << BITS) - 1u;
+
+    uint eid = inds[e];
+    size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
+    size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+
+    // Two independent 4-way accumulator sets: the gate chain and the up
+    // chain never wait on each other.
+    float g0[3] = {0}, g1[3] = {0}, g2[3] = {0}, g3[3] = {0};
+    float u0[3] = {0}, u1[3] = {0}, u2[3] = {0}, u3[3] = {0};
+    for (int pack = int(lane); pack < K_by_p; pack += 32) {
+      uint32_t packed_g = wg_q[wbase + (size_t)pack];
+      uint32_t packed_u = wu_q[wbase + (size_t)pack];
+      int k_base = pack * VPW;
+      int gi = k_base / GS;
+      float sjg = float(g_scales[gbase + (size_t)gi]);
+      float bjg = float(g_biases[gbase + (size_t)gi]);
+      float sju = float(u_scales[gbase + (size_t)gi]);
+      float bju = float(u_biases[gbase + (size_t)gi]);
+      for (int ki = 0; ki < VPW; ki += 4) {
+        uint32_t qg = packed_g >> (ki * BITS);
+        uint32_t qu = packed_u >> (ki * BITS);
+        // Only active members execute loads/arithmetic; no unconditional S3 work
+        // for singleton owners. Maximum register demand remains a measured risk.
+        #pragma clang loop unroll(full)
+        for (int token = 0; token < 3; ++token) {
+          if (slots[token] < 0) continue;
+          size_t xi = (size_t)token * (size_t)K + (size_t)(k_base + ki);
+        float x0 = float(x[xi + 0]);
+        float x1 = float(x[xi + 1]);
+        float x2 = float(x[xi + 2]);
+        float x3 = float(x[xi + 3]);
+        g0[token] += x0 * (float((qg >> (0 * BITS)) & mask) * sjg + bjg);
+        g1[token] += x1 * (float((qg >> (1 * BITS)) & mask) * sjg + bjg);
+        g2[token] += x2 * (float((qg >> (2 * BITS)) & mask) * sjg + bjg);
+        g3[token] += x3 * (float((qg >> (3 * BITS)) & mask) * sjg + bjg);
+        u0[token] += x0 * (float((qu >> (0 * BITS)) & mask) * sju + bju);
+        u1[token] += x1 * (float((qu >> (1 * BITS)) & mask) * sju + bju);
+        u2[token] += x2 * (float((qu >> (2 * BITS)) & mask) * sju + bju);
+        u3[token] += x3 * (float((qu >> (3 * BITS)) & mask) * sju + bju);
+        }
+      }
+    }
+    #pragma clang loop unroll(full)
+    for (int token = 0; token < 3; ++token) {
+    if (slots[token] < 0) continue;
+    float acc_g = simd_sum((g0[token] + g1[token]) + (g2[token] + g3[token]));
+    float acc_u = simd_sum((u0[token] + u1[token]) + (u2[token] + u3[token]));
+    if (lane == 0) {
+      // Round exactly where the unfused path's two kernels wrote T(acc),
+      // then the same table-lookup SwiGLU.
+      T gt = T(acc_g);
+      T ut = T(acc_u);
+      T sig = sigtab[as_type<ushort>(gt)];
+      y[((size_t)token * (size_t)TOPK + (size_t)slots[token]) * (size_t)N + (size_t)n] = (gt * sig) * ut;
+    }
+    }
     """
 
     private static let gateUpSource = """

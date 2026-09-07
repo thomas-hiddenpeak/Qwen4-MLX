@@ -13,6 +13,8 @@
 
 ## 当前状态
 
+- 2026-09-07 20:15：实际专家重叠采集及复算已提交推送`a8fd716`并核对远程SHA。首个shared-load gate/up候选最终release/CPU构建60.13秒、13项CPU通过；两层六组原route pattern + synthetic激活的288项逐位/有限值检查、54暖/216测量完整，独立复算一致。A/C六组倍率0.948471/0.973175/0.956120/0.937033/1.000941/0.966475，未通过性能筛选，不接生成，仅保留显式operator probe。随后同二进制现有AR/D2各一次完整11k/128回归通过，D2计数一致；146文件SHA+102payload stat复核释放，最新参考52066的精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验，heartbeat仍暂停；root完成阶段提交与推送后交回用户。见MTP_GROUPED_GATEUP_EXPERIMENT.md。
+
 - 2026-09-07 19:50：默认关闭的验证routing capture已release构建并通过19项选定CPU检查。原11k/128普通与采集两请求完整golden一致，55轮全部S3、2640层记录完整无丢失；实测同轮同层重复选择26.7184%，gate/up-only逻辑节省上限17.8123%，未测实际DRAM或宣称生成收益。141文件SHA+102payload stat已复核释放，参考49817的精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验；gdn agent正在ignored目录实现共享gate/up局部候选，root保持唯一build/GPU/Git所有者。见MTP_EXPERT_OVERLAP.md。
 
 - 2026-09-07 16:28：MTP验证诊断已提交推送`0b24db9`，远程SHA核对通过；独立事件扫描复算245,474,613ns及9项分析CPU控制通过，有效报告为run/analysis-v2.json（首版golden元数据设置错误保留）。GDN QKV S3 TM2候选随后release46.10秒、CPU dispatch契约及42项实权重逐位检查通过，48暖/192测量完整；S3四层倍率0.957720/1.009808/0.898387/1.012265，S2未改参数对照也有方向性波动，未建立可重复收益，不扩大整模型或改默认。140文件SHA+102payload stat已复核释放；参考41069精确argv、监听、空闲及MTP/drafter关闭已核对。当前无GPU实验，heartbeat仍暂停；最终源码保留显式算子probe，未接生成mode。见VERIFICATION_QKV_TM2_EXPERIMENT.md。

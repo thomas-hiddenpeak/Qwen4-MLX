@@ -1,0 +1,376 @@
+{
+  "schema": "qwen38-moe-grouped-gateup-route-cases-v1",
+  "frozenUTC": "2026-09-07T11:59:44.651061+00:00",
+  "source": {
+    "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/mtp-expert-overlap-v1/run/captured.json",
+    "sha256": "978b160ba4c953cf919af4dc98d29fb9195af46da2d4163130517257719646b9",
+    "analysis": {
+      "path": "/Users/tom/Documents/test/coreai-models/experiments/ane-runner/results/mtp-expert-overlap-v1/run/analysis.json",
+      "sha256": "ab9895e3e7a32bc1a80c9b9b6c0b2b3288b449d3d8b8ddd16babcc780e57c620"
+    },
+    "recordIndexBase": 0
+  },
+  "selectionPolicy": "First qualifying original capture record for each explicit layer/U/fanout predicate; cases retain the listed design order, not chronological order. No synthetic routes.",
+  "cases": [
+    {
+      "name": "layer0_u30_no_overlap",
+      "sourceKind": "captured",
+      "recordIndex": 96,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 0,
+      "position": 11061,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          310,
+          264,
+          56,
+          312,
+          96,
+          140,
+          417,
+          470,
+          36,
+          44
+        ],
+        [
+          157,
+          476,
+          199,
+          74,
+          480,
+          329,
+          269,
+          239,
+          5,
+          423
+        ],
+        [
+          87,
+          449,
+          309,
+          436,
+          20,
+          287,
+          143,
+          159,
+          460,
+          364
+        ]
+      ],
+      "n1": 30,
+      "n2": 0,
+      "n3": 0,
+      "uniqueExperts": 30,
+      "selectionPredicate": {
+        "layer": 0,
+        "tokenCount": 3,
+        "uniqueExperts": 30,
+        "requireNoTripleFanout": false
+      },
+      "qualifyingRecordCount": 15
+    },
+    {
+      "name": "layer0_u24_low_overlap",
+      "sourceKind": "captured",
+      "recordIndex": 816,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 0,
+      "position": 11095,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          42,
+          56,
+          124,
+          140,
+          405,
+          417,
+          203,
+          96,
+          135,
+          310
+        ],
+        [
+          290,
+          391,
+          140,
+          417,
+          134,
+          93,
+          440,
+          365,
+          6,
+          341
+        ],
+        [
+          343,
+          417,
+          64,
+          290,
+          325,
+          6,
+          451,
+          47,
+          93,
+          415
+        ]
+      ],
+      "n1": 19,
+      "n2": 4,
+      "n3": 1,
+      "uniqueExperts": 24,
+      "selectionPredicate": {
+        "layer": 0,
+        "tokenCount": 3,
+        "uniqueExperts": 24,
+        "requireNoTripleFanout": false
+      },
+      "qualifyingRecordCount": 3
+    },
+    {
+      "name": "layer0_u19_triple_overlap",
+      "sourceKind": "captured",
+      "recordIndex": 2592,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 0,
+      "position": 11181,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          357,
+          343,
+          471,
+          47,
+          51,
+          365,
+          6,
+          93,
+          134,
+          187
+        ],
+        [
+          270,
+          343,
+          0,
+          93,
+          6,
+          415,
+          290,
+          140,
+          374,
+          47
+        ],
+        [
+          343,
+          6,
+          47,
+          344,
+          374,
+          49,
+          134,
+          93,
+          290,
+          469
+        ]
+      ],
+      "n1": 12,
+      "n2": 3,
+      "n3": 4,
+      "uniqueExperts": 19,
+      "selectionPredicate": {
+        "layer": 0,
+        "tokenCount": 3,
+        "uniqueExperts": 19,
+        "requireNoTripleFanout": false
+      },
+      "qualifyingRecordCount": 1
+    },
+    {
+      "name": "layer45_u20_pair_only",
+      "sourceKind": "captured",
+      "recordIndex": 1773,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 45,
+      "position": 11136,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          363,
+          486,
+          435,
+          488,
+          429,
+          64,
+          451,
+          211,
+          272,
+          299
+        ],
+        [
+          378,
+          486,
+          427,
+          463,
+          175,
+          192,
+          151,
+          478,
+          319,
+          92
+        ],
+        [
+          378,
+          175,
+          427,
+          463,
+          151,
+          192,
+          92,
+          38,
+          319,
+          478
+        ]
+      ],
+      "n1": 10,
+      "n2": 10,
+      "n3": 0,
+      "uniqueExperts": 20,
+      "selectionPredicate": {
+        "layer": 45,
+        "tokenCount": 3,
+        "uniqueExperts": 20,
+        "requireNoTripleFanout": true
+      },
+      "qualifyingRecordCount": 2
+    },
+    {
+      "name": "layer45_u15_mixed_overlap",
+      "sourceKind": "captured",
+      "recordIndex": 45,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 45,
+      "position": 11057,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          329,
+          192,
+          463,
+          389,
+          382,
+          38,
+          91,
+          88,
+          133,
+          340
+        ],
+        [
+          192,
+          463,
+          91,
+          382,
+          38,
+          88,
+          133,
+          92,
+          340,
+          387
+        ],
+        [
+          91,
+          175,
+          23,
+          463,
+          192,
+          88,
+          340,
+          38,
+          456,
+          92
+        ]
+      ],
+      "n1": 6,
+      "n2": 3,
+      "n3": 6,
+      "uniqueExperts": 15,
+      "selectionPredicate": {
+        "layer": 45,
+        "tokenCount": 3,
+        "uniqueExperts": 15,
+        "requireNoTripleFanout": false
+      },
+      "qualifyingRecordCount": 7
+    },
+    {
+      "name": "layer45_u11_high_overlap",
+      "sourceKind": "captured",
+      "recordIndex": 2493,
+      "repetition": 0,
+      "phase": "verification",
+      "layer": 45,
+      "position": 11176,
+      "tokenCount": 3,
+      "expertIDs": [
+        [
+          192,
+          463,
+          387,
+          92,
+          478,
+          427,
+          329,
+          151,
+          502,
+          38
+        ],
+        [
+          463,
+          92,
+          192,
+          478,
+          387,
+          329,
+          38,
+          427,
+          502,
+          151
+        ],
+        [
+          192,
+          463,
+          329,
+          478,
+          92,
+          387,
+          378,
+          38,
+          427,
+          502
+        ]
+      ],
+      "n1": 1,
+      "n2": 1,
+      "n3": 9,
+      "uniqueExperts": 11,
+      "selectionPredicate": {
+        "layer": 45,
+        "tokenCount": 3,
+        "uniqueExperts": 11,
+        "requireNoTripleFanout": false
+      },
+      "qualifyingRecordCount": 1
+    }
+  ],
+  "scope": [
+    "Only expert IDs were captured; no original activations, logits, routing weights or intermediate state are present.",
+    "The later operator probe must label deterministic synthetic inputs and forced routing separately from these actual observed route IDs. These fixtures do not replay the original model trajectory.",
+    "Original slot order is preserved. n1/n2/n3 count experts appearing in exactly one/two/three token rows, and uniqueExperts is their sum.",
+    "Cases deliberately cover route patterns and extremes; they are not frequency-weighted samples and do not support a whole-model speedup estimate."
+  ]
+}

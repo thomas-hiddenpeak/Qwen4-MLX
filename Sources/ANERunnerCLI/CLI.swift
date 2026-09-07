@@ -74,6 +74,8 @@ struct RunnerCLI {
                 try probeMoE(arguments)
             case "probe-gpu-moe":
                 try probeGPUMoE(arguments)
+            case "probe-gpu-moe-grouped-gateup":
+                try probeGPUMoEGroupedGateUp(arguments)
             case "probe-gpu-moe-verification":
                 try probeGPUMoEVerification(arguments)
             case "probe-gpu-sequence":
@@ -351,6 +353,8 @@ struct RunnerCLI {
     probe-gpu-moe-prefill-expert --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON [--suite expert|composition]
 
     probe-gpu-moe --model-dir PATH --fixture PATH [--output report.json]
+    probe-gpu-moe-grouped-gateup --model-dir PATH --route-cases PATH --output NEW_REPORT_JSON
+        Operator-only S3 forced-route comparison: scalar loop, token-axis, grouped gate/up.
     probe-gpu-moe-verification --model-dir PATH --output NEW_REPORT_JSON [--layer 0] [--warmups 3] [--runs 12]
         Validate and time the GPU router, selected experts and shared expert.
     probe-gpu-sequence --model-dir PATH --fixture PATH [--output report.json]
