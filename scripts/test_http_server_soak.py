@@ -165,7 +165,7 @@ def main():
             idle = harness.idle()
             cycle["cancel_to_idle_observed_seconds"] = time.monotonic() - reset_started
             cycle["idle_after_cancel"] = idle
-            lines = [line for line in log.read_text().splitlines() if "HTTP request id=" + prefix["id"] + " " in line]
+            lines = harness.terminal_log_lines(log, prefix["id"])
             cycle["cancel_server_lines"] = lines
             check(f"cycle_{index:02d}_decode_rst_released", prefix["content_frames"] >= 2
                   and len(lines) == 1 and "terminal=cancelled stage=decode " in lines[0],
@@ -206,7 +206,9 @@ def main():
         check("exactly_twelve_cycles_and_five_idle_samples", len(report["cycles"]) == CYCLES
               and all(item["complete"] for item in report["cycles"])
               and [item["cycle"] for item in samples] == [0, 3, 6, 9, 12])
-        check("final_idle_all_resources_released", True, health=harness.idle())
+        final_idle = harness.idle()
+        report["logging_health"] = edge_helpers.require_lossless_logging(final_idle)
+        check("final_idle_all_resources_released", True, health=final_idle)
         report["complete"] = True
         report["passed"] = all(item["passed"] for item in report["checks"])
     except BaseException as error:

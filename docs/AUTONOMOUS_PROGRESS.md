@@ -15,12 +15,16 @@
 
 已推送`9a60fbd`到`codex/moe-composition`。当前自主开发分支为`codex/upstream-adoption`，初始接续提交`8e427b2`已推送。上一轮专家+归约组合330项局部比较、6轮11k生成和5组边界回归通过；单层+5.21%，完整prefill828→824 token/s，保持可选。最新完整记录见[组合回归](MOE_PREFILL_COMPOSITION.md)。
 
-最新已验证参考服务：PID24434，`http://127.0.0.1:11235`，MTP/drafter关闭，09:46:09恢复ready；root核对精确argv、meta、监听PID及空闲指标。最新已完成恢复ledger为`results/http-output-fix-regression-v2/run-ledger.json`。async性能控制器已恢复参考26788（10:11:04ready），root精确argv/meta/listener/idle核对通过；最新恢复ledger在`results/decode-host-gap-v1/performance/`。当前无GPU实验，其他项目未停止。
+最新参考服务PID31650，`http://127.0.0.1:11235`，MTP/drafter关闭，10:56:42 ready；root精确argv/meta/listener/idle核对通过，ledger与postflight在`results/http-async-logger-regression-v2/`。没有其他GPU实验运行，其他项目未停止。
 
 A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通过/13漂移未定，双窗口性能门槛未通过，已提交推送d432caa。HTTP修复c93011f完成release build、36项Swift CPU/6项Python解析控制、19项live、15项edges、12周期46项soak和6项终态日志检查。首批edges在服务启动前端口检查失败，保留原报告，续批三个独立端口完成。真实非流式output_limit已触发并验证恢复；SSE实际溢出仍未覆盖。90文件postflight与恢复核对通过，旧冻结已解除，历史结果仍绑定c930。
 
-独立审查确认同步stderr日志可在未读取的满pipe上阻塞网络与推理日志路径；当前普通文件回归不能覆盖。redis agent正在ignored路径准备最小有界异步日志候选及pipe活性验证，不改默认推理。HTTP阶段f77f58e已推送并核对远程SHA。PD/async8候选已核对全部基线后应用，release build49.11秒、3项新增纯CPU policy测试通过；新二进制5f1321b。PD到达场景已完成：13请求正确性通过，两配对短等待改善33.39%/42.05%，但首对整体耗时+9.31%、长TTFT+11.43%超门槛，外基线漂移约18.59%，不改默认。同状态门槛已通过：完整logits、121持久张量及host信息逐位一致，原checkpoint不变，13checks通过，恢复26064。async固定4process已完成，8轮完整IDs/配置/计数通过；原始聚合倍率1.186397，但外AR基线下降30.4455%，按固定门槛判indeterminate_drift，默认0。120文件和102模型payload postflight通过后解除冻结。日志修复v2已在d887b64后应用并构建51.82秒，但CPU闭pipe测试使xctest收到SIGPIPE13退出，尚未启动GPU回归。二进制836678a。正在准备v3修复，不能提交v2源码或执行服务草案。
-本任务 heartbeat `qwen4-mlx` 已启用，每20分钟接续至北京时间13:30；到期应暂停，避免用户醒来后继续无界运行。临时 `caffeinate -i -t 30000` 防止空闲睡眠，允许显示器休眠，不更改系统设置。接续依赖本机和应用保持运行。
+PD和async8已提交推送d887b64：13请求PD正确性通过，短等待改善33.39%/42.05%，但首对整体耗时和长TTFT超限、外基线漂移18.59%，默认burst4保持。async一步完整logits/121持久张量/host信息/原checkpoint的13项检查通过，8轮完整输出与计数通过；原始倍率1.186397伴随30.4455%外基线下降，性能未定，默认0。历史120文件/102模型payload postflight已完成。供电观察及日志失败记录e744e5c已推送核对；历史快照为40W和离散AC电量100/73/45。用户返回后明确低功率适配器是预期配置，撤回供电核对作为性能复测的前置要求；漂移原因尚未确定。
+
+有界logger五case已全部通过：live19、edges15、固定12cycle soak46、terminal6、真实未读日志pipe3。二进制`b0391391b4af4dbdcd31bb16cffbf268e790112129e4887c3ac84ef547be1bc1`，133文件/102模型payload postflight通过后解除冻结；源码已完成验证，随本次阶段提交。此前SIGPIPE13与首次Swift限定名编译失败均保留，最终release51.66秒/43Swift通过。普通文件中的日志归因要求零loss；pipe实际128条满额、52926字节保留、419字节in-flight、内核未读65536字节，written固定165，AR/MTP正确且TERM后0.7258455秒退出。pipe故意丢日志，不能宣称完整终态归因。
+
+包装器的ignored测试集路径已在解冻后改为同SHA生产文件；仅Package.swift与5个生产脚本的隔离目录中11项CPU通过，没有results/模型依赖。历史133文件计划不改写；新SSE真实溢出脚本与小型输入已接入公开目录，9项解析与2项实际main退出控制通过；尚未运行模型尝试。
+用户已于11:04左右返回并要求总结。本轮heartbeat `qwen4-mlx`已暂停，不再自动接续新实验；root已核对并结束本任务临时`caffeinate -i -t 30000`进程，系统设置未改。当前没有GPU实验或源码冻结，参考31650保持原参数运行。
 
 ## 进行中的工作
 
@@ -32,13 +36,13 @@ A/B共192请求完整IDs与阶段/功能范围检查通过，正式36组为23通
 
 ## 接续记录
 
-下一次接续先查看Git及各agent候选状态。HTTP controller23104/session15161已exit0、恢复24434；v2完整结果与90文件postflight/解除冻结记录已保存，无需重跑这些历史case。先提交HTTP原因/日志修复及准确文档，再整合阻塞日志修复、PD公平性和async8候选。每次新构建重新冻结身份和参考predecessor，先CPU/状态门槛，再有限GPU实验；A/B已正式分析，不重跑替换未定组。
+先查看本页“当前状态”和最新controller ledger，不重复执行历史草案。PD与async8已完成构建、正确性和有限性能筛选并提交d887b64，HTTP输出原因/终态日志已提交f77f58e；旧c930/5f1321b结果仍绑定原二进制，不改写历史指纹。A/B的13个性能未定组也不通过替换数据消除。
 
-解冻后的首项实现是HTTP输出原因/终态日志修复。ignored候选位于`results/http-output-fix-v1/candidate/`，v3 patch SHA256为`1dcd0f4a44044f43a2cf4dc990840e659534d69ba6235cd9262a4a08b2b98333`；root实际`git apply --check`通过；B结束后已应用并构建，36项相关Swift CPU通过，后续真实回归已完成。v1的SSE文本计数错误在v2改为null，v2新文件patch头缺少mode导致apply-check失败，v3补齐后通过；历史候选保留。应用前核对manifest与baseline，统一构建后跑相关CPU及现有live/edges/soak，再测新增JSON终态字段，不把合成buffer测试算成真实网络overflow。HTTP验证与PD公平性probe已准备ignored副本，见下文；各agent均无生产修改/build/GPU权。缓存前置条件不变。
+Logger五case和参考恢复已经完成，不能重复运行旧草案。本次推送包含有界日志源码、CPU/真实服务结论和公开SSE回归入口；SSE入口只有CPU证据，没有真实overflow通过结果。下一步可先用当前binary与公开脚本/fixture重新冻结一次慢客户端尝试（旧ignored plan-draft不能直接启动），随后直接做性能漂移诊断与有限对照。用户已返回，后续依当前交互推进。
 
-后续候选已保存可审阅副本。HTTP修复与验证脚本已原样接入生产路径，构建、CPU与真实回归通过，PD与async8仍未接入。HTTP验证脚本位于`results/http-output-fix-v1/validation-candidate/`，v2脚本SHA为`ffa233865c03d8f7158c24a485f9a61350623332b92274176c68c44c5b9dee2f`，6项CPU解析控制通过；root重跑及旧43请求日志审阅通过，旧日志没有新schema，不能计作新功能验收。`results/http-output-fix-regression-v1/plan-draft.json`已准备live/edges/12周期soak/terminal-logs四case，最后包含一次合法非流式超限候选及恢复，未触发也明确保留，不重试。这些前置已完成；首批正式plan在live后遇到边界harness启动前端口检查失败，保留报告后以相同90文件/二进制和三个独立空闲端口冻结v2续跑，未改服务、helper或验收条件。草案不能重复启动。最终UTF8 flush超限可能发生在model completed之后，新日志验证已区分此路径与生成期间failed。
+供电不作为已确认性能问题或后续复测前置条件。继续完成有明确边界的服务正确性/活性工作，并针对观测漂移独立分析；不放宽MTP性能门槛，不改默认burst4/async0，不提前实现共享前缀或SSD状态缓存。各agent只有明确分配的文档或ignored候选写权限，root保持唯一build/GPU/Git所有者。
 
-PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d70674b0f9c3b4a9d1c0cb8db19a61306a18e2640bf7452eada5c`，root静态审阅、manifest依赖与实际apply-check通过，未构建。新增probe及原cooperative入口7行分流，固定历史短26输入/64输出、长11057/128，先本次独立AR核对，再4/8/8/4及取消两份live状态/fresh AR。共13请求（预计11完成/2取消）；性能与正确性分开。`results/pd-fairness-v1/plan-draft.json`待HTTP阶段恢复后选择最新predecessor再正式冻结。另有vllm agent准备当前token内async8提交的ignored候选，见[限定提交研究](DECODE_SUBMISSION_FEASIBILITY.md)，同样无生产修改/build/GPU权。
+以下是当时的历史记录；其中“当前”“待运行”等措辞描述该时间点，以本页顶部和最新ledger为接续依据。
 
 - 05:20左右：分派三路研究/实现；参考服务保持运行；GDN agent只允许独立编译，尚未获得GPU运行权。
 - 05:31：三份上游固定版本已核对，两个调研文档和[综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)完成。开始请求级 MTP 成本摘要和调度输出延迟统计，不改变在线策略。
@@ -89,3 +93,9 @@ PD候选位于`results/pd-fairness-v1/candidate/`，patch SHA为`01f551f6af1d706
 - 10:16：PD/async结果及可复跑fixture已阶段提交并push d887b64，远程SHA一致。Logger v2已原样apply，release build session91604；待42项相关Swift CPU和Python控制通过后才冻结五case服务回归。参考保持26788，尚未开始logger模型测试。
 
 - 10:20：42项HTTP CPU在真实closed-pipe logger测试处被SIGPIPE13终止，v2日志器未通过；原始build/cpu log保留于`results/http-async-logger-regression-v1/`，未加载模型。Apple XNU证实EPIPE会向进程发SIGPIPE，dup+NOSIGPIPE又会修改共享fileglob，故不采用。Root明确改为自有独立serve-gpu进程入口的SIGPIPE忽略策略（不是其他应用/共享FD修改），Core不隐式改global；redis准备v3 delta与实际closed-pipe测试，待root构建验证。另发现当前协商40 W和离散AC电量100/73/45，见POWER_ENVIRONMENT_FINDINGS；后续不再追加受漂移影响的优化测速。参考26788仍空闲。
+
+- 10:58：logger五case全部exit0，19/15/46/6/3检查通过，参考31650已核对。133文件/102payload postflight后解除冻结；包装器仅路径修复并以不含ignored文件的隔离目录重跑同11CPU通过。实际pipe写入堵塞仍支持health、AR/MTP与0.726秒TERM退出。SSE修正版候选11CPU和独立复核通过，正在准备公开脚本/fixture，无新模型运行。
+
+- 11:06：用户返回要求总结；停止新增实验并暂停八小时heartbeat，结束本任务临时防睡眠进程。SSE公开3脚本/5输入文件已准备，root复跑9+2CPU通过，未启动GPU。正在完成最后源码、结果与公开回归入口的阶段push；参考31650仍运行。
+
+- 11:07：用户说明低功率适配器是有意使用且不影响性能。Root修正文档和计划，不再把40 W当作性能问题或复测前置条件；原始环境记录及性能漂移保留，不编造因果。

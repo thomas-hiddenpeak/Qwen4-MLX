@@ -2,15 +2,17 @@
 
 2026-09-07。MTP双窗口结束后，HTTP adapter已修复非流式累计文本超限原因丢失，并增加可关联的模型、输出和连接终态记录。服务二进制`c93011f804dd287a7758568d69373089959a0b92408379390ea71d7294b0568a`完成36项Swift CPU、6项Python日志解析控制、19项live、15项edges、固定12轮46项soak及6项真实终态检查。**真实非流式生成过程中的`text_limit → HTTP 500 / output_limit`已触发并验证后续恢复；SSE应用缓冲overflow、15秒发送期限、300秒连接期限仍未覆盖。**
 
+当前b039已加入有界异步诊断日志及显式服务进程SIGPIPE策略，release构建、43项Swift CPU、11项Python控制及五组真实服务回归19/15/46/6/3项全部通过；包含实际非流式text_limit再次触发，以及真实未读满stderr管道下的服务活性。下面c930旧实测独立保留，不计入新版本验收。
+
 完整服务合同与历史结果见[HTTP实验服务](HTTP_SERVER_EXPERIMENT.md)。本页区分此次实测、源码合同与尚未触发的分支，不把正常请求或CPU状态机通过当作全部网络边界通过。
 
-## 当前路径与覆盖
+## 输出路径与c930实测覆盖
 
 | 边界 | 实现与此次证据 | 仍不能声称的范围 |
 | --- | --- | --- |
 | 非流式累计文本限额 | 每请求[QwenHTTPTextBudget](../Sources/ANERunnerCore/QwenHTTPTextBudget.swift)先检查UTF-8字节，再接受文本；保留首个本地失败原因。最低8192字节配置减去2048字节JSON/header余量，允许6144字节文本。真实AR生成在decode中命中`text_limit`，scheduler failed之后仍返回`output_limit`；随后新AR/MTP成功。 | 只覆盖生成时累计文本检查，不覆盖最后UTF-8 flush才跨限或最终JSON/header编码超限；也不是模型数值故障恢复。 |
 | SSE应用缓冲overflow | [QwenSSEOutputBuffer](../Sources/ANERunnerCore/QwenSSEOutputBuffer.swift)在普通帧字节或事件额度不足时选择`slowConsumer`并请求取消；若还能发送，保留已接受前缀，再发`slow_consumer`错误和一次`[DONE]`。scheduler迟到终态不能覆盖这个选择。 | 尚无真实HTTP/SSE `slow_consumer`或对应overflow记录。非流式`output_limit`不补成此项通过。 |
-| 单次发送期限15秒 | [sendNext](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L349)记录lease和发送起点；[checkDeadlines](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L394)检查未完成发送并以`send_deadline`关闭，记录lease/发送经过时间。header/simple发送也使用此计时。 | 尚未观察真实发送保持未完成达到期限；CPU缓冲检查和暂停读取均不能代替。 |
+| 单次发送期限15秒 | [sendNext](../Sources/ANERunnerCLI/GPUHTTPServer.swift)记录lease和发送起点；[checkDeadlines](../Sources/ANERunnerCLI/GPUHTTPServer.swift)检查未完成发送并以`send_deadline`关闭，记录lease/发送经过时间。header/simple发送也使用此计时。 | 尚未观察真实发送保持未完成达到期限；CPU缓冲检查和暂停读取均不能代替。 |
 | 整个连接期限300秒 | 从accept时刻计算年龄；未先命中发送期限时，以`connection_deadline`关闭，记录连接年龄。 | 尚未观察已解析、计算中或排队请求命中；未完成header/body会先遇到接收期限。 |
 | 晚到的send确认 | 关闭保留真实in-flight lease，确认回调释放它并可记录`closed_send_released`。 | 此次终态日志没有该事件实例，不能称为真实晚确认分支已覆盖。 |
 
@@ -30,11 +32,11 @@
 
 ## 三种终态不能混成一次“成功送达”
 
-[complete](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L548)先记录模型终态，再执行最后UTF-8 flush及最终响应编码，所以`model_terminal completed`或旧`HTTP request ... finish=eos/length`只证明模型完成。adapter最后一步仍可能失败。
+[complete](../Sources/ANERunnerCLI/GPUHTTPServer.swift)先记录模型终态，再执行最后UTF-8 flush及最终响应编码，所以`model_terminal completed`或旧`HTTP request ... finish=eos/length`只证明模型完成。adapter最后一步仍可能失败。
 
-[logOutput](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L622)只由首次overflow或`finish.accepted`记录`output_terminal`；它表示输出缓冲选定结果，**不表示客户端已经读取**。本次live/edges/soak/terminal的所有output_terminal记录当时均`output_drained=false`。后续`connection_close reason=terminal_sent`来自Network的contentProcessed确认；客户端完整收到响应的证据仍来自测试端解析，不能只凭发送回调推定。
+[logOutput](../Sources/ANERunnerCLI/GPUHTTPServer.swift)只由首次overflow或`finish.accepted`记录`output_terminal`；它表示输出缓冲选定结果，**不表示客户端已经读取**。本次live/edges/soak/terminal的所有output_terminal记录当时均`output_drained=false`。后续`connection_close reason=terminal_sent`来自Network的contentProcessed确认；客户端完整收到响应的证据仍来自测试端解析，不能只凭发送回调推定。
 
-[close](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L372)记录网络终态和关闭前/后outcome。RST经常先选择`disconnected`，随后scheduler报告cancelled；迟到`finish`返回alreadyTerminal，不再产生output_terminal。未进入scheduler的拒绝请求也可能只有connection_close。不能承诺每份请求都有三个事件，或把缺少output_terminal直接当作丢日志。
+[close](../Sources/ANERunnerCLI/GPUHTTPServer.swift)记录网络终态和关闭前/后outcome。RST经常先选择`disconnected`，随后scheduler报告cancelled；迟到`finish`返回alreadyTerminal，不再产生output_terminal。未进入scheduler的拒绝请求也可能只有connection_close。不能承诺每份请求都有三个事件，或把缺少output_terminal直接当作丢日志。
 
 日志schema为`qwen-http-lifecycle-v1`，用PID、request ID和connection ID关联，只含有限原因、计数与时间；不写提示词、正文或token内容。SSE的累计`text_bytes/text_limit_bytes`不适用，记录null而非伪造0。旧`HTTP request id=...`仍保留给已有取消gate，但它与新的model_terminal是同一模型事件的两种表示。
 
@@ -53,8 +55,43 @@ connection_close还包含health、参数拒绝等非生成连接，不能当作�
 
 后续SSE溢出测试需要取得请求ID、明确的slow_consumer选择及同连接错误/[DONE]；期限测试需要服务侧send_deadline或connection_deadline、对应lease/年龄与恢复证据。若触发条件不成立，继续记未覆盖，不伪造推理或延迟凑通过。
 
-## 同步stderr仍有活性缺口
+## 诊断日志的背压与信号策略
 
-c930的[log](../Sources/ANERunnerCLI/GPUHTTPServer.swift#L670)仍在共享mutex内同步写stderr。若stderr接到无人读取且已满的pipe，写入能阻塞调用它的网络或推理线程；独立网络队列不消除共享日志阻塞。此次服务日志写普通文件，以上通过结果没有覆盖满pipe行为。
+c930的log在共享mutex内同步写stderr。若stderr接到无人读取且已满的pipe，写入能阻塞网络或推理线程；c930服务日志写普通文件，以上通过结果没有覆盖这种活性问题。**这项历史缺口不能被旧19/15/46/6检查或早期19+15+46结果补成通过。**
 
-最小有界日志写入候选及pipe活性验证正在准备，**尚未应用或验证，不能声称该缺口已经修复**。保持c930历史证据与后续候选分开。真实SSE overflow、发送/连接期限、晚到send确认、长期稳定及精确MTP verify/replay取消也仍有各自门槛。
+当前b039已将写入移到[QwenHTTPLogger](../Sources/ANERunnerCore/QwenHTTPLogger.swift)的单独固定线程。producer只在短锁内入队，不等待sink IO；固定额度为65536字节、128条、单条4096字节，正在写的完整记录继续占额度。满额或过大记录整条丢弃，失败写入记errno并停止接受；health的`logging`提供保留/in-flight计数、累计drops和write_failures。它独立于SSE/非流式响应缓冲，日志丢弃不会选择slow_consumer/output_limit或取消模型。
+
+关闭时stop丢弃排队记录，不join可能仍卡在IO的writer；该writer最多保留一条记录至返回或进程退出。因此这是可丢弃的诊断日志，不能承诺最后一条终态、刷盘或完整审计。正文、提示词、token内容和原始异常正文仍不进入日志。
+
+第一版writer线程mask方案实际失败：[xctest日志](../results/http-async-logger-regression-v1/cpu-tests.log)显示真实closed-pipe测试被SIGPIPE13终止。固定Apple XNU源码中，非socket写入的EPIPE路径调用进程级`psignal`；`F_SETNOSIGPIPE`设置共享fileglob的FG_NOSIGPIPE，dup仍指向同一个fileglob。所以只屏蔽writer线程不足，在私有dup上设置该flag也不是隔离方案。[Apple sys_generic.c](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/sys_generic.c#L601)，[F_SETNOSIGPIPE](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_descrip.c#L2944)，[finishdup](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_descrip.c#L551)。公开commit早于本机kernel，源码解释与此次真实失败一致，不声称取得本机内核完整对应版本。
+
+最终选定的最小策略是在独立`serve-gpu`进程入口显式设置SIGPIPE=SIG_IGN，持续至该进程退出；不改变父进程、其他应用或共享stderr FD标志。Core仅只读核验，未配置就拒绝默认stderr sink。忽略信号让断管以EPIPE返回，满pipe写入仍可能阻塞，所以固定writer及非等待退出同样必要。
+
+v3第一次编译又因本机Swift SDK将`Darwin.sigaction(...)`解析为struct构造器而失败；只在3文件7处改成未限定函数调用。保留[首编译错误](../results/http-async-logger-regression-v2/build.log)、[导入修正记录](../results/http-async-logger-regression-v2/import-fix.json)及[后续成功构建](../results/http-async-logger-regression-v2/build-fixed-import.log)，不写成一次通过。当前`b0391391b4af4dbdcd31bb16cffbf268e790112129e4887c3ac84ef547be1bc1`的[43项Swift CPU](../results/http-async-logger-regression-v2/cpu-tests.log)与[11项Python控制](../results/http-async-logger-regression-v2/python-production-tests.log)通过，含实际断管EPIPE、调用线程mask/FD标志不变和未配置策略被拒绝。它们不是实际满pipe服务验收。
+
+五项服务postflight后，包装器已改为加载生产`scripts/test_http_terminal_log_validator.py`，与旧ignored副本内容SHA一致。仅含Package.swift和5个生产脚本、无results或模型的临时目录中，[相同11项CPU再次通过](../results/http-async-logger-regression-v2/python-clean-layout-tests.log)，见[修正记录](../results/http-async-logger-regression-v2/logger-wrapper-path-fix.json)；这是同组复跑，不累计为22项。Swift二进制和历史冻结SHA未改。
+
+## b039实测诊断归因与满管道活性
+
+日志可晚于响应和health出现，需按唯一请求/连接ID有界等待；旧兼容行仍与model_terminal对应同一个事件。edges/soak保留原取消前提、请求和耗时口径，等待最多10秒并检查零丢弃/写入失败，最后原有idle快照再检查累计计数；terminal脚本也如此。计数缺失或任意drops/failures均不能判日志归因完整。
+
+[`本轮计划`](../results/http-async-logger-regression-v2/plan.json)的live/edges/12轮soak/terminal-logs/pipe最终检查数为19/15/46/6/3，全部complete、passed、graceful_shutdown且退出码0；[postflight](../results/http-async-logger-regression-v2/postflight-and-release.json)核对133文件、102模型payload及b039二进制，参考服务按原argv恢复PID31650、11235监听与idle均已核对。完整请求与RSS/FD范围见[HTTP服务实测](HTTP_SERVER_EXPERIMENT.md#b039有界日志cpu与五组实模回归通过)。
+
+普通文件日志的实际计数如下；旧model行与新model_terminal逐ID一致，不能相加。
+
+| b039报告 | 旧model / model_terminal | output_terminal | connection_close |
+| --- | ---: | ---: | ---: |
+| live | 14 / 14：9完成、5 prefill取消 | 9 | 174 |
+| edges | 8 / 8：7完成、1 decode取消 | 7 | 154 |
+| soak | 43 / 43：31完成、12 decode取消 | 31 | 213 |
+| terminal | 8 / 8：6完成、1 decode取消、1 text_limit失败 | 7 | 140 |
+
+edges/soak/terminal的最后idle快照分别为written/enqueued 184/184、337/337、170/170，队列和in-flight为零，drops/dropped_bytes/write_failures均为0。live最后保存的是SIGTERM前active快照（215/215、零loss），没有退出后的health快照；其raw取消终态已核对，不据此承诺退出日志可靠投递。soak的43个模型终态对应31份完成HTTP响应与12个不同ID的decode取消，每轮取消后及轮末资源归零。850.750708709秒窗口内5次外部idle RSS采样末次比基线增加320 KiB，FD始终11；这是有限观察，不证明无泄漏或长期稳定。
+
+[`本轮terminal报告`](../results/http-async-logger-regression-v2/terminal-logs.json)与[raw日志](../results/http-async-logger-regression-v2/terminal-logs.server.log)再次命中真实非流式生成超限：PID31366，请求`chatcmpl-da642831-c778-4dbf-94dd-a12c9c8576fe`，51.953498875秒收到HTTP500/output_limit。模型记录failed/decode、reason=text_limit；输出记录failed/output_limit、已接受text_bytes与limit均6144；同连接terminal_sent后额度归零，后续AR/MTP均返回`1,2,`、prompt35/output4/total39、length。仍是generation_text_limit，不能补成最终UTF-8 flush或JSON/header超限覆盖。
+
+[`pipe报告`](../results/http-async-logger-regression-v2/pipe.json)使用自有stderr管道，读端保持打开且退出前从未读取，stdout独立写普通文件。161次填充health后应用日志达到128条事件上限；3个额外health样本均有65536字节未读、written固定165、in-flight419字节、总保留52926字节，drops为2/3/4。这同时观察到实际管道积压、writer不再前进和应用限额丢弃，不能仅以暂停读取替代。
+
+日志堵塞期间，真实AR非流式与MTP2 SSE均完成`1,2,`、prompt35/output4/total39、length；随后idle的全部请求/模型资源归零，但日志仍为128条、52926字节、written165，累计丢弃13条/6581字节、write_failures为0。SIGTERM在0.7258455秒内退出0，父Python原SIGPIPE策略保持不变；退出后才捕获65536字节stderr，stdout为0字节。实际[stderr记录](../results/http-async-logger-regression-v2/pipe.stderr.log)共165个完整行（157条无请求ID的connection_close及8条启动信息），没有任何模型请求终态，符合此项明确的`lifecycle_attribution_complete=false`。
+
+这证明当前自有未读满pipe条件下的服务活性，不证明完整日志、退出刷盘或所有sink行为。断管EPIPE由独立Core真实pipe CPU测试覆盖。本轮没有新SSE overflow尝试；SSE应用overflow、15秒发送/300秒连接期限、晚到send确认、长期稳定及MTP verify/replay内部取消仍未覆盖。

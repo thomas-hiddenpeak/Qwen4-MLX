@@ -190,10 +190,30 @@ def validate_request(parsed, expectation):
             "output_limit_phase": limit_phase}
 
 
-def wait_logs(path, child, model, expectations, timeout=10):
+def require_complete_logging(health):
+    """Health, not a possibly incomplete log, is the authority for lost records."""
+    logs = health.get("logging")
+    require(isinstance(logs, dict), "Health lacks bounded logger counters; attribution completeness unknown")
+    counts = ("max_bytes", "max_events", "max_event_bytes", "buffered_bytes", "buffered_events",
+              "queued_events", "in_flight_bytes", "enqueued_events", "written_events",
+              "dropped_events", "dropped_bytes", "write_failures")
+    require(all(type(logs.get(k)) is int and logs[k] >= 0 for k in counts), "Invalid bounded logger counter")
+    require(logs.get("accepting") is True and logs.get("writer_exited") is False,
+            "Logger is not accepting; attribution completeness unknown")
+    require(logs["in_flight_bytes"] <= logs["buffered_bytes"] <= logs["max_bytes"]
+            and logs["queued_events"] <= logs["buffered_events"] <= logs["max_events"], "Logger quota exceeded")
+    require(logs["dropped_events"] == logs["dropped_bytes"] == logs["write_failures"] == 0
+            and logs.get("last_write_errno") is None,
+            "Lifecycle attribution incomplete: dropped_events=%d dropped_bytes=%d write_failures=%d"
+            % (logs["dropped_events"], logs["dropped_bytes"], logs["write_failures"]))
+    return logs
+
+
+def wait_logs(path, child, model, expectations, harness, timeout=10):
     deadline, last = time.monotonic() + timeout, None
     while time.monotonic() < deadline:
         require(child.poll() is None, "Owned server exited while waiting for log records")
+        require_complete_logging(harness.health()[1])
         parsed = read_log(path, child.pid, model)
         try:
             evidence = [validate_request(parsed, expected) for expected in expectations]
@@ -237,7 +257,8 @@ def main():
         "notes": ["One real model under the outer GPU controller; no speed claim.",
                   "RST requires two nonempty content frames; first token may come from prefill.",
                   "Structured records may arrive after HTTP/health; correlated by request ID, not line order.",
-                  "No SSE overflow or send/connection deadline pass is claimed."]}
+                  "No SSE overflow or send/connection deadline pass is claimed.",
+                  "Live log attribution requires zero health-reported drops/write failures through the final snapshot."]}
 
     def save():
         out.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
@@ -304,7 +325,7 @@ def main():
               idle=harness.idle(), cancel_to_idle_observed_seconds=time.monotonic() - reset_at)
         check("fresh_ar_mtp_after_rst", equivalent(generate("fresh_ar", 0, False), ar)
               and equivalent(generate("fresh_mtp", 2, True), mtp), idle=harness.idle())
-        parsed, evidence = wait_logs(log, child, model, expectations)
+        parsed, evidence = wait_logs(log, child, model, expectations, harness)
         check("normal_and_rst_structured_and_legacy_paths", True, requests=evidence)
         if args.try_output_limit:
             # 2400 Han characters = 7200 UTF-8 bytes if actually copied. Model
@@ -339,17 +360,19 @@ def main():
                 raise ValueError("Output-limit candidate returned an unrelated failure")
             expectations.append(expectation)
             report["requests"].append(expectation)
-            _, optional_evidence = wait_logs(log, child, model, [expectation])
+            _, optional_evidence = wait_logs(log, child, model, [expectation], harness)
             report["output_limit"]["log_evidence"] = optional_evidence
             report["output_limit"]["passed"] = report["output_limit"]["status"] == "observed"
             check("fresh_ar_mtp_after_optional_attempt", equivalent(generate("post_limit_ar", 0, False), ar)
                   and equivalent(generate("post_limit_mtp", 2, True), mtp), idle=harness.idle())
-        parsed, evidence = wait_logs(log, child, model, expectations)
+        parsed, evidence = wait_logs(log, child, model, expectations, harness)
         expected_ids = {item["id"] for item in expectations}
         observed_ids = {item["request_id"] for item in parsed["records"] if item["request_id"] is not None}
+        final_idle = harness.idle()
+        report["logging_health"] = require_complete_logging(final_idle)
         check("all_correlated_terminal_paths_and_log_schema", len(expected_ids) == len(expectations) and observed_ids == expected_ids,
               requests=evidence,
-              log_format="structured_with_legacy_compatibility", final_idle=harness.idle())
+              log_format="structured_with_legacy_compatibility", final_idle=final_idle)
         report["complete"] = True
         report["passed"] = all(c["passed"] for c in report["checks"]) and (not args.try_output_limit or report["output_limit"]["passed"])
     except BaseException as error:

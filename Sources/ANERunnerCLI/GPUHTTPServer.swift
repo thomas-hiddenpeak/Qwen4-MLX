@@ -9,6 +9,16 @@ import Synchronization
 
 extension RunnerCLI {
     static func serveGPU(_ args: Arguments) throws {
+        // serve-gpu is one command in its own CLI process. Darwin pipe EPIPE
+        // can signal the whole process, so this explicit service policy lasts
+        // until process exit. It does not alter the parent process or any fd's
+        // shared flags. Core's stderr logger verifies this precondition.
+        var pipePolicy = sigaction()
+        pipePolicy.__sigaction_u.__sa_handler = SIG_IGN
+        sigemptyset(&pipePolicy.sa_mask)
+        guard sigaction(SIGPIPE, &pipePolicy, nil) == 0 else {
+            throw CLIError.usage("Cannot install HTTP SIGPIPE policy")
+        }
         try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
@@ -23,7 +33,10 @@ extension RunnerCLI {
             maxConnections: try number("--max-connections", 8, 1...32),
             maxBodyBytes: try number("--max-body-bytes", 262_144, 1024...1_048_576),
             outputBytes: try number("--output-buffer-bytes", 65_536, 8192...1_048_576))
-        try GPUHTTPServer(configuration: config).run()
+        let server = try GPUHTTPServer(configuration: config)
+        // A running service has its own bounded logger. Do not re-enter the
+        // general CLI catch's synchronous stderr write after a sink failure.
+        guard server.run() else { Darwin.exit(EXIT_FAILURE) }
     }
 }
 
@@ -138,7 +151,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private let health = Mutex(GPUHTTPHealth())
     private let finished = DispatchSemaphore(value: 0)
     private let failure = Mutex<String?>(nil)
-    private let logLock = Mutex(())
+    private let logger: QwenHTTPLogger
     private let listener: NWListener
     private var clients: [UUID: GPUHTTPClient] = [:]
     private var signals: [DispatchSourceSignal] = []
@@ -153,15 +166,19 @@ private final class GPUHTTPServer: @unchecked Sendable {
             port: NWEndpoint.Port(rawValue: UInt16(configuration.port))!)
         parameters.allowLocalEndpointReuse = true
         listener = try NWListener(using: parameters)
+        logger = try QwenHTTPLogger()
     }
 
-    func run() throws {
+    func run() -> Bool {
         let previousINT = Darwin.signal(SIGINT, SIG_IGN)
         let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)
         defer { Darwin.signal(SIGINT, previousINT); Darwin.signal(SIGTERM, previousTERM) }
         network.async { self.startNetwork() }
         finished.wait()
-        if let message = failure.withLock({ $0 }) { throw CLIError.usage(message) }
+        let succeeded = failure.withLock { $0 == nil }
+        if !succeeded { log("HTTP server failed") }
+        logger.stop()
+        return succeeded
     }
 
     private func startNetwork() {
@@ -250,9 +267,20 @@ private final class GPUHTTPServer: @unchecked Sendable {
         switch (request.method, request.path) {
         case ("GET", "/health"):
             let h = health.withLock { $0 }
+            let logs = logger.snapshot()
             let body = try JSONSerialization.data(withJSONObject: [
                 "status": h.state, "ready": h.state == "ready", "model": configuration.modelID,
                 "pid": Int(getpid()), "experimental": true,
+                "logging": [
+                    "accepting": logs.accepting, "writer_exited": logs.writerExited,
+                    "max_bytes": logs.maxBytes, "max_events": logs.maxEvents, "max_event_bytes": logs.maxEventBytes,
+                    "buffered_bytes": logs.bufferedBytes, "buffered_events": logs.bufferedEvents,
+                    "queued_events": logs.queuedEvents, "in_flight_bytes": logs.inFlightBytes,
+                    "enqueued_events": logs.enqueuedEvents, "written_events": logs.writtenEvents,
+                    "dropped_events": logs.droppedEvents, "dropped_bytes": logs.droppedBytes,
+                    "write_failures": logs.writeFailures,
+                    "last_write_errno": logs.lastWriteErrno as Any? ?? NSNull()
+                ],
                 "idle": h.idle && inbox.count == 0, "active": h.active, "active_jobs": h.jobs,
                 "queued_prefills": h.prefills, "ready_decodes": h.ready,
                 "resident_sequences": h.resident, "reserved_tokens": h.reserved,
@@ -668,6 +696,6 @@ private final class GPUHTTPServer: @unchecked Sendable {
     }
 
     private func log(_ text: String) {
-        logLock.withLock { _ in FileHandle.standardError.write(Data((text + "\n").utf8)) }
+        logger.enqueue(Data((text + "\n").utf8))
     }
 }

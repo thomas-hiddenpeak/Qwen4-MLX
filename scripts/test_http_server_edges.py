@@ -24,6 +24,18 @@ ZERO_COUNTERS = ("active", "active_jobs", "pending_requests", "queued_prefills",
                  "ready_decodes", "resident_sequences", "reserved_tokens")
 
 
+def require_lossless_logging(health):
+    """Cumulative counters cover all work through this health snapshot."""
+    logs = health.get("logging")
+    if not isinstance(logs, dict):
+        raise ValueError("Bounded logger counters unknown; terminal attribution incomplete")
+    counts = ("dropped_events", "dropped_bytes", "write_failures")
+    if (any(type(logs.get(k)) is not int or logs[k] != 0 for k in counts)
+            or logs.get("last_write_errno") is not None or logs.get("accepting") is not True):
+        raise ValueError("Logger dropped or failed records; terminal attribution incomplete")
+    return logs
+
+
 class HTTPHarness:
     def __init__(self, port, child):
         self.port, self.child = port, child
@@ -95,6 +107,23 @@ class HTTPHarness:
     def idle(self):
         return self.until(lambda item: item[0] == 200 and item[1].get("idle") is True
                           and all(item[1].get(key) == 0 for key in ZERO_COUNTERS))
+
+    def terminal_log_lines(self, path, request_id, timeout=10):
+        """Wait for asynchronous legacy records without weakening attribution."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.alive()
+            raw = path.read_bytes()
+            if len(raw) > 8 * 1024 * 1024:
+                raise ValueError("Server log exceeds 8 MiB gate bound")
+            complete = raw[:raw.rfind(b"\n") + 1].decode("utf-8", errors="strict")
+            lines = [line for line in complete.splitlines() if "HTTP request id=" + request_id + " " in line]
+            _, health = self.health()
+            require_lossless_logging(health)
+            if lines:
+                return lines
+            time.sleep(.1)
+        raise TimeoutError("Asynchronous terminal record missing for " + request_id)
 
     def post_socket(self, body):
         payload = json.dumps(body, ensure_ascii=False).encode()
@@ -369,14 +398,16 @@ def main():
         save()
         idle = harness.idle()
         elapsed = time.monotonic() - started
-        matching = [line for line in log.read_text().splitlines() if "HTTP request id=" + prefix["id"] + " " in line]
+        matching = harness.terminal_log_lines(log, prefix["id"])
         check("mtp_decode_rst_cancelled_and_released", prefix["content_frames"] >= 2
               and len(matching) == 1 and "terminal=cancelled stage=decode " in matching[0],
               elapsed_seconds=elapsed, prefix=prefix, matching_server_lines=matching, health=idle)
         fresh = decode_completion(harness.request("POST", "/v1/chat/completions", chat(numbers, budget=4)), False)
         check("fresh_after_mtp_decode_rst_exact", fresh["text"] == baseline["text"]
               and fresh["usage"] == baseline["usage"] and fresh["finish"] == baseline["finish"], result=fresh)
-        check("final_idle_all_resources_released", True, health=harness.idle())
+        final_idle = harness.idle()
+        report["logging_health"] = require_lossless_logging(final_idle)
+        check("final_idle_all_resources_released", True, health=final_idle)
         report["complete"] = True
         report["passed"] = all(item["passed"] for item in report["checks"])
     except BaseException as error:
