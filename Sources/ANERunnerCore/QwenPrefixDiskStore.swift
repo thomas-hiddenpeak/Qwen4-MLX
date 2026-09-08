@@ -95,6 +95,21 @@ public struct QwenPrefixDiskMatch: Sendable {
     public let diskBytes: Int
 }
 
+/// A snapshot of an already requested close. Incomplete means background IO
+/// or callback delivery still owns resources; it does not reopen admissions.
+public struct QwenPrefixDiskCloseResult: Equatable, Sendable {
+    /// All admitted IO returned and the IO queue closed its directory/lock FDs.
+    public let ioCompleted: Bool
+    /// All callbacks admitted before close returned and released their owners.
+    public let callbacksCompleted: Bool
+    public var completed: Bool { ioCompleted && callbacksCompleted }
+
+    public init(ioCompleted: Bool, callbacksCompleted: Bool) {
+        self.ioCompleted = ioCompleted
+        self.callbacksCompleted = callbacksCompleted
+    }
+}
+
 /// An exclusively owned, namespace-isolated, checksummed snapshot directory.
 ///
 /// All filesystem/index work runs on one CPU queue. `enqueue` is nonblocking:
@@ -105,9 +120,11 @@ public struct QwenPrefixDiskMatch: Sendable {
 ///
 /// `clear` invalidates admitted work before waiting for active IO. `close`
 /// rejects new jobs and optionally drains admitted writes; close(drain:false)
-/// invalidates them. Both calls wait for the finite current IO operation and
-/// must not be called from an asynchronous completion. Cache callbacks are
-/// dispatched separately; non-waiting completion calls may use the store.
+/// invalidates them. The original synchronous APIs wait without a deadline;
+/// use close(drain:timeout:) to bound the caller's wait, including callbacks.
+/// Waiting operations must not be called from an asynchronous completion.
+/// Cache callbacks are dispatched separately; non-waiting completion calls
+/// may use the store.
 /// The directory is private (0700), files are 0600, and a process lock prevents
 /// two store instances from managing it concurrently. Only exact owned names
 /// are removed, and path operations use directory FDs without following links.
@@ -131,6 +148,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     private let queueKey = DispatchSpecificKey<Bool>()
     private let admission = NSLock()
     private let closeGroup = DispatchGroup()
+    private let callbackCloseGroup = DispatchGroup()
     private var epoch: UInt64 = 0
     private var closed = false
     private var stats = QwenPrefixDiskStatistics()
@@ -425,14 +443,57 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     }
 
     public func close(drain: Bool = true) {
+        beginClose(drain: drain)
+        closeGroup.wait()
+        if drain { callbackCloseGroup.wait() }
+    }
+
+    /// Rejects new work immediately, then waits at most `timeout` seconds for
+    /// the already admitted IO, descriptor closure and callback delivery. Both
+    /// phases share one monotonic deadline. Nonpositive or nonfinite timeouts
+    /// poll without waiting; they never request an unlimited wait.
+    ///
+    /// A timeout only detaches this waiter. It cannot cancel an OS syscall,
+    /// close an FD still in use, or release a pending Data/lease owner. Queued
+    /// work keeps the store alive until actual completion. A later call may
+    /// wait again; it neither schedules another close nor admits new work.
+    /// `drain: false` invalidates pending writes, but completion here still
+    /// requires their cleanup and callbacks to finish.
+    @discardableResult
+    public func close(drain: Bool = true, timeout: TimeInterval) -> QwenPrefixDiskCloseResult {
+        let deadline = Self.closeDeadline(timeout)
+        beginClose(drain: drain)
+        let ioCompleted = closeGroup.wait(timeout: deadline) == .success
+        let callbacksCompleted = ioCompleted && callbackCloseGroup.wait(timeout: deadline) == .success
+        return .init(ioCompleted: ioCompleted, callbacksCompleted: callbacksCompleted)
+    }
+
+    private static func closeDeadline(_ timeout: TimeInterval) -> DispatchTime {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard timeout.isFinite, timeout > 0 else { return .init(uptimeNanoseconds: now) }
+        // Saturate below DispatchTime.distantFuture without trapping on large
+        // finite TimeIntervals or overflowing the absolute monotonic clock.
+        let nanoseconds = (timeout * 1_000_000_000).rounded(.up)
+        let maximum = UInt64.max - 1
+        let remaining = maximum - min(now, maximum)
+        guard nanoseconds < Double(remaining) else { return .init(uptimeNanoseconds: maximum) }
+        return .init(uptimeNanoseconds: now + UInt64(nanoseconds))
+    }
+
+    private func beginClose(drain: Bool) {
         admission.lock()
         if !closed {
             closed = true
             closeGroup.enter()
+            callbackCloseGroup.enter()
             if !drain { epoch &+= 1 }
             queue.async { [self] in
                 closeDescriptors()
                 closeGroup.leave()
+                // Every admitted IO block has already enqueued its callback.
+                // This marker therefore follows all callback owners, including
+                // reads that remain charged until their callback returns.
+                callbackQueue.async { [self] in callbackCloseGroup.leave() }
             }
         } else if !drain {
             // A concurrent immediate close may cancel jobs a draining close
@@ -440,8 +501,6 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             epoch &+= 1
         }
         admission.unlock()
-        closeGroup.wait()
-        if drain { callbackQueue.sync {} }
     }
 
     private func admitLocked(bytes: Int) -> Bool {

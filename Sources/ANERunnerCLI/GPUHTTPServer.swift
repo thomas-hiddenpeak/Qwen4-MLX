@@ -22,7 +22,8 @@ extension RunnerCLI {
         try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes",
             "--prefix-cache-bytes", "--prefix-cache-entries", "--prefix-cache-directory",
             "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes",
-            "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds"])
+            "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds",
+            "--prefix-cache-shutdown-timeout-seconds"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
@@ -39,7 +40,8 @@ extension RunnerCLI {
                 .standardizedFileURL.resolvingSymlinksInPath()
         } else {
             guard args["--prefix-cache-disk-bytes"] == nil, args["--prefix-cache-disk-entries"] == nil,
-                  args["--prefix-cache-min-free-bytes"] == nil, args["--prefix-cache-restore-timeout-seconds"] == nil else {
+                  args["--prefix-cache-min-free-bytes"] == nil, args["--prefix-cache-restore-timeout-seconds"] == nil,
+                  args["--prefix-cache-shutdown-timeout-seconds"] == nil else {
                 throw CLIError.usage("SSD cache limits require --prefix-cache-directory")
             }
             prefixCacheDirectory = nil
@@ -59,6 +61,7 @@ extension RunnerCLI {
             prefixCacheTTLSeconds: try number("--prefix-cache-ttl-seconds", 86_400, 1...Int.max),
             prefixCacheMinFreeBytes: try number("--prefix-cache-min-free-bytes", 1_073_741_824, 0...Int.max),
             prefixCacheRestoreTimeoutSeconds: try number("--prefix-cache-restore-timeout-seconds", 5, 1...300),
+            prefixCacheShutdownTimeoutSeconds: try number("--prefix-cache-shutdown-timeout-seconds", 30, 1...300),
             stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max))
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
@@ -73,6 +76,7 @@ private struct GPUHTTPConfiguration: Sendable {
     let prefixCacheDirectory: URL?
     let prefixCacheDiskBytes, prefixCacheDiskEntries, prefixCacheTTLSeconds: Int
     let prefixCacheMinFreeBytes, prefixCacheRestoreTimeoutSeconds: Int
+    let prefixCacheShutdownTimeoutSeconds: Int
     let stateBudgetBytes: Int
     var prefixDiskLimits: QwenPrefixDiskLimits {
         .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes,
@@ -316,6 +320,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
 
     private func route(_ request: QwenHTTPRequest, client: GPUHTTPClient) throws {
         switch (request.method, request.path) {
+        case ("GET", "/metrics"):
+            simple(client, data: try QwenHTTPFrames.response(status: 200,
+                contentType: "text/plain; version=0.0.4; charset=utf-8", body: prometheusMetrics()))
         case ("GET", "/health"):
             let h = health.withLock { $0 }
             let logs = logger.snapshot()
@@ -347,6 +354,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     "diskRestoreTimeoutSeconds": configuration.prefixCacheRestoreTimeoutSeconds] as Any,
                 "prefix_disk_cache": h.prefixDiskJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "prefix_disk_cache_limits": try prefixDiskLimitsJSON(),
+                "prefix_cache_policy": configuration.prefixCacheBytes == 0 ? NSNull() : [
+                    "lookup": "complete_canonical_prompt", "maximum_checkpoints_per_request": 2,
+                    "checkpoint_grid_tokens": 416, "mtp_enabled": false] as Any,
+                "prefix_cache_shutdown_timeout_seconds": configuration.prefixCacheShutdownTimeoutSeconds,
                 "state_budget": h.stateBudgetJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "mlx_memory": h.mlxMemory as Any? ?? NSNull(),
                 "memory_pressure": try JSONSerialization.jsonObject(with: JSONEncoder().encode(memoryPressure.snapshot)),
@@ -390,6 +401,80 @@ private final class GPUHTTPServer: @unchecked Sendable {
             reject(client, status: ["/health", "/v1/models", "/v1/chat/completions"].contains(request.path) ? 405 : 404,
                 message: "Unsupported endpoint or method", code: "invalid_request_error")
         }
+    }
+
+    /// Reads the same copied counters as health. No device calls, token keys,
+    /// request IDs or unbounded labels enter the monitoring endpoint.
+    private func prometheusMetrics() -> Data {
+        let h = health.withLock { $0 }
+        let pressure = memoryPressure.snapshot
+        var lines = [String]()
+        func emit<T: BinaryInteger>(_ name: String, _ type: String, _ help: String, _ value: T) {
+            lines.append("# HELP qwen_\(name) \(help)")
+            lines.append("# TYPE qwen_\(name) \(type)")
+            lines.append("qwen_\(name) \(value)")
+        }
+        func decoded(_ bytes: Data?) -> [String: Any] {
+            guard let bytes, let value = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return [:] }
+            return value
+        }
+        func counters(_ bytes: Data?, _ fields: [(String, String, String, String)]) {
+            let values = decoded(bytes)
+            for (field, name, type, help) in fields {
+                // Absent observations stay absent, including during model load.
+                guard let number = values[field] as? NSNumber else { continue }
+                emit(name, type, help, number.int64Value)
+            }
+        }
+        emit("ready", "gauge", "Model ready to serve requests.", h.state == "ready" ? 1 : 0)
+        emit("queued_prefills", "gauge", "Queued prefill jobs including prefix waiters.", h.prefills)
+        emit("ready_decodes", "gauge", "Decode jobs ready on the local scheduler.", h.ready)
+        emit("waiting_prefix_sequences", "gauge", "Requests waiting for a producer or SSD prefix.", h.waitingPrefix)
+        emit("resident_sequences", "gauge", "Sequences retained by the local scheduler.", h.resident)
+        emit("pending_requests", "gauge", "HTTP requests waiting for tokenization and scheduler admission.", inbox.count)
+        emit("memory_pressure_level", "gauge", "Effective policy level: unknown=-1 normal=0 warning=1 critical=2.",
+             [QwenMemoryPressurePolicy.Level.unknown: -1, .normal: 0, .warning: 1, .critical: 2][pressure.effectiveLevel]!)
+        emit("memory_pressure_monitor_running", "gauge", "Whether the OS notification monitor is running.", h.pressureMonitorRunning ? 1 : 0)
+        emit("memory_pressure_os_events_total", "counter", "Delivered OS pressure notifications; excludes injected policy events.", pressure.operatingSystemEvents)
+        emit("memory_pressure_injected_events_total", "counter", "Explicitly injected pressure policy observations.", pressure.injectedEvents)
+        emit("memory_pressure_request_denials_total", "counter", "New request admission checks denied by pressure policy.", pressure.newRequestDenials)
+        emit("memory_pressure_optional_denials_total", "counter", "Optional cache admission checks denied by pressure policy.", pressure.optionalCacheDenials)
+        counters(h.stateBudgetJSON, [
+            ("requestBytes", "state_request_bytes", "gauge", "Logical request state reservation; not RSS."),
+            ("cacheBytes", "state_cache_bytes", "gauge", "Logical retained RAM snapshot reservation; not RSS."),
+            ("workspaceBytes", "state_workspace_bytes", "gauge", "Logical workspace reservation, including unfinished transfers."),
+            ("maxBytes", "state_limit_bytes", "gauge", "Joint logical state reservation limit; not a physical memory limit."),
+            ("currentLeases", "state_leases", "gauge", "Live logical state reservations."),
+            ("rejections", "state_reservation_rejections_total", "counter", "Rejected logical reservation attempts.")])
+        counters(h.prefixCacheJSON, [
+            ("restoredHits", "prefix_restores_total", "counter", "Complete prefix states actually restored from RAM or SSD."),
+            ("diskHits", "prefix_ssd_restores_total", "counter", "Complete prefix states actually restored from SSD."),
+            ("entries", "prefix_ram_entries", "gauge", "Retained complete RAM prefix snapshots."),
+            ("evictions", "prefix_ram_evictions_total", "counter", "RAM index evictions."),
+            ("liveFlights", "prefix_live_flights", "gauge", "Live prefix producer and transfer coordination records."),
+            ("diskReadTimeouts", "prefix_read_timeouts_total", "counter", "Requests detached from unfinished SSD reads after their deadline."),
+            ("diskPublicationTimeouts", "prefix_publication_timeouts_total", "counter", "Requests detached from pending SSD publication waits."),
+            ("restoreFailures", "prefix_restore_failures_total", "counter", "Optional state restoration failures."),
+            ("retainedSystemAnchorSkips", "prefix_system_anchor_preservation_skips_total", "counter", "RAM candidates skipped to retain a shared system checkpoint.")])
+        counters(h.prefixDiskJSON, [
+            ("diskBytes", "ssd_archive_bytes", "gauge", "Accounted published cache file bytes; excludes model n-gram storage."),
+            ("entries", "ssd_archive_entries", "gauge", "Accounted cache archives."),
+            ("pendingJobs", "ssd_pending_jobs", "gauge", "Admitted unfinished SSD cache jobs."),
+            ("pendingBytes", "ssd_pending_bytes", "gauge", "Admitted SSD job byte reservations."),
+            ("bytesRead", "ssd_archive_read_bytes_total", "counter", "Cache archive file bytes read; not physical device IO."),
+            ("bytesWritten", "ssd_archive_written_bytes_total", "counter", "Successfully published archive bytes; not physical device IO."),
+            ("evictions", "ssd_archive_evictions_total", "counter", "SSD cache archive evictions."),
+            ("writeFailures", "ssd_write_failures_total", "counter", "SSD cache write failures."),
+            ("corruptions", "ssd_corruptions_total", "counter", "Rejected corrupt cache archives."),
+            ("spaceRejections", "ssd_space_rejections_total", "counter", "Optional writes rejected by available space checks."),
+            ("spaceQueryFailures", "ssd_space_query_failures_total", "counter", "Failed available space queries."),
+            ("availableSpaceBytes", "ssd_available_space_bytes", "gauge", "Last successful available space sample for the cache filesystem.")])
+        if let memory = h.mlxMemory {
+            for (field, name) in [("active_bytes", "mlx_active_bytes"), ("cache_bytes", "mlx_cache_bytes"), ("peak_bytes", "mlx_peak_bytes")] {
+                if let value = memory[field] { emit(name, "gauge", "MLX allocator observation; not process RSS.", value) }
+            }
+        }
+        return Data((lines.joined(separator: "\n") + "\n").utf8)
     }
 
     private func prefixDiskLimitsJSON() throws -> Any {
@@ -548,9 +633,17 @@ private final class GPUHTTPServer: @unchecked Sendable {
             try QwenPrefixDiskStore(directory: $0, limits: configuration.prefixDiskLimits,
                 ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds))
         }
-        // Also closes the exclusively owned directory if model construction
-        // fails before the generator can assume its normal shutdown lifecycle.
-        defer { diskStore?.close(drain: true) }
+        // One finite close path covers normal shutdown and construction errors.
+        // Pending host-only IO retains its own FD/Data/lease owners if this
+        // deadline expires. Do not add a later unbounded flush/close fallback.
+        defer {
+            if let diskStore {
+                let result = diskStore.close(drain: true,
+                    timeout: TimeInterval(configuration.prefixCacheShutdownTimeoutSeconds))
+                let state = diskStore.statistics
+                log("HTTP prefix cache shutdown completed=\(result.completed) io_completed=\(result.ioCompleted) callbacks_completed=\(result.callbacksCompleted) pending_jobs=\(state.pendingJobs) pending_bytes=\(state.pendingBytes)")
+            }
+        }
         var previousCache = 0
         try MX.check(mlx_set_cache_limit(&previousCache, 256 * 1024 * 1024), "HTTP allocator cache")
         defer { var ignored = 0; _ = mlx_set_cache_limit(&ignored, previousCache) }
@@ -570,15 +663,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
             for job in jobs.values { job.work.cancellation.cancel() }
             _ = try? scheduler.discardAll()
             jobs.removeAll()
-            // Persist admitted SSD writes while releasing request/RAM storage.
-            // Closing the service must not act as an SSD cache purge.
-            do {
-                try generator.flushPrefixCacheWrites()
-                try generator.closePrefixCache(drain: true)
-            } catch {
-                log("HTTP prefix cache shutdown encountered an error")
-                diskStore?.close(drain: true)
-            }
+            // Release private device state here. The single outer close owns
+            // the finite SSD drain; service shutdown does not purge archives.
             try? generator.clearPrefixCache(includingDisk: false)
             try? MX.synchronize()
         }
@@ -626,14 +712,21 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     try work.cancellation.check()
                     let messages = work.chat.messages.map { ChatMessage(role: $0.role, content: $0.content,
                         toolCalls: $0.toolCalls, toolCallID: $0.toolCallID) }
-                    let tokens = try tokenizer.encode(tokenizer.renderChat(messages: messages, tools: work.chat.activeTools))
-                    let prefixTokens = configuration.prefixCacheBytes > 0 && work.chat.mtpDepth == 0 ?
-                        try tokenizer.systemPrefixTokenCount(messages: messages, tools: work.chat.activeTools, fullTokens: tokens) : 0
+                    let tokens: [Int32]
+                    let prefixPlan: QwenConversationPrefixPlan?
+                    if configuration.prefixCacheBytes > 0 && work.chat.mtpDepth == 0 {
+                        let conversation = try tokenizer.encodeConversation(messages: messages, tools: work.chat.activeTools,
+                                                                            prefillChunk: 416)
+                        tokens = conversation.tokens; prefixPlan = conversation.prefixPlan
+                    } else {
+                        tokens = try tokenizer.encode(tokenizer.renderChat(messages: messages, tools: work.chat.activeTools))
+                        prefixPlan = nil
+                    }
                     try work.cancellation.check()
                     let request = QwenGenerationRequest(tokens: tokens, maxTokens: work.chat.maxTokens,
                         contextLimit: 16_384, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
                         verification: work.chat.mtpDepth == 2 ? .batchedScalarLinear : .scalar,
-                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCacheMaxTokens: prefixTokens)
+                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCachePlan: prefixPlan)
                     let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
                         self.health.withLock { $0.runningJob = active.schedulerID?.uuidString }
@@ -748,6 +841,18 @@ private final class GPUHTTPServer: @unchecked Sendable {
             modelFields["prefill_seconds"] = (result.phases?.prefill.targetSeconds).map(finite) ?? NSNull()
             modelFields["decode_seconds"] = finite(result.decodeSeconds)
             modelFields["cached_prompt_tokens"] = result.phases?.prefill.cachedTokenCount ?? 0
+            if let prefill = result.phases?.prefill {
+                modelFields["computed_prompt_tokens"] = prefill.computedTokenCount
+                modelFields["actual_prefill_tokens"] = prefill.actualForwardTokenCount
+                modelFields["recomputed_prefill_tokens"] = prefill.recomputedTokenCount
+                modelFields["prefill_active_seconds"] = finite(prefill.totalSeconds)
+                modelFields["prefill_suspension_seconds"] = prefill.suspensionSeconds.map(finite) ?? NSNull()
+                modelFields["cache_source"] = prefill.cacheSource
+                modelFields["cache_lookup_seconds"] = prefill.cacheLookupSeconds.map(finite) ?? NSNull()
+                modelFields["cache_restore_seconds"] = prefill.cacheRestoreSeconds.map(finite) ?? NSNull()
+                modelFields["cache_save_seconds"] = prefill.cacheSaveSeconds.map(finite) ?? NSNull()
+                modelFields["cache_wait_seconds"] = prefill.cacheWaitSeconds.map(finite) ?? NSNull()
+            }
         }
         logLifecycle(.modelTerminal, connectionID: work.connectionID, work: work,
             reason: active.textBudget.failure?.rawValue, fields: modelFields)

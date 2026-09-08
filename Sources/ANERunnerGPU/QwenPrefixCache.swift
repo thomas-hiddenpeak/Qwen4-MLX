@@ -56,23 +56,88 @@ private final class QwenPrefixDiskPublication: @unchecked Sendable {
     func finish() { lock.lock(); complete = true; lock.unlock() }
 }
 
-/// A leader owns no other request. Dropping/cancelling it releases the flight;
-/// followers may then take over at the next scheduler slice.
+/// The read job and its request consumer finish independently. This fence
+/// owns no Data/Tensor/lease: it only prevents another identical read while
+/// the first import/promotion or an abandoned POSIX operation is unfinished.
+final class QwenPrefixDiskReadFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ioFinished = false, consumerFinished = false
+    var isComplete: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return ioFinished && consumerFinished
+    }
+    func finishIO() { lock.lock(); ioFinished = true; lock.unlock() }
+    func finishConsumer() { lock.lock(); consumerFinished = true; lock.unlock() }
+}
+
+/// Executor-confined ownership. An old request cannot release a new owner
+/// after clear, cancellation takeover, or a different checkpoint publication.
+final class QwenPrefixProducerRegistry {
+    private var owners: [String: UUID] = [:]
+    var count: Int { owners.count }
+    func owner(for key: String) -> UUID? { owners[key] }
+    @discardableResult
+    func claim(key: String, identity: UUID) -> Bool {
+        if let existing = owners[key] { return existing == identity }
+        owners[key] = identity
+        return true
+    }
+    func release(key: String, identity: UUID) {
+        if owners[key] == identity { owners.removeValue(forKey: key) }
+    }
+    func removeAll() { owners.removeAll() }
+}
+
+struct QwenPrefixCheckpoint: Equatable {
+    let key: String, boundary: Int
+    init(tokens: [Int32], namespace: String, boundary: Int) {
+        self.boundary = boundary
+        var h = SHA256(); h.update(data: Data(namespace.utf8))
+        Array(tokens.prefix(boundary)).withUnsafeBytes { h.update(bufferPointer: $0) }
+        key = h.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// One request lookup context survives both checkpoint publications. Only
+/// ownedProducer is a computation flight; full lookup tokens are never its key.
 final class QwenPrefixCacheFlight {
     weak var cache: QwenPrefixCache?
-    let key: String, namespace: String, tokens: [Int32], identity = UUID(), epoch: UInt64
+    let namespace: String, tokens: [Int32], identity = UUID(), epoch: UInt64
+    let checkpoints: [QwenPrefixCheckpoint]
+    let prefillChunk: Int
+    let systemProducerBoundary: Int?
     let allowWaitingForLeader: Bool
-    var leader = false
+    var ownedProducer: QwenPrefixCheckpoint?
     var waiting = false
     var read: QwenPrefixDiskRead?
+    var readCheckpoint: QwenPrefixCheckpoint?
+    var readFence: QwenPrefixDiskReadFence?
+    var readWaitStartedAt: UInt64?
+    var waitedForRead = false
+    var skipDisk = false
+    var publicationWaitKey: String?
     var publicationWaitStartedAt: UInt64?
+    var timedOutPublications: Set<String> = []
     var resolved = false
+    var lookupSeconds = 0.0, restoreSeconds = 0.0
     let startedAt = DispatchTime.now().uptimeNanoseconds
-    init(cache: QwenPrefixCache, key: String, namespace: String, tokens: [Int32], epoch: UInt64, allowWaitingForLeader: Bool) {
+    init(cache: QwenPrefixCache, namespace: String, tokens: [Int32],
+         checkpoints: [QwenPrefixCheckpoint], prefillChunk: Int, systemProducerBoundary: Int?,
+         epoch: UInt64, allowWaitingForLeader: Bool) {
         self.allowWaitingForLeader = allowWaitingForLeader
-        self.cache = cache; self.key = key; self.namespace = namespace; self.tokens = tokens; self.epoch = epoch
+        self.cache = cache; self.namespace = namespace; self.tokens = tokens; self.epoch = epoch
+        self.checkpoints = checkpoints; self.prefillChunk = prefillChunk
+        self.systemProducerBoundary = systemProducerBoundary
     }
-    deinit { cache?.releaseFlight(key: key, identity: identity) }
+    func detachRead() {
+        readFence?.finishConsumer()
+        readFence = nil; read = nil; readCheckpoint = nil
+    }
+    deinit {
+        // The callback still owns read Data/workspace after an abandonment.
+        detachRead()
+        if let ownedProducer { cache?.releaseFlight(key: ownedProducer.key, identity: identity) }
+    }
 }
 
 /// All Tensor/index operations remain on the model inference executor. The
@@ -94,8 +159,10 @@ final class QwenPrefixCache {
     private var diskReadTimeouts = 0
     private var diskPublicationTimeouts = 0
     private var pressureEvictions = 0, budgetSkipped = 0, duplicateSkipped = 0, flightWaits = 0, expired = 0
-    private var flights: [String: UUID] = [:]
+    private var retainedSystemAnchorSkips = 0, restoreWaits = 0
+    private let flights = QwenPrefixProducerRegistry()
     private var publications: [String: QwenPrefixDiskPublication] = [:]
+    private var reads: [String: QwenPrefixDiskReadFence] = [:]
     private var epoch: UInt64 = 0
 
     init(limits: QwenPrefixCacheLimits, disk: QwenPrefixDiskStore?, model: QwenModel,
@@ -118,16 +185,19 @@ final class QwenPrefixCache {
         r.diskPublicationTimeouts = diskPublicationTimeouts
         r.pressureEvictions = pressureEvictions; r.budgetSkipped = budgetSkipped
         r.duplicateSkipped = duplicateSkipped; r.flightWaits = flightWaits; r.liveFlights = flights.count; r.expired = expired
+        r.retainedSystemAnchorSkips = retainedSystemAnchorSkips; r.restoreWaits = restoreWaits
         return r
     }
     func clear(resetStatistics: Bool = false, includingDisk: Bool = false) {
-        epoch &+= 1; flights.removeAll(); publications.removeAll(); index.clear(resetStatistics: resetStatistics)
+        epoch &+= 1; flights.removeAll(); publications.removeAll(); reads.removeAll()
+        index.clear(resetStatistics: resetStatistics)
         if includingDisk { disk?.clear(resetStatistics: resetStatistics) }
         if resetStatistics {
             published = 0; skippedOversize = 0; restoreFailures = 0; restoredHits = 0; diskHits = 0
             diskFallbacks = 0; pressureEvictions = 0; budgetSkipped = 0; duplicateSkipped = 0; flightWaits = 0; expired = 0
             diskReadTimeouts = 0
             diskPublicationTimeouts = 0
+            retainedSystemAnchorSkips = 0; restoreWaits = 0
         }
     }
     /// Evict retained snapshots before denying optional workspace or a request.
@@ -148,28 +218,77 @@ final class QwenPrefixCache {
         diskIdentity + "|" + request.prefixCacheNamespace(accumulation: model.prefillAccumulation.rawValue,
             fusedPrefill: model.fusedPrefillEnabled)
     }
-    func begin(_ request: QwenGenerationRequest, maximum: Int, model: QwenModel, allowWaitingForLeader: Bool = true) -> QwenPrefixCacheFlight {
+    func begin(_ request: QwenGenerationRequest, policy: QwenPrefixCachePolicy,
+               model: QwenModel, allowWaitingForLeader: Bool = true) -> QwenPrefixCacheFlight {
         publications = publications.filter { !$0.value.isComplete }
-        let tokens = Array(request.tokens.prefix(maximum)), ns = namespace(request, model: model)
-        var h = SHA256(); h.update(data: Data(ns.utf8))
-        tokens.withUnsafeBytes { h.update(bufferPointer: $0) }
-        let key = h.finalize().map { String(format: "%02x", $0) }.joined()
-        return QwenPrefixCacheFlight(cache: self, key: key, namespace: ns, tokens: tokens, epoch: epoch, allowWaitingForLeader: allowWaitingForLeader)
+        reads = reads.filter { !$0.value.isComplete }
+        let tokens = Array(request.tokens.prefix(policy.lookupMaximum)), ns = namespace(request, model: model)
+        let checkpoints = policy.publicationBoundaries.map {
+            QwenPrefixCheckpoint(tokens: tokens, namespace: ns, boundary: $0)
+        }
+        return QwenPrefixCacheFlight(cache: self, namespace: ns, tokens: tokens,
+            checkpoints: checkpoints, prefillChunk: request.prefillChunk,
+            systemProducerBoundary: policy.systemProducerBoundary,
+            epoch: epoch, allowWaitingForLeader: allowWaitingForLeader)
     }
     func releaseFlight(key: String, identity: UUID) {
-        if flights[key] == identity { flights.removeValue(forKey: key) }
+        flights.release(key: key, identity: identity)
     }
     private func current(_ f: QwenPrefixCacheFlight) -> Bool { f.epoch == epoch }
-    private func memoryMatch(_ f: QwenPrefixCacheFlight) -> QwenPrefixCacheMatch<Snapshot>? {
+    private func releaseProducer(_ f: QwenPrefixCacheFlight, at boundary: Int? = nil) {
+        guard let owned = f.ownedProducer, boundary == nil || boundary == owned.boundary else { return }
+        releaseFlight(key: owned.key, identity: f.identity)
+        f.ownedProducer = nil
+    }
+    private func markWaiting(_ f: QwenPrefixCacheFlight) {
+        if !f.waiting { flightWaits += 1; f.waiting = true }
+    }
+    /// The caller either has not forwarded anything yet, or forbids waiting.
+    /// A lower fallback always releases a future ticket before acquiring another.
+    private func prepareProducer(_ f: QwenPrefixCacheFlight, after offset: Int, mayWait: Bool) -> Bool {
+        guard current(f) else { releaseProducer(f); return true }
+        let next = f.checkpoints.first { $0.boundary > offset }
+        if next != f.ownedProducer { releaseProducer(f) }
+        guard let next else { return true }
+        if let owner = flights.owner(for: next.key), owner != f.identity {
+            if mayWait { markWaiting(f); return false }
+            return true // Continue privately; never replace the other owner.
+        }
+        if let publication = publications[next.key] {
+            if publication.isComplete { publications.removeValue(forKey: next.key) }
+            else if mayWait && !f.timedOutPublications.contains(next.key) {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if f.publicationWaitKey != next.key {
+                    f.publicationWaitKey = next.key; f.publicationWaitStartedAt = now
+                }
+                if let started = f.publicationWaitStartedAt,
+                   Double(now - started) * 1e-9 >= diskRestoreTimeoutSeconds {
+                    f.timedOutPublications.insert(next.key)
+                    diskPublicationTimeouts += 1; diskFallbacks += 1
+                } else { markWaiting(f); return false }
+            }
+        }
+        if flights.claim(key: next.key, identity: f.identity) { f.ownedProducer = next }
+        return true
+    }
+    /// Peek does not count a successful restore or touch LRU. The selected
+    /// snapshot is looked up again immediately before private copying.
+    private func memoryCandidate(_ f: QwenPrefixCacheFlight) -> QwenPrefixCacheMatch<Snapshot>? {
         while let match = index.peek(tokens: f.tokens, namespace: f.namespace) {
             if let ttlSeconds, Date().timeIntervalSince1970 - match.value.createdAt >= ttlSeconds {
                 index.remove(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
                 expired += 1
                 continue
             }
-            break
+            guard match.prefixTokenCount > 0, match.prefixTokenCount % f.prefillChunk == 0,
+                  match.value.state.offset == match.prefixTokenCount else {
+                index.remove(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
+                restoreFailures += 1
+                continue
+            }
+            return match
         }
-        return index.lookup(tokens: f.tokens, namespace: f.namespace)
+        return nil
     }
     private func recoverOptionalFailure(model: QwenModel, error: Error) throws {
         if error as? QwenGenerationError == .cancelled { throw error }
@@ -191,108 +310,150 @@ final class QwenPrefixCache {
                  checkCancellation: () throws -> Void) throws -> Resolution? {
         let started = DispatchTime.now().uptimeNanoseconds
         func elapsed(_ start: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - start) * 1e-9 }
+        var restoreWork = 0.0
+        defer {
+            f.lookupSeconds += max(0, elapsed(started) - restoreWork)
+            f.restoreSeconds += restoreWork
+        }
+        func restoring<T>(_ body: () throws -> T) rethrows -> T {
+            let start = DispatchTime.now().uptimeNanoseconds
+            defer { restoreWork += elapsed(start) }
+            return try body()
+        }
+        func resolved(_ state: QwenModel.State?, source: String) -> Resolution {
+            f.resolved = true
+            return .init(state: state, source: source,
+                lookupSeconds: f.lookupSeconds + max(0, elapsed(started) - restoreWork),
+                restoreSeconds: f.restoreSeconds + restoreWork)
+        }
         try checkCancellation()
-        guard current(f) else { f.read = nil; f.resolved = true; return .init(state: nil, source: "cold", lookupSeconds: 0, restoreSeconds: 0) }
+        guard current(f) else {
+            f.detachRead(); releaseProducer(f)
+            return resolved(nil, source: "cold")
+        }
         if let read = f.read {
             if read.hasTimedOut(after: diskRestoreTimeoutSeconds) {
                 // Only detach this request. lookupAsync's completion still owns
                 // the ticket/lease until actual read + callback completion. Do
                 // not release its workspace or start a replacement read here.
-                f.read = nil; f.resolved = true
+                f.detachRead(); releaseProducer(f); f.skipDisk = true
                 diskReadTimeouts += 1; diskFallbacks += 1
-                return .init(state: nil, source: "cold", lookupSeconds: 0, restoreSeconds: 0)
+            } else {
+                guard read.isReady else { return nil }
+                // Retain the final ticket through import/recovery. The callback
+                // may still own host Data after marking ready; no early release.
+                defer { f.detachRead(); withExtendedLifetime(read) {} }
+                let expected = f.readCheckpoint?.boundary
+                if let match = read.take(), match.prefixTokenCount == expected {
+                    do {
+                        let state = try restoring {
+                            let archive = QwenPrefixStateArchive(metadata: match.metadata, payload: match.payload,
+                                logicalPayloadBytes: try model.estimatedPrefixStateBytes(at: match.prefixTokenCount))
+                            let restored = try model.importPrefixState(archive, expectedOffset: match.prefixTokenCount,
+                                checkCancellation: checkCancellation)
+                            try checkCancellation()
+                            _ = try saveMemory(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace,
+                                state: restored, model: model, retainingSystemPrefix: f.systemProducerBoundary,
+                                checkCancellation: checkCancellation, observer: nil)
+                            return restored
+                        }
+                        diskHits += 1; restoredHits += 1
+                        return resolved(state, source: "disk")
+                    } catch {
+                        try recoverOptionalFailure(model: model, error: error)
+                        _ = disk?.invalidateAsync(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
+                        restoreFailures += 1
+                    }
+                }
+                // A shorter result after corruption/expiry is not the selected
+                // checkpoint. Replan from RAM/cold without a second SSD read.
+                f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
             }
-            guard read.isReady else { return nil }
-            // A completed callback may already have dropped its reference.
-            // Keep this final ticket owner through import and error recovery;
-            // lexical scope alone does not guarantee Swift ARC lifetime.
-            defer { withExtendedLifetime(read) {} }
-            let match = read.take()
-            f.read = nil
-            // The callback can still own its ticket/result after marking it
-            // ready. ARC releases this reservation only after both import and
-            // the independent completion owner have finished with host data.
-            if let match {
+        }
+
+        // No forward work has started. A failed deeper restoration can safely
+        // replan, after releasing its future producer, from the actual fallback.
+        while true {
+            try checkCancellation()
+            let memoryDepth = memoryCandidate(f)?.prefixTokenCount ?? 0
+            let summary = f.skipDisk ? nil : disk?.peek(tokens: f.tokens, namespace: f.namespace)
+            let useDisk = summary.map {
+                $0.prefixTokenCount > memoryDepth && $0.prefixTokenCount <= f.tokens.count &&
+                $0.prefixTokenCount % f.prefillChunk == 0
+            } ?? false
+            let depth = useDisk ? summary!.prefixTokenCount : memoryDepth
+            guard prepareProducer(f, after: depth, mayWait: f.allowWaitingForLeader) else { return nil }
+
+            if useDisk, let summary, let disk {
+                let checkpoint = QwenPrefixCheckpoint(tokens: f.tokens, namespace: f.namespace, boundary: depth)
+                if let pending = reads[checkpoint.key] {
+                    if pending.isComplete { reads.removeValue(forKey: checkpoint.key) }
+                    else {
+                        if f.readWaitStartedAt == nil { f.readWaitStartedAt = DispatchTime.now().uptimeNanoseconds }
+                        if f.allowWaitingForLeader, elapsed(f.readWaitStartedAt!) < diskRestoreTimeoutSeconds {
+                            if !f.waitedForRead { restoreWaits += 1; f.waitedForRead = true }
+                            markWaiting(f); return nil
+                        }
+                        if f.allowWaitingForLeader { diskReadTimeouts += 1 }
+                        f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
+                        continue
+                    }
+                }
+                guard summary.metadataBytes >= 0, summary.payloadBytes >= 0,
+                      summary.payloadBytes <= (Int.max - summary.metadataBytes) / 2,
+                      let lease = reserve(bytes: summary.payloadBytes * 2 + summary.metadataBytes,
+                                          kind: .workspace, model: model) else {
+                    f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
+                    continue
+                }
+                let read = QwenPrefixDiskRead(lease: lease), fence = QwenPrefixDiskReadFence()
+                // Restrict the actual read to the depth whose workspace was
+                // reserved, even if a deeper archive publishes after peek.
+                if disk.lookupAsync(tokens: f.tokens, namespace: f.namespace, maxPrefixTokens: depth,
+                    completion: { [read, fence] result in
+                        defer { fence.finishIO(); withExtendedLifetime(read) {} }
+                        read.complete(result)
+                    }) {
+                    reads = reads.filter { !$0.value.isComplete }
+                    reads[checkpoint.key] = fence
+                    f.read = read; f.readCheckpoint = checkpoint; f.readFence = fence
+                    f.skipDisk = true // This request schedules at most one read.
+                    return nil
+                }
+                lease.release() // No job/host archive was accepted.
+                f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
+                continue
+            }
+            if let match = memoryCandidate(f) {
+                // A TTL can expire between the initial peek and this use.
+                // Never keep a future tail owner while starting from less.
+                guard match.prefixTokenCount == memoryDepth else {
+                    releaseProducer(f); continue
+                }
                 do {
-                    let archive = QwenPrefixStateArchive(metadata: match.metadata, payload: match.payload,
-                        logicalPayloadBytes: try model.estimatedPrefixStateBytes(at: match.prefixTokenCount))
-                    let restored = try model.importPrefixState(archive, expectedOffset: match.prefixTokenCount,
-                        checkCancellation: checkCancellation)
-                    try checkCancellation()
-                    // The imported arrays belong to the request. Promotion uses
-                    // a separate evaluated copy and its own retained lease.
-                    _ = try saveMemory(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace,
-                        state: restored, model: model, checkCancellation: checkCancellation, observer: nil)
-                    diskHits += 1; restoredHits += 1; f.resolved = true
-                    if match.prefixTokenCount == f.tokens.count { releaseFlight(key: f.key, identity: f.identity) }
-                    return .init(state: restored, source: "disk", lookupSeconds: 0, restoreSeconds: elapsed(started))
+                    let state = try restoring {
+                        let copy = try model.privatePrefixStateCopy(match.value.state)
+                        try checkCancellation()
+                        return copy
+                    }
+                    _ = index.lookup(tokens: f.tokens, namespace: f.namespace)
+                    restoredHits += 1
+                    return resolved(state, source: "memory")
                 } catch {
                     try recoverOptionalFailure(model: model, error: error)
-                    _ = disk?.invalidateAsync(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
-                    restoreFailures += 1
+                    index.remove(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
+                    restoreFailures += 1; releaseProducer(f)
+                    continue
                 }
             }
-            diskFallbacks += 1; f.resolved = true
-            return .init(state: nil, source: "cold", lookupSeconds: 0, restoreSeconds: elapsed(started))
+            if memoryDepth > 0 { releaseProducer(f); continue }
+            _ = index.lookup(tokens: f.tokens, namespace: f.namespace, touch: false)
+            return resolved(nil, source: "cold")
         }
-        if let owner = flights[f.key], owner != f.identity {
-            // Complete-stage calls retain the inference gate and cannot wait
-            // for an externally paused producer. Their safe fallback is cold.
-            if !f.allowWaitingForLeader {
-                f.resolved = true
-                return .init(state: nil, source: "cold", lookupSeconds: elapsed(started), restoreSeconds: 0)
-            }
-            if !f.waiting { flightWaits += 1; f.waiting = true }
-            return nil
-        }
-        if let publication = publications[f.key] {
-            if publication.isComplete { publications.removeValue(forKey: f.key) }
-            else if f.allowWaitingForLeader,
-                    index.peek(tokens: f.tokens, namespace: f.namespace)?.prefixTokenCount != f.tokens.count {
-                if let waitStart = f.publicationWaitStartedAt, elapsed(waitStart) >= diskRestoreTimeoutSeconds {
-                    // A stalled write must not hold all prefill slots forever.
-                    // Keep the publication and its workspace alive; this request
-                    // becomes the sole cold producer using its existing lease.
-                    f.resolved = true; f.leader = true; flights[f.key] = f.identity
-                    diskPublicationTimeouts += 1; diskFallbacks += 1
-                    return .init(state: nil, source: "cold", lookupSeconds: elapsed(started), restoreSeconds: 0)
-                }
-                if f.publicationWaitStartedAt == nil { f.publicationWaitStartedAt = DispatchTime.now().uptimeNanoseconds }
-                if !f.waiting { flightWaits += 1; f.waiting = true }
-                return nil
-            }
-        }
-        if let match = memoryMatch(f) {
-            let lookup = elapsed(started), restoreStart = DispatchTime.now().uptimeNanoseconds
-            do {
-                let restored = try model.privatePrefixStateCopy(match.value.state)
-                try checkCancellation()
-                restoredHits += 1; f.resolved = true
-                // A shorter hit still leads creation of the requested boundary.
-                if match.prefixTokenCount < f.tokens.count { f.leader = true; flights[f.key] = f.identity }
-                return .init(state: restored, source: "memory", lookupSeconds: lookup, restoreSeconds: elapsed(restoreStart))
-            } catch {
-                try recoverOptionalFailure(model: model, error: error)
-                index.remove(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
-                restoreFailures += 1
-            }
-        }
-        f.leader = true; flights[f.key] = f.identity
-        if let disk, let summary = disk.peek(tokens: f.tokens, namespace: f.namespace),
-           summary.metadataBytes >= 0, summary.payloadBytes <= (Int.max - summary.metadataBytes) / 2,
-           let lease = reserve(bytes: summary.payloadBytes * 2 + summary.metadataBytes, kind: .workspace, model: model) {
-            let read = QwenPrefixDiskRead(lease: lease)
-            if disk.lookupAsync(tokens: f.tokens, namespace: f.namespace, completion: { read.complete($0) }) {
-                f.read = read
-                return nil
-            }
-            lease.release(); diskFallbacks += 1
-        }
-        f.resolved = true
-        return .init(state: nil, source: "cold", lookupSeconds: elapsed(started), restoreSeconds: 0)
     }
 
     private func saveMemory(tokens: [Int32], namespace: String, state: QwenModel.State, model: QwenModel,
+                            retainingSystemPrefix: Int?,
                             checkCancellation: () throws -> Void,
                             observer: ((String, QwenModel.State) throws -> Void)?) throws -> Bool {
         guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return false }
@@ -302,6 +463,20 @@ final class QwenPrefixCache {
         }
         let bytes = try model.prefixStatePayloadBytes(state)
         guard bytes <= index.maxBytes, tokens.count <= index.maxKeyTokens else { skippedOversize += 1; return false }
+        var retainedPrefix = retainingSystemPrefix
+        if let boundary = retainedPrefix, boundary < tokens.count,
+           let anchor = index.peek(tokens: tokens, namespace: namespace, maxPrefixTokens: boundary),
+           anchor.prefixTokenCount == boundary,
+           let ttlSeconds, Date().timeIntervalSince1970 - anchor.value.createdAt >= ttlSeconds {
+            index.remove(tokens: Array(tokens.prefix(boundary)), namespace: namespace)
+            expired += 1; retainedPrefix = nil
+        }
+        if let boundary = retainedPrefix,
+           !index.canInsertAlongsidePrefix(tokens: tokens, namespace: namespace,
+                                           logicalPayloadBytes: bytes, prefixTokenCount: boundary) {
+            retainedSystemAnchorSkips += 1
+            return false
+        }
         guard let lease = reserve(bytes: bytes, kind: .cache, model: model) else { return false }
         let saved: QwenModel.State
         do { saved = try model.privatePrefixStateCopy(state) }
@@ -310,24 +485,37 @@ final class QwenPrefixCache {
         try checkCancellation()
         guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return false }
         let inserted = index.insert(tokens: tokens, namespace: namespace,
-            value: Snapshot(state: saved, lease: lease, createdAt: Date().timeIntervalSince1970), logicalPayloadBytes: bytes)
+            value: Snapshot(state: saved, lease: lease, createdAt: Date().timeIntervalSince1970),
+            logicalPayloadBytes: bytes, retainingPrefixTokens: retainedPrefix)
         if inserted { published += 1 }
         return inserted
     }
-    func publish(_ f: QwenPrefixCacheFlight, state: QwenModel.State, model: QwenModel,
+    func publish(_ f: QwenPrefixCacheFlight, at boundary: Int, state: QwenModel.State, model: QwenModel,
                  checkCancellation: () throws -> Void,
                  observer: ((String, QwenModel.State) throws -> Void)?) throws {
-        defer { releaseFlight(key: f.key, identity: f.identity) }
+        // Only this exact checkpoint's computation ownership is released.
+        // Retain the request context for the next publication opportunity.
+        defer {
+            releaseProducer(f, at: boundary)
+            if current(f) { _ = prepareProducer(f, after: boundary, mayWait: false) }
+        }
         guard current(f) else { return }
+        guard let checkpoint = f.checkpoints.first(where: { $0.boundary == boundary }),
+              state.offset == boundary, boundary > 0, boundary <= f.tokens.count,
+              boundary % f.prefillChunk == 0 else {
+            throw QwenGenerationError.unavailable("prefix publication does not match a complete planned checkpoint")
+        }
+        let tokens = Array(f.tokens.prefix(boundary)), key = checkpoint.key
         guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
-        _ = try saveMemory(tokens: f.tokens, namespace: f.namespace, state: state, model: model,
+        _ = try saveMemory(tokens: tokens, namespace: f.namespace, state: state, model: model,
+            retainingSystemPrefix: f.systemProducerBoundary,
             checkCancellation: checkCancellation, observer: observer)
-        guard let disk, disk.peek(tokens: f.tokens, namespace: f.namespace)?.prefixTokenCount != f.tokens.count,
+        guard let disk, disk.peek(tokens: tokens, namespace: f.namespace)?.prefixTokenCount != tokens.count,
               memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
         // A waiter may have timed out and recomputed while this key's original
         // write is still in progress. Retain its ownership; never enqueue a
         // second full archive or replace the pending publication record.
-        if let pending = publications[f.key], !pending.isComplete { duplicateSkipped += 1; return }
+        if let pending = publications[key], !pending.isComplete { duplicateSkipped += 1; return }
         let bytes = try model.prefixStatePayloadBytes(state)
         guard bytes <= disk.limits.maxPendingBytes, bytes <= (Int.max - QwenPrefixStateArchiveDescriptor.maximumMetadataBytes) / 2,
               let lease = reserve(bytes: bytes * 2 + QwenPrefixStateArchiveDescriptor.maximumMetadataBytes, kind: .workspace, model: model) else { return }
@@ -341,14 +529,14 @@ final class QwenPrefixCache {
             guard current(f), memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
             let publication = QwenPrefixDiskPublication()
             publications = publications.filter { !$0.value.isComplete }
-            if disk.enqueue(tokens: f.tokens, namespace: f.namespace, metadata: archive.metadata,
+            if disk.enqueue(tokens: tokens, namespace: f.namespace, metadata: archive.metadata,
                 payload: archive.payload, completion: { [lease] _ in
                     // The store and callback each retain this completion.
                     // Release by final ownership, not by callback timing.
                     defer { withExtendedLifetime(lease) {} }
                     publication.finish()
                 }) {
-                publications[f.key] = publication
+                publications[key] = publication
             } else { lease.release() }
         } catch {
             lease.release()
@@ -358,7 +546,42 @@ final class QwenPrefixCache {
     }
 }
 
+struct QwenPrefixCachePolicy: Equatable {
+    let lookupMaximum: Int
+    let publicationBoundaries: [Int]
+    let systemProducerBoundary: Int?
+}
+
 extension QwenGenerationRequest {
+    /// Independently CPU-testable; the full request validator calls this too.
+    func validatePrefixCachePolicy() throws {
+        if prefixCachePlan != nil && prefixCacheMaxTokens != nil {
+            throw QwenGenerationError.invalidRequest("prefixCachePlan and prefixCacheMaxTokens are mutually exclusive")
+        }
+        if let prefixCacheMaxTokens, !(0..<tokens.count).contains(prefixCacheMaxTokens) {
+            throw QwenGenerationError.invalidRequest("prefixCacheMaxTokens must be nonnegative and shorter than the prompt")
+        }
+        if let plan = prefixCachePlan {
+            guard plan.promptTokenCount == tokens.count else {
+                throw QwenGenerationError.invalidRequest("prefixCachePlan promptTokenCount differs from the complete prompt")
+            }
+            guard plan.prefillChunk == prefillChunk else {
+                throw QwenGenerationError.invalidRequest("prefixCachePlan prefillChunk differs from the execution grid")
+            }
+        }
+    }
+    var prefixCachePolicy: QwenPrefixCachePolicy? {
+        guard mtpDepth == 0, tokens.count > 1, prefillChunk > 0 else { return nil }
+        if let plan = prefixCachePlan {
+            guard !plan.publicationTokenCounts.isEmpty else { return nil }
+            return .init(lookupMaximum: plan.lookupMaxTokens,
+                publicationBoundaries: plan.publicationTokenCounts,
+                systemProducerBoundary: plan.systemProducerTokenCount)
+        }
+        let boundary = prefixCacheBoundary
+        guard boundary > 0 else { return nil }
+        return .init(lookupMaximum: boundary, publicationBoundaries: [boundary], systemProducerBoundary: boundary)
+    }
     /// Preserve the exact original chunk schedule; never synthesize a state
     /// at an internal radix node or prefill the final prompt token from cache.
     var prefixCacheBoundary: Int {

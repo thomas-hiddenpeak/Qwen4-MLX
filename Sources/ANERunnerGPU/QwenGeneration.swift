@@ -42,6 +42,9 @@ public struct QwenGenerationRequest: Sendable {
     /// Trusted reusable prefix of the complete encoded prompt. Nil/zero opts
     /// out; the runtime rounds down to an original prefill chunk boundary.
     public let prefixCacheMaxTokens: Int?
+    /// Complete-conversation lookup with bounded original-grid checkpoints.
+    /// Mutually exclusive with the legacy prefixCacheMaxTokens hint.
+    public let prefixCachePlan: QwenConversationPrefixPlan?
 
     public init(tokens: [Int32], maxTokens: Int = 128, contextLimit: Int = 16_384,
                 prefillChunk: Int = 416, mtpDepth: Int = 0,
@@ -50,7 +53,8 @@ public struct QwenGenerationRequest: Sendable {
                 decodeMode: GPUDecodeMode = .reference,
                 prefillAttention: GPUAttention.PrefillMode = .reference,
                 prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
-                prefixCacheMaxTokens: Int? = nil) {
+                prefixCacheMaxTokens: Int? = nil,
+                prefixCachePlan: QwenConversationPrefixPlan? = nil) {
         self.tokens = tokens; self.maxTokens = maxTokens
         self.contextLimit = contextLimit; self.prefillChunk = prefillChunk
         self.mtpDepth = mtpDepth; self.verification = verification
@@ -61,6 +65,7 @@ public struct QwenGenerationRequest: Sendable {
         self.prefillAttention = prefillAttention
         self.prefillMoEConfiguration = prefillMoEConfiguration
         self.prefixCacheMaxTokens = prefixCacheMaxTokens
+        self.prefixCachePlan = prefixCachePlan
     }
 
     public func validate(configuration: QwenConfiguration) throws {
@@ -75,9 +80,7 @@ public struct QwenGenerationRequest: Sendable {
             throw QwenGenerationError.invalidRequest("multimodal inputs are unsupported")
         }
         guard maxTokens > 0 else { throw QwenGenerationError.invalidRequest("maxTokens must be positive") }
-        if let prefixCacheMaxTokens, !(0..<tokens.count).contains(prefixCacheMaxTokens) {
-            throw QwenGenerationError.invalidRequest("prefixCacheMaxTokens must be nonnegative and shorter than the prompt")
-        }
+        try validatePrefixCachePolicy()
         guard contextLimit > 0, contextLimit <= configuration.maximumPositions else {
             throw QwenGenerationError.invalidRequest("contextLimit exceeds the model's supported range")
         }
@@ -220,16 +223,21 @@ public struct QwenPrefillStatistics: Codable, Sendable {
     /// Full prompt usage is unchanged; rates count only tokens actually computed.
     public var cachedTokenCount: Int? = nil
     public var computedTokenCount: Int? = nil
+    /// Trunk prefill positions actually forwarded, including any discarded work.
+    /// Nil in historical reports. The current cursor never discards prefix work.
+    public var actualForwardTokenCount: Int? = nil
+    /// Actual forward positions beyond the unique adopted computed prefix.
+    public var recomputedTokenCount: Int? = nil
     public var cacheLookupSeconds: Double? = nil
     public var cacheRestoreSeconds: Double? = nil
     public var cacheSaveSeconds: Double? = nil
     public var cacheSource: String? = nil
     public var cacheWaitSeconds: Double? = nil
     public var targetTokensPerSecond: Double? {
-        targetSeconds > 0 ? Double(computedTokenCount ?? promptTokenCount) / targetSeconds : nil
+        targetSeconds > 0 ? Double(actualForwardTokenCount ?? computedTokenCount ?? promptTokenCount) / targetSeconds : nil
     }
     public var readyTokensPerSecond: Double? {
-        totalSeconds > 0 ? Double(computedTokenCount ?? promptTokenCount) / totalSeconds : nil
+        totalSeconds > 0 ? Double(actualForwardTokenCount ?? computedTokenCount ?? promptTokenCount) / totalSeconds : nil
     }
 }
 
@@ -340,7 +348,8 @@ fileprivate final class QwenPrefillProgress {
     var prefetch: QwenModel.PrefillPrefetch?
     var offset = 0, chunks = 0, ssdBytes = 0
     var ssdWait = 0.0, targetSeconds = 0.0, activeSeconds = 0.0, suspensionSeconds = 0.0
-    var cacheBoundary = 0, cachedTokens = 0
+    var cacheBoundaries: [Int] = []
+    var cachedTokens = 0, actualForwardTokens = 0
     var cacheFlight: QwenPrefixCacheFlight?
     var cacheResolved = true
     var cacheSource = "cold"
@@ -424,6 +433,10 @@ public final class QwenGenerator {
     }
     public func closePrefixCache(drain: Bool = true) throws {
         try model.withExclusiveGeneration { prefixCache?.disk?.close(drain: drain) }
+    }
+    @discardableResult
+    public func closePrefixCache(drain: Bool = true, timeout: TimeInterval) throws -> QwenPrefixDiskCloseResult? {
+        try model.withExclusiveGeneration { prefixCache?.disk?.close(drain: drain, timeout: timeout) }
     }
     @discardableResult
     public func trimPrefixCacheMemory(maxEntries: Int = Int.max) throws -> Int {
@@ -625,9 +638,12 @@ public final class QwenGenerator {
             try cancellation?.check()
             let p = QwenPrefillProgress(state: model.makeState(), decoder: decoder,
                 requestLease: requestLease, preparationSeconds: preparationSeconds, now: now())
-            p.cacheBoundary = model.profiler.isRecording ? 0 : request.prefixCacheBoundary
-            if p.cacheBoundary > 0, let prefixCache {
-                p.cacheFlight = prefixCache.begin(request, maximum: p.cacheBoundary, model: model,
+            let policy = model.profiler.isRecording ? nil : request.prefixCachePolicy
+            // Keep diagnostic coldBoundary callbacks even without a cache
+            // instance, so the independent cold oracle sees the same grid.
+            p.cacheBoundaries = policy?.publicationBoundaries ?? []
+            if let policy, let prefixCache {
+                p.cacheFlight = prefixCache.begin(request, policy: policy, model: model,
                     allowWaitingForLeader: allowPrefixWait)
                 p.cacheResolved = false
                 beganDeviceWork = true
@@ -703,6 +719,7 @@ public final class QwenGenerator {
             try checkCancellation(session.cancellation, cancellation)
             try p.decoder?.consumePrompt(stream: out.stream, prompt: request.tokens, offset: p.offset)
             p.ssdWait += out.ssdWaitSeconds; p.ssdBytes += out.ssdLogicalBytes
+            p.actualForwardTokens += end - p.offset
             p.offset = end; p.chunks += 1
             session.recordProcessed(end)
             // Preserve the request-local pending PreparedInput and its already
@@ -713,7 +730,7 @@ public final class QwenGenerator {
             if end == request.tokens.count {
                 try p.decoder?.finishPrompt(expectedTokenCount: request.tokens.count)
             }
-            if end == p.cacheBoundary {
+            if p.cacheBoundaries.contains(end) {
                 // Complete SSD lookahead before publishing. It belongs to the
                 // active cursor and is never part of the shared snapshot.
                 p.prefetch?.finish()
@@ -721,7 +738,7 @@ public final class QwenGenerator {
                 try prefixStateObserver?("coldBoundary", p.state)
                 if let prefixCache, let flight = p.cacheFlight {
                     let saveStart = now()
-                    try prefixCache.publish(flight,
+                    try prefixCache.publish(flight, at: end,
                         state: p.state, model: model,
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) },
                         observer: prefixStateObserver)
@@ -738,7 +755,9 @@ public final class QwenGenerator {
                 evaluateEveryLayers: request.prefillEvaluateEveryLayers)
             stats.suspensionSeconds = p.suspensionSeconds
             stats.attentionMode = request.prefillAttention.rawValue
-            if request.prefixCacheMaxTokens != nil {
+            stats.actualForwardTokenCount = p.actualForwardTokens
+            stats.recomputedTokenCount = max(0, p.actualForwardTokens - (request.tokens.count - p.cachedTokens))
+            if request.prefixCacheMaxTokens != nil || request.prefixCachePlan != nil {
                 stats.cachedTokenCount = p.cachedTokens
                 stats.computedTokenCount = request.tokens.count - p.cachedTokens
                 stats.cacheLookupSeconds = p.cacheLookupSeconds
@@ -776,6 +795,7 @@ public final class QwenGenerator {
                     ssdLogicalBytes: stats.ssdLogicalBytes, evaluateEveryLayers: stats.evaluateEveryLayers,
                     attentionMode: stats.attentionMode, suspensionSeconds: 0,
                     cachedTokenCount: stats.cachedTokenCount, computedTokenCount: stats.computedTokenCount,
+                    actualForwardTokenCount: stats.actualForwardTokenCount, recomputedTokenCount: stats.recomputedTokenCount,
                     cacheLookupSeconds: stats.cacheLookupSeconds, cacheRestoreSeconds: stats.cacheRestoreSeconds,
                     cacheSaveSeconds: stats.cacheSaveSeconds, cacheSource: stats.cacheSource, cacheWaitSeconds: stats.cacheWaitSeconds)
                 let payload = try result.payload.take()

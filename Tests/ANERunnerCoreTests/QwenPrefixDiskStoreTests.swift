@@ -86,6 +86,13 @@ final class QwenPrefixDiskStoreTests: XCTestCase {
             }
         }
     }
+    private final class CallbackPause: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        func hold() -> Bool {
+            entered.signal()
+            return resume.wait(timeout: .now() + 10) == .success
+        }
+    }
     private func directory() throws -> URL {
         // Foundation resolvingSymlinksInPath canonicalizes /private/var back
         // to the /var alias on macOS. Use the POSIX path without resolving it
@@ -867,6 +874,169 @@ final class QwenPrefixDiskStoreTests: XCTestCase {
         let reopened = try store(dir)
         XCTAssertEqual(reopened.statistics.recoveredEntries, 0)
         XCTAssertNil(lookup(reopened, [1], namespace: "a"))
+    }
+
+    func testBoundedCloseCompletesAdmittedWriteAndCallbacksAndCanBePolledAgain() throws {
+        let dir = try directory(), cache = try store(dir), box = CompletionBox()
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                    completion: { box.append($0) }))
+        let result = cache.close(drain: true, timeout: 3)
+        XCTAssertTrue(result.completed)
+        XCTAssertTrue(result.ioCompleted)
+        XCTAssertTrue(result.callbacksCompleted)
+        XCTAssertEqual(box.read(), [true])
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        XCTAssertTrue(cache.close(drain: true, timeout: 0).completed)
+        XCTAssertTrue(cache.close(drain: true, timeout: .greatestFiniteMagnitude).completed)
+        XCTAssertTrue(cache.close(drain: false, timeout: 0).completed)
+        XCTAssertFalse(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2])))
+        let reopened = try store(dir)
+        XCTAssertEqual(lookup(reopened, [1], namespace: "a")?.payload, Data([1]))
+    }
+
+    func testBoundedCloseDuringIORetainsLeaseAndFDThenAllowsCancellationAndRetry() throws {
+        let dir = try directory(), gate = PublicationSyncProbe(), box = CompletionBox()
+        let budget = try QwenStateBudget(maxBytes: 128)
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); cache.close() }
+        weak var weakLease: QwenStateBudget.Lease?
+        gate.blockNext()
+        do {
+            let lease = try XCTUnwrap(budget.reserve(bytes: 64, kind: .workspace))
+            weakLease = lease
+            XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data([1]),
+                                        payload: Data(repeating: 2, count: 32), completion: { [lease] success in
+                defer { withExtendedLifetime(lease) {} }
+                box.append(success)
+            }))
+        }
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        let started = DispatchTime.now().uptimeNanoseconds
+        let first = cache.close(drain: true, timeout: 0.02)
+        XCTAssertLessThan(Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9, 1)
+        XCTAssertFalse(first.completed)
+        XCTAssertFalse(first.ioCompleted)
+        XCTAssertFalse(first.callbacksCompleted)
+        XCTAssertEqual(cache.statistics.pendingJobs, 1)
+        XCTAssertEqual(cache.statistics.pendingBytes, 33)
+        XCTAssertEqual(budget.statistics.workspaceBytes, 64)
+        XCTAssertNotNil(weakLease)
+        XCTAssertTrue(box.read().isEmpty)
+        XCTAssertFalse(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2])))
+        XCTAssertThrowsError(try QwenPrefixDiskStore(directory: dir, limits: limits())) {
+            XCTAssertEqual($0 as? QwenPrefixDiskStore.StoreError, .directoryInUse)
+        }
+        // A later non-draining close can cancel an earlier draining close;
+        // another draining waiter must not revive the invalidated epoch.
+        XCTAssertFalse(cache.close(drain: false, timeout: 0).completed)
+        XCTAssertFalse(cache.close(drain: true, timeout: 0).completed)
+        XCTAssertEqual(cache.statistics.pendingJobs, 1)
+        XCTAssertEqual(budget.statistics.workspaceBytes, 64)
+        gate.resume.signal()
+        XCTAssertTrue(cache.close(drain: true, timeout: 3).completed)
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        XCTAssertEqual(budget.statistics.workspaceBytes, 0)
+        XCTAssertNil(weakLease)
+        let reopened = try store(dir)
+        XCTAssertEqual(reopened.statistics.recoveredEntries, 0)
+        XCTAssertNil(lookup(reopened, [1], namespace: "a"))
+    }
+
+    func testBoundedCloseWaitsForReadCallbackOwnerAfterDirectoryHasClosed() throws {
+        let dir = try directory(), cache = try store(dir), pause = CallbackPause(), box = CompletionBox()
+        let budget = try QwenStateBudget(maxBytes: 128)
+        defer { pause.resume.signal(); cache.close() }
+        put(cache, [1], namespace: "a", byte: 9)
+        weak var weakLease: QwenStateBudget.Lease?
+        do {
+            let lease = try XCTUnwrap(budget.reserve(bytes: 64, kind: .workspace))
+            weakLease = lease
+            XCTAssertTrue(cache.lookupAsync(tokens: [1], namespace: "a", completion: { [lease] match in
+                defer { withExtendedLifetime((lease, match)) {} }
+                box.append(pause.hold() && match?.payload == Data(repeating: 9, count: 200))
+            }))
+        }
+        XCTAssertEqual(pause.entered.wait(timeout: .now() + 3), .success)
+        let first = cache.close(drain: true, timeout: 0.02)
+        XCTAssertTrue(first.ioCompleted)
+        XCTAssertFalse(first.callbacksCompleted)
+        XCTAssertFalse(first.completed)
+        XCTAssertEqual(cache.statistics.pendingJobs, 1)
+        XCTAssertEqual(cache.statistics.pendingBytes, cache.limits.maxPendingBytes)
+        XCTAssertEqual(budget.statistics.workspaceBytes, 64)
+        XCTAssertNotNil(weakLease)
+        // Invalid durations are immediate polls, never unbounded waits.
+        let started = DispatchTime.now().uptimeNanoseconds
+        for timeout in [0, -1, TimeInterval.nan, TimeInterval.infinity, -TimeInterval.infinity] {
+            let retry = cache.close(drain: true, timeout: timeout)
+            XCTAssertTrue(retry.ioCompleted)
+            XCTAssertFalse(retry.callbacksCompleted)
+        }
+        XCTAssertLessThan(Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9, 1)
+        // Descriptor ownership may end before the independent callback's Data
+        // ownership. A new store can acquire the directory without stealing it.
+        let reopened = try store(dir)
+        XCTAssertNotNil(lookup(reopened, [1], namespace: "a"))
+        pause.resume.signal()
+        XCTAssertTrue(cache.close(drain: true, timeout: 3).completed)
+        XCTAssertEqual(box.read(), [true])
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        XCTAssertEqual(budget.statistics.workspaceBytes, 0)
+        XCTAssertNil(weakLease)
+    }
+
+    func testBoundedCloseSharesOneDeadlineAcrossIOAndCallbackWaits() throws {
+        let gate = PublicationSyncProbe(), pause = CallbackPause()
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); pause.resume.signal(); cache.close() }
+        gate.blockNext()
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                    completion: { _ in _ = pause.hold() }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { gate.resume.signal() }
+        let started = DispatchTime.now().uptimeNanoseconds
+        let result = cache.close(drain: true, timeout: 0.4)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
+        XCTAssertTrue(result.ioCompleted)
+        XCTAssertFalse(result.callbacksCompleted)
+        XCTAssertFalse(result.completed)
+        XCTAssertLessThan(elapsed, 0.6,
+                          "callback waiting must consume the remaining deadline, not a fresh 0.4 seconds")
+        XCTAssertEqual(pause.entered.wait(timeout: .now() + 1), .success)
+        pause.resume.signal()
+        XCTAssertTrue(cache.close(drain: true, timeout: 3).completed)
+    }
+
+    func testBoundedCloseKeepsLastStoreOwnerAliveUntilLateIOAndCallbacksFinish() throws {
+        let dir = try directory(), gate = PublicationSyncProbe(), box = CompletionBox()
+        var cache: QwenPrefixDiskStore? = try QwenPrefixDiskStore(directory: dir, limits: limits(),
+                                                                 publicationDirectorySync: { try gate.sync($0) })
+        weak var retained = cache
+        defer { gate.resume.signal(); cache?.close() }
+        gate.blockNext()
+        XCTAssertTrue(cache!.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                     completion: { box.append($0) }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        XCTAssertFalse(cache!.close(drain: true, timeout: 0).completed)
+        cache = nil
+        XCTAssertNotNil(retained, "the IO closure owns the store after the caller stops waiting")
+        XCTAssertThrowsError(try QwenPrefixDiskStore(directory: dir, limits: limits())) {
+            XCTAssertEqual($0 as? QwenPrefixDiskStore.StoreError, .directoryInUse)
+        }
+        gate.resume.signal()
+        let deadline = Date().addingTimeInterval(3)
+        while retained != nil, Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        XCTAssertNil(retained)
+        XCTAssertEqual(box.read(), [true])
+        let reopened = try store(dir)
+        XCTAssertEqual(reopened.statistics.recoveredEntries, 1)
+        XCTAssertEqual(lookup(reopened, [1], namespace: "a")?.payload, Data([1]))
     }
 
 }

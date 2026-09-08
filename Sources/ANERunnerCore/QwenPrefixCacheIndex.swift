@@ -26,6 +26,12 @@ public struct QwenPrefixCacheStatistics: Codable, Equatable, Sendable {
     public var flightWaits: Int = 0
     public var liveFlights: Int = 0
     public var expired: Int = 0
+    /// Optional RAM tail/promotion skipped to keep an existing same-path system
+    /// anchor when both cannot fit. Nil in historical serialized statistics.
+    public var retainedSystemAnchorSkips: Int? = nil
+    /// Requests that waited for an independently owned identical SSD read.
+    /// A later read may still be needed if RAM promotion was not admitted.
+    public var restoreWaits: Int? = nil
 }
 
 /// A strong reference to a saved value at an exact, complete token boundary.
@@ -123,20 +129,31 @@ public final class QwenPrefixCacheIndex<Value> {
     /// replacement releases the old value and charges only the replacement.
     /// Capacity pressure evicts the least recently used entries globally,
     /// across namespaces. A replacement itself is not counted as an eviction.
+    /// An optional exact ancestor is preserved for this insertion only. If the
+    /// pair cannot coexist, reject before mutation; explicit eviction, clear,
+    /// and the caller's workspace admission can still remove that ancestor.
     @discardableResult
     public func insert(tokens: [Int32], namespace: String, value: Value,
-                       logicalPayloadBytes: Int) -> Bool {
+                       logicalPayloadBytes: Int, retainingPrefixTokens: Int? = nil) -> Bool {
         guard !tokens.isEmpty, logicalPayloadBytes >= 0,
               logicalPayloadBytes <= maxBytes, tokens.count <= maxKeyTokens else {
             return false
         }
+        let retained = retainingPrefixTokens.flatMap { count -> Entry? in
+            guard count > 0, count < tokens.count else { return nil }
+            return exactEntry(tokens: Array(tokens.prefix(count)), namespace: namespace)
+        }
+        if let retained, !canCoexist(tokens: tokens.count, bytes: logicalPayloadBytes, with: retained) { return false }
         if let existing = exactEntry(tokens: tokens, namespace: namespace) {
             removeEntry(existing)
         }
         // Subtraction avoids overflow even when callers configure Int.max.
         while entryCount >= maxEntries || logicalPayloadBytes > maxBytes - payloadBytes ||
                 tokens.count > maxKeyTokens - tokenCount {
-            guard let victim = oldest else { preconditionFailure("prefix cache accounting mismatch") }
+            guard let first = oldest,
+                  let victim = first === retained ? first.next : first else {
+                preconditionFailure("prefix cache accounting mismatch")
+            }
             removeEntry(victim)
             evictions += 1
         }
@@ -146,6 +163,21 @@ public final class QwenPrefixCacheIndex<Value> {
         appendNewest(entry)
         entryCount += 1; payloadBytes += logicalPayloadBytes; tokenCount += tokens.count
         return true
+    }
+
+    /// Check before allocating a copy for an optional insertion. The ancestor
+    /// must be an exact checkpoint, not an internal radix branching node.
+    public func canInsertAlongsidePrefix(tokens: [Int32], namespace: String,
+                                        logicalPayloadBytes: Int, prefixTokenCount: Int) -> Bool {
+        guard !tokens.isEmpty, logicalPayloadBytes >= 0, logicalPayloadBytes <= maxBytes,
+              tokens.count <= maxKeyTokens else { return false }
+        guard prefixTokenCount > 0, prefixTokenCount < tokens.count,
+              let retained = exactEntry(tokens: Array(tokens.prefix(prefixTokenCount)), namespace: namespace) else { return true }
+        return canCoexist(tokens: tokens.count, bytes: logicalPayloadBytes, with: retained)
+    }
+
+    private func canCoexist(tokens: Int, bytes: Int, with retained: Entry) -> Bool {
+        maxEntries >= 2 && bytes <= maxBytes - retained.bytes && tokens <= maxKeyTokens - retained.tokens.count
     }
 
     /// Finds the longest inserted prefix no longer than maxPrefixTokens.

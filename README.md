@@ -34,8 +34,8 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -
 | 调度 | prefill / decode独立接口与单次状态交接；库默认 `wholeStages`，HTTP使用 `cooperative`，decodeBurst保持4；同一推理执行器串行计算 |
 | 有界资源 | HTTP连接、排队、输出和日志有额度；request/cache/workspace 联合状态预留、取消及终态清理已实现；接入macOS压力通知与恢复滞回，逻辑额度不等于物理内存硬上限 |
 | 默认关闭的候选 | MTP、expert32/down、融合归约、QSA prefill融合、blocked GDN、async8与额外decode投影融合；各自按配置选择，未因主线整合改成默认 |
-| 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；自动复用系统提示词/工具定义；库默认关闭，显式MTP保持冷prefill |
-| SSD 状态缓存 | 显式开启的有界持久化层，完整混合状态归档、异步恢复/写入、校验及重启恢复、可用空间水位及请求等待期限；与 n-gram SSD 读取分别管理 |
+| 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；自动复用完整会话/工具历史，有限保留共享系统与会话尾部检查点；库默认关闭，显式MTP保持冷prefill |
+| SSD 状态缓存 | 显式开启的有界持久化层，完整混合状态归档、异步恢复/写入、校验及重启恢复、可用空间水位、请求等待期限及有界关闭等待；与 n-gram SSD 读取分别管理 |
 | 工具调用 | function tools、auto/none、非流式/SSE调用及工具结果续答；客户端执行工具 |
 | 尚未实现 | 完整会话历史自动复用、物理 KV 页共享、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
 
@@ -53,7 +53,9 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 
 这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文固定16384；AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
 
-系统提示词与工具定义自动参与[完整前缀缓存](docs/AR_PREFIX_CACHE.md)，命中时返回 `usage.prompt_tokens_details.cached_tokens`，`/health`提供容量及命中/淘汰统计。可用 `--prefix-cache-bytes 0` 关闭。可选 `--prefix-cache-directory` 启用有界持久化 SSD，`--state-budget-bytes` 配置 request/cache/workspace 的联合逻辑额度，详见[使用合同](docs/KV_CACHE_RELIABILITY.md)。历史实测11k输入复用9984 token后，单窗口TTFT从约21–25秒降至约2.6秒；这表示减少重复prefill，不是基础decode吞吐提升。
+完整请求经模板渲染后一次分词，系统、工具定义与 user/assistant/tool 历史均参与[准确前缀复用](docs/research/KV_CONVERSATION_VALIDATION.md)。检查点沿用416-token计算网格，每个请求最多发布系统与尾部两个检查点；编辑历史或分叉只恢复实际一致的完整状态。默认512 MiB放不下两份长状态时保留共享系统锚点，尾部可写入显式开启的SSD层。命中返回 `usage.prompt_tokens_details.cached_tokens`；`/health`提供详细统计，`GET /metrics`提供无请求标签的Prometheus文本指标。
+
+可用 `--prefix-cache-bytes 0` 关闭缓存，`--prefix-cache-directory` 启用持久化SSD，`--state-budget-bytes` 配置request/cache/workspace联合逻辑额度，`--prefix-cache-shutdown-timeout-seconds` 设置SSD关闭等待期限（默认30秒）。该期限约束SSD队列与回调排空，不能保证挂起的GPU或系统调用立即终止。实际范围和验证见[使用合同](docs/KV_CACHE_RELIABILITY.md)。缓存收益来自减少重复prefill；不代表基础decode吞吐提升。
 
 各轮验证版本、请求示例、限额与剩余边界见 [HTTP/SSE服务](docs/HTTP_SERVER_EXPERIMENT.md)和[输出边界](docs/HTTP_OUTPUT_BOUNDARIES.md)。发送期限、连接期限及长时间稳定性仍有未覆盖范围，不把有限回归表述为生产验收完成。
 

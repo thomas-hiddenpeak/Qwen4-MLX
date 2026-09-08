@@ -1,14 +1,16 @@
 # 自主研究与开发接续
 
-## 2026-09-09 八小时自主窗口：KV 管理批次 A 开发中
+## 2026-09-09 八小时自主窗口：KV 管理批次 B 已验证，准备持续淘汰
 
-用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `002d68d`，根代理唯一 build/GPU/Git owner，MTP 性能后置。
+用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `d449ad0`，根代理唯一 build/GPU/Git owner，MTP 性能后置。
 
 K02 tokenizer计划接口已提交推送 `30c847b`（7项CPU通过），完整会话运行时尚未接线。批次A的最终54项相关CPU检查和release61.96秒构建通过，`results/kv-night-a2/` pressure89checks、timeouts50checks、44成功HTTP+4日志确认取消均通过。实模20请求/229IDs、独立跨状态23组/2567张量及host状态；HTTP21次SSD恢复/7.70GB归档读回，无残留request/workspace/pending。二进制`fc02358d...38502e`，215文件/102模型stat postflight通过。详见可靠性记录，勿把注入pressure或70秒HTTP窗口说成真实物理压力/小时长稳。
 
 最新参考恢复ledger为 `results/kv-night-a2/run-ledger.json`，PID52289、精确argv、idle、MTP/drafter关闭已独立复核；无GPU实验，冻结解除。a1失败因短fixture合法3-token EOS被错误的maxTokens==16假设拒绝，保留原始失败报告，a2已修正并通过。
 
-根侧正提交本批可靠性源码/测试/文档。下一步并行分工：K02完整lookup/系统producer/双checkpoint发布与有效token统计；有界close/drain，避免HTTP冗余无界flush/close抵消deadline。之后真实多轮工具/分叉回归，再在小RAM/有限SSD上跑2小时多前缀churn。新churn脚本9项根侧CPU控制测试通过，尚无真实长窗。macOS `memory_pressure -S`不执行：为系统级purge/通知，异常退出不能保证复位；真实压力验收仍保留，依据已入research文档。不要重复开发已准备接口、另启GPU控制器或重用旧PID。
+批次A已提交并推送 `d449ad0`。批次B已验证：K02完整lookup/系统producer/双checkpoint、默认512MiB保留共享system策略及actualForward/recomputed统计；有限close/drain包括callback同一deadline，HTTP唯一关闭入口默认30秒；HTTP完整conversation接线与Prometheus /metrics。165项相关Swift CPU检查、release70.58秒通过，二进制`8b694fcd...57dc2`。B1原生conversation71checks/12对照生成/6冷参考/33状态事件全部通过，pressure89、timeouts50复测通过。B1 HTTP第二进程创建前端口bind失败，保留报告；B2仅将harness改为独立端口，全部9次会话/重启/低空间及36次mixed成功，4次metrics对账、45次完整usage/实际token守恒与3次RST唯一cancelled终态对账通过。B1的219、B2的222文件及各102payload postflight通过，冻结解除。最新参考56391、精确argv、idle、MTP/drafter关闭已复核，ledger为 `results/kv-night-b2/run-ledger.json`。root正阶段提交推送；后续先600秒churn预检，再7200秒窗口，1GiB SSD/160MiB RAM/8长前缀/2短前缀。wrapper仍由tiered agent在ignored目录修复，不要提前启动。
+
+新churn脚本9项根侧CPU控制测试通过，尚无真实长窗。macOS `memory_pressure -S`不执行：为系统级purge/通知，异常退出不能保证复位；真实压力验收仍保留，依据已入research文档。不要重复开发已准备接口、另启GPU控制器或重用旧PID。
 
 ## 2026-09-09 当前方向：KV cache 关键能力与开源设计吸收
 
