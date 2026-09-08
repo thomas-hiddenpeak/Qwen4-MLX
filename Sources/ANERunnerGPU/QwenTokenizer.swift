@@ -14,6 +14,47 @@ public struct ChatMessage: Codable {
     }
 }
 
+/// CPU-only candidates for the complete, already tokenized conversation.
+/// A candidate is not a cache hit or a reservation. Only the runtime can
+/// establish that a complete mixed-state checkpoint actually exists there.
+public struct QwenConversationPrefixPlan: Equatable, Sendable {
+    public let promptTokenCount: Int
+    public let prefillChunk: Int
+    /// Lookup may examine the entire prompt except its final logits token.
+    /// Existing checkpoints need not be this request's publication candidates.
+    public let lookupMaxTokens: Int
+    /// At most two original-grid boundaries: the system/tool anchor and the
+    /// prompt continuation point. These are optional publication opportunities.
+    public let publicationTokenCounts: [Int]
+    /// A shared producer uses namespace + these actual prefix token IDs,
+    /// independently of lookupMaxTokens or this request's differing tail.
+    /// Nil means no complete system/tool chunk is available for coalescing.
+    public let systemProducerTokenCount: Int?
+
+    public init(promptTokenCount: Int, exactSystemPrefixTokenCount: Int,
+                prefillChunk: Int = 416) throws {
+        guard promptTokenCount > 0,
+              (0...promptTokenCount).contains(exactSystemPrefixTokenCount),
+              (1...512).contains(prefillChunk) else {
+            throw QwenGenerationError.invalidRequest("Invalid conversation prefix boundaries")
+        }
+        self.promptTokenCount = promptTokenCount
+        self.prefillChunk = prefillChunk
+        lookupMaxTokens = promptTokenCount - 1
+        let anchor = min(exactSystemPrefixTokenCount, lookupMaxTokens) / prefillChunk * prefillChunk
+        let continuation = lookupMaxTokens / prefillChunk * prefillChunk
+        systemProducerTokenCount = anchor > 0 ? anchor : nil
+        publicationTokenCounts = Array(Set([anchor, continuation].filter { $0 > 0 })).sorted()
+    }
+}
+
+/// The authoritative full-request token sequence and its bounded cache plan.
+/// No tokens from independently encoded messages are appended to this array.
+public struct QwenTokenizedConversation: Sendable {
+    public let tokens: [Int32]
+    public let prefixPlan: QwenConversationPrefixPlan
+}
+
 /// Native byte-level BPE for the shipped Qwen tokenizer. No Python/runtime bridge.
 public final class QwenTokenizer {
     public enum Normalization {
@@ -237,6 +278,19 @@ public final class QwenTokenizer {
         guard !prefix.isEmpty else { return 0 }
         let encoded = try encode(prefix)
         return zip(encoded, fullTokens).prefix(while: { $0.0 == $0.1 }).count
+    }
+
+    /// Tokenize the complete rendered request once, then derive optional
+    /// original-chunk cache candidates. The independent system encoding is
+    /// used only to locate an exact common prefix, never to construct tokens.
+    /// The caller still applies cache enablement, AR-only and budget policies.
+    public func encodeConversation(messages: [ChatMessage], tools: [QwenToolDefinition] = [],
+                                   prefillChunk: Int = 416) throws -> QwenTokenizedConversation {
+        let tokens = try encode(renderChat(messages: messages, tools: tools))
+        let systemCount = try systemPrefixTokenCount(messages: messages, tools: tools, fullTokens: tokens)
+        let plan = try QwenConversationPrefixPlan(promptTokenCount: tokens.count,
+            exactSystemPrefixTokenCount: systemCount, prefillChunk: prefillChunk)
+        return QwenTokenizedConversation(tokens: tokens, prefixPlan: plan)
     }
 
     private func encodeOrdinary(_ input: String) throws -> [Int32] {
