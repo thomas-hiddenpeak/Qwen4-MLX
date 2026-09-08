@@ -4,7 +4,7 @@
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
-当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：AR工具服务、完整状态前缀复用及缓存额度/淘汰已完成本轮回归；后续推进SSD状态缓存，并分别优化prefill/decode基础路径。**MTP性能优化放到计划后段**，现有MTP保持显式选择、正确性和状态隔离要求不变。具体完成范围见[本轮验收](docs/AR_PREFIX_CACHE.md)。
+当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：AR工具服务、完整状态前缀复用及缓存额度/淘汰已完成本轮回归；当前集中完善[KV cache可靠性](docs/KV_CACHE_RELIABILITY.md)：联合状态额度、同前缀请求合并与可选持久化SSD层已接入；各项测试证据与发布边界分别记录。**MTP性能优化放到计划后段**，现有MTP保持显式选择、正确性和状态隔离要求不变。具体完成范围见[本轮验收](docs/AR_PREFIX_CACHE.md)。
 
 ## 构建与生成
 
@@ -52,7 +52,7 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 
 这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文固定16384；AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
 
-系统提示词与工具定义自动参与[完整前缀缓存](docs/AR_PREFIX_CACHE.md)，命中时返回 `usage.prompt_tokens_details.cached_tokens`，`/health`提供容量及命中/淘汰统计。可用 `--prefix-cache-bytes 0` 关闭。实测11k输入复用9984 token后，单窗口TTFT从约21–25秒降至约2.6秒；这表示减少重复prefill，不是基础decode吞吐提升。
+系统提示词与工具定义自动参与[完整前缀缓存](docs/AR_PREFIX_CACHE.md)，命中时返回 `usage.prompt_tokens_details.cached_tokens`，`/health`提供容量及命中/淘汰统计。可用 `--prefix-cache-bytes 0` 关闭。可选 `--prefix-cache-directory` 启用有界持久化 SSD，`--state-budget-bytes` 配置 request/cache/workspace 的联合逻辑额度，详见[使用合同](docs/KV_CACHE_RELIABILITY.md)。历史实测11k输入复用9984 token后，单窗口TTFT从约21–25秒降至约2.6秒；这表示减少重复prefill，不是基础decode吞吐提升。
 
 各轮验证版本、请求示例、限额与剩余边界见 [HTTP/SSE服务](docs/HTTP_SERVER_EXPERIMENT.md)和[输出边界](docs/HTTP_OUTPUT_BOUNDARIES.md)。发送期限、连接期限及长时间稳定性仍有未覆盖范围，不把有限回归表述为生产验收完成。
 

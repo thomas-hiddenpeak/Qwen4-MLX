@@ -1,6 +1,16 @@
 # 自主研究与开发接续
 
-## 2026-09-08 当前完成：AR 服务与前缀缓存
+## 2026-09-08 当前完成：KV cache 两层管理与可靠性回归
+
+继续按用户要求集中 KV cache，MTP 性能后置。联合 request/cache/workspace 额度、完整混合状态归档、可选持久化 SSD、异步读写/校验/TTL/LRU、同前缀等待合并、取消接管和 HTTP health/429 处理已接入。核心存储 `1c5e3aa` 与运行时集成 `d097657` 已分阶段推送。
+
+175 项 Swift CPU 与 7 项新增 Python parser 测试通过。完整状态/生命周期 27 请求、282 IDs，扣除自身 anchor 后为21组/2361条跨状态张量比较及对应host状态。服务长窗966.47秒：1004成功请求/8032 tokens、84次RST日志确认取消，正常重启与空闲SIGKILL重启均SSD命中且输出相同。另以160MiB RAM额度强制SSD：104成功请求/832 tokens、9次RST、51次SSD恢复/约18.7GB读回、25次同前缀等待合并，全部通过。详见[缓存可靠性](KV_CACHE_RELIABILITY.md)。
+
+当前是候选版本，不将约16分钟RAM窗口和约93秒SSD窗口称为小时/天级工业发布验收；下一重点是持续SSD、多前缀淘汰和实际系统内存压力。最终保留的cache leases是有效缓存，不是未释放请求；request/workspace及SSD pending均归零。新HTTP parser首轮误把冷miss缺省统计当失败，已修复并保留失败报告。
+
+最新参考恢复ledger：`results/cache-reliability-ssd-v1/run-ledger.json`，本次核对PID17735、原argv、MTP/drafter关闭且idle；252文件/102模型payload postflight通过，冻结解除。无在途GPU实验。heartbeat继续暂停，未改供电设置。接续先检查实际PID/命令，以下历史PID不再有效。
+
+## 2026-09-08 前一阶段：AR 服务与前缀缓存
 
 用户要求先处理计划前两项。本轮已完成完整混合状态快照/私有恢复、radix 最长前缀、LRU 和条目/字节/key token 额度，以及 HTTP function tools、调用历史、工具结果续答。HTTP 默认缓存512 MiB/8条，库需显式开启；MTP仍冷prefill。完整范围与原始结果见 [本轮验收](AR_PREFIX_CACHE.md)，尚未开始 SSD 状态卸载或 MTP 性能调优。
 
@@ -24,7 +34,7 @@
 - 用当前工作分支做阶段提交并推送，不强推、不替换已有历史。每次接续先看Git状态及本文件，接手已有工作，不重复开同一项。
 - 单个GPU实验所有者；研究与CPU工作可并行，模型加载及GPU测试串行。使用既有控制器核对参考服务身份和空闲请求，测试结束恢复原参数；不停止无关训练或其他项目。
 - Prefill/decode分别计时；普通AR与MTP分别比较。现有默认不因局部微测收益自动提升。先跑小数值门槛，再做真实11k完整生成；保存没有收益的结果。
-- MTP稳定性、取消、状态一致性和服务接口是缓存开发的前置条件。前缀缓存必须包含Attention KV、QSA、GDN、PLE/n-gram及MTP适用状态，不能仅缓存KV就宣布可复用。
+- 当前集中 AR 缓存管理：必须完整保存 Attention KV、QSA、GDN、PLE/n-gram。MTP 性能后置，MTP 专属缓存未支持，显式 MTP 继续冷路径；共享生命周期改动仍回归已有 MTP 正确性。
 - 优先采取局部可验证改动。引用原始项目文档、代码版本与许可；借鉴设计和复制实现分别说明。
 
 ## 当前状态
