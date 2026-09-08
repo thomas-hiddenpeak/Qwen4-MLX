@@ -47,6 +47,16 @@ final class QwenPrefixDiskRead: @unchecked Sendable {
                                 now: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Bool {
         now >= startedAt && Double(now - startedAt) * 1e-9 >= seconds
     }
+    /// Convert the already validated duration to the same attempt's absolute
+    /// uptime deadline. Round positive sub-nanosecond waits up; finite durations
+    /// beyond the representable clock saturate instead of trapping or wrapping.
+    static func waitDeadline(startedAt: UInt64, after seconds: TimeInterval) -> UInt64? {
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let nanoseconds = (seconds * 1_000_000_000).rounded(.up)
+        let remaining = UInt64.max - startedAt
+        guard nanoseconds < Double(remaining) else { return UInt64.max }
+        return startedAt + UInt64(nanoseconds)
+    }
     func take() -> QwenPrefixDiskMatch? {
         lock.lock(); defer { lock.unlock() }
         let result = value; value = nil
@@ -420,6 +430,10 @@ final class QwenPrefixCache {
 
             if useDisk, let summary, let disk {
                 if f.readWaitStartedAt == nil { f.readWaitStartedAt = DispatchTime.now().uptimeNanoseconds }
+                guard let readDeadline = QwenPrefixDiskRead.waitDeadline(startedAt: f.readWaitStartedAt!,
+                    after: diskRestoreTimeoutSeconds) else {
+                    throw QwenGenerationError.unavailable("Invalid SSD read admission deadline")
+                }
                 let checkpoint = QwenPrefixCheckpoint(tokens: f.tokens, namespace: f.namespace, boundary: depth)
                 if let pending = reads[checkpoint.key] {
                     if pending.isComplete { reads.removeValue(forKey: checkpoint.key) }
@@ -436,12 +450,14 @@ final class QwenPrefixCache {
                     }
                 }
                 if f.readAdmissionIntent == nil {
-                    switch disk.acquireReadIntent() {
+                    switch disk.acquireReadIntent(deadlineUptimeNanoseconds: readDeadline) {
                     case .acquired(let intent):
                         f.readAdmissionIntent = intent; readAdmissionIntents[f.identity] = intent
                     case .busy:
                         if f.allowWaitingForLeader { markWaiting(f); return nil }
                         f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
+                    case .expired:
+                        f.skipDisk = true; releaseProducer(f); diskReadTimeouts += 1; diskFallbacks += 1; continue
                     case .closed, .unavailable:
                         f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
                     }
@@ -457,6 +473,9 @@ final class QwenPrefixCache {
                     if f.allowWaitingForLeader { markWaiting(f); return nil }
                     releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
                 case .closed, .unavailable, .invalidated:
+                    // Only a deadline in the still-live store epoch is a
+                    // timeout. Clear/close and foreign invalidation are not.
+                    if intent.hasExpired { diskReadTimeouts += 1 }
                     releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
                 }
                 // A write admitted BEFORE this intent may have replaced the
@@ -506,6 +525,9 @@ final class QwenPrefixCache {
                     // No fence was installed and no callback accepted. Keep
                     // only the metadata intent, bounded by the same deadline.
                     markWaiting(f); return nil
+                }
+                if submitted == .invalidated, intent.hasExpired {
+                    diskReadTimeouts += 1
                 }
                 releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
                 continue

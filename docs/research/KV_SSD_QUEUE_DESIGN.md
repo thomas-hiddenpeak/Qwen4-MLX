@@ -112,7 +112,7 @@ C1 R3 的失败边界是探针把 `cacheWaitSeconds >= 5s` 当成总期限。报
 
 C2 使用 binary `4d728eb5d3bb7efdf6d35df11799da76bd02aa5a347297b273bcf92fb02d7bf4` 完成五 case 回归：准入58项、已接收IO超时51项、完整会话71项全部通过；45个HTTP成功请求和3个取消均与48条唯一模型终态独立对账。R3总解析5.001235秒，timeout增1、hit/read字节无增，旧写仍拥有pending。已接收IO超时场景实际完成342,798,336-byte归档读取。236文件/102模型stat postflight和参考恢复已核对，详见[可靠性记录](../KV_CACHE_RELIABILITY.md)。这仍不是物理慢盘或小时级竞争性能验收。
 
-后续隔离补丁：库调用方合法暂停waiting cursor时，当前GPU轮询期限不会自行解除Core优先权。拟在Core元数据准入操作中检查同一个绝对期限，只撤销未提交的优先权，保持已接收IO及cursor所有权；本节所列C2结果尚不包括该补丁。
+后续C3隔离补丁已完成：库调用方合法暂停waiting cursor时，store在enqueue/acquire/state/statistics访问中按同一个绝对期限撤销未提交的优先权。无timer/额外worker，不改变已接收IO、私有request lease或producer所有权；低层Core API省略deadline仍为手动释放合同。clear/close/存储不可用先于expiry分类，旧UUID不能撤销新owner。187项CPU（新增9项Core fake-clock、1项时间转换）、70项准入、51项已接收IO超时和36成功/3取消HTTP通过。R7游标不合作5.054100375秒，其他enqueue自行过期旧优先权并成功；旧cursor随后冷退、timeout+1、无读回且保留新owner。详见[可靠性C3记录](../KV_CACHE_RELIABILITY.md)。C2历史证据不重写为C3结果。
 
 ## 最小验收清单
 

@@ -4,6 +4,10 @@
 
 用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `0290767`已推送并核对远程SHA，根代理唯一 build/GPU/Git owner，MTP 性能后置。
 
+05:10 更新：C3三case全部通过，187相关CPU/70准入/51accepted-IO timeout；8+6完整生成128 IDs和12组独立状态一致，HTTP36成功288tokens+3取消=39唯一终态、阶段字段对账。R7暂停5.054100375秒的enqueue自主过期正确。239文件/102stat postflight、参考63602精确argv/idle/MTPdrafter关闭已复核，最新ledger=`results/kv-night-c3/run-ledger.json`，冻结解除。root正commit C3；下一步7200秒churn，拟把wrapper客户端在途prompt额度从30k增至40k容纳至少2长前缀，server4GiB/RAM160MiB/SSD1GiB不变，tiered在核对峰值后启动。不要另启GPU；Swift helper仅ignored准备。
+
+05:05 更新：C2的K04已推送并核对远程`2efb935`；native capacity机制五case通过，公共源码与结果另推`ba34964`。每种append模式17次=13复用/2增长/2COW，GQA同步/async各49case逐位通过，未接生产attention或声称吞吐收益。262文件/102stat postflight与参考62443恢复核对通过。随后metadata absolute expiry四文件+R7暂停实模probe集成，187项相关CPU通过、release66.42秒，binary=`78036ae4...cfac23`。当前唯一controller为`results/kv-night-c3/plan.json`，239文件/102stat冻结，admission8请求、timeouts及HTTP mixed端口11257依次运行；结束前不改Sources/Tests/scripts/native/binary。C3通过后commit，再启动7200秒churn；2h未开始。Swift容量helper/诊断桥继续仅在ignored候选准备。
+
 04:54 更新：C2全部五case通过，admission58、accepted-IO-timeout51、conversation71及HTTP45成功/3取消、48唯一终态对账；177项相关CPU与release47.05秒，binary `4d728eb5...d7bf4`。新计数/计时字段和44/45 metrics series对账通过。236文件/102模型stat postflight、参考PID61971精确argv/idle/MTPdrafter关闭已独立复核，最新ledger=`results/kv-night-c2/run-ledger.json`，源冻结已解除。现阶段先commit/push K04。只读审查确认库调用方长期暂停waiting cursor会一直占读优先权；vllm agent在ignored `results/kv-read-intent-expiry-candidate/`准备metadata绝对期限补丁，不改已接收IO合同。native capacity/GQA与Swift helper均只准备在ignored目录，无GPU结果；root后续串行验证，2h窗口仍待启动，不得宣称已通过。
 
 04:44 更新：K04 单个 metadata read intent 已集成，177 项 Swift CPU 通过；C1 首个实模探针在 R3 计时断言失败，原因是探针只算 suspended wait，漏计同步 lookup，实际合计 5.001298 秒。原始失败保留，不能补报超时计数通过。参考服务 PID60211 已恢复并独立核对，236 文件/102 模型 stat postflight 通过。探针已改为断言前保存前后计数/额度/IO owner，再分别检查超时增量、无读回和总解析时间；无 runtime 回退。C2 release 已完成，`results/kv-night-c2/plan.json` 冻结同批源码及新端口11253/54/55，依次重跑 admission、已接收 IO 超时、完整会话、HTTP 会话和混合请求。以 C2 controller 为唯一 GPU owner，期间不改 Sources/Tests/scripts/binary。完成后提交 K04，再跑独立 capacity 机制微测和 7200 秒 churn；尚无两小时通过结果。

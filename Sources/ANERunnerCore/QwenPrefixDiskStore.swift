@@ -96,7 +96,7 @@ public enum QwenPrefixDiskReadSubmission: Equatable, Sendable {
 
 public enum QwenPrefixDiskReadIntentAdmission: Sendable {
     case acquired(QwenPrefixDiskReadIntent)
-    case busy, closed, unavailable
+    case busy, closed, unavailable, expired
 }
 
 /// One bounded, revocable priority intention. It owns no FD, result Data,
@@ -106,12 +106,16 @@ public final class QwenPrefixDiskReadIntent: @unchecked Sendable {
     fileprivate weak var store: QwenPrefixDiskStore?
     fileprivate let identity = UUID()
     fileprivate let epoch: UInt64
-    fileprivate init(store: QwenPrefixDiskStore, epoch: UInt64) {
-        self.store = store; self.epoch = epoch
+    fileprivate let deadlineUptimeNanoseconds: UInt64?
+    fileprivate init(store: QwenPrefixDiskStore, epoch: UInt64, deadlineUptimeNanoseconds: UInt64?) {
+        self.store = store; self.epoch = epoch; self.deadlineUptimeNanoseconds = deadlineUptimeNanoseconds
     }
     public var state: QwenPrefixDiskReadAdmissionState {
         store?.readAdmissionState(self) ?? .closed
     }
+    /// Deadline expiration in a still-live store epoch. Clear/close/storage
+    /// invalidation takes precedence; state remains `.invalidated` on expiry.
+    public var hasExpired: Bool { store?.readIntentHasExpired(self) ?? false }
     public func release() { store?.releaseReadIntent(self) }
     deinit { release() }
 }
@@ -176,6 +180,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     public let limits: QwenPrefixDiskLimits
     private let ttlSeconds: TimeInterval?
     private let clock: @Sendable () -> TimeInterval
+    private let uptimeClock: @Sendable () -> UInt64
     private let availableSpace: @Sendable (Int32) throws -> UInt64
     private let publicationDirectorySync: @Sendable (Int32) throws -> Void
     private let queue = DispatchQueue(label: "qwen.prefix.ssd", qos: .utility)
@@ -186,7 +191,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     private let callbackCloseGroup = DispatchGroup()
     private var epoch: UInt64 = 0
     private var closed = false
-    private var foregroundReadIntent: (identity: UUID, epoch: UInt64)?
+    private var foregroundReadIntent: (identity: UUID, epoch: UInt64, deadline: UInt64?)?
     private var stats = QwenPrefixDiskStatistics()
     private var summaries: [String: SummaryRecord] = [:]
     private struct SummaryRecord {
@@ -249,14 +254,16 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
                       })
     }
 
-    // Module-internal fault injection for the publication commit boundary.
-    // The callback borrows the directory FD, runs without admission held, and
-    // must neither close the FD nor call a waiting store operation.
+    // Module-internal injection for publication faults and deterministic uptime.
+    // The publication callback borrows the FD without admission held and must
+    // not close it or call a waiting store operation. The uptime callback runs
+    // under admission: it must be bounded and must not reenter this store.
     init(directory: URL, limits: QwenPrefixDiskLimits = .init(),
          ttlSeconds: TimeInterval? = nil,
          now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
          availableSpace: (@Sendable (Int32) throws -> UInt64)? = nil,
-         publicationDirectorySync: @escaping @Sendable (Int32) throws -> Void) throws {
+         publicationDirectorySync: @escaping @Sendable (Int32) throws -> Void,
+         uptimeNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) throws {
         guard limits.maxEntries > 0, limits.maxBytes > 0,
               limits.maxKeyTokens > 0, limits.maxPendingJobs > 0,
               limits.maxPendingBytes > 0, limits.maxMetadataBytes > 0,
@@ -265,7 +272,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
               ttlSeconds.map({ $0.isFinite && $0 > 0 }) ?? true,
               directory.isFileURL else { throw StoreError.invalidLimits }
         self.directory = directory; self.limits = limits
-        self.ttlSeconds = ttlSeconds; self.clock = now
+        self.ttlSeconds = ttlSeconds; self.clock = now; self.uptimeClock = uptimeNanoseconds
         // The optional sampler is an injection point for deterministic CPU
         // faults. It runs only on the IO queue, borrows the open directory FD,
         // and must not retain or close that FD or call back into this store.
@@ -311,6 +318,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
 
     public var statistics: QwenPrefixDiskStatistics {
         admission.lock(); defer { admission.unlock() }
+        expireReadIntentLocked()
         var value = stats
         value.foregroundReadIntents = foregroundReadIntent == nil ? 0 : 1
         value.foregroundReadIntentAcquisitions = stats.foregroundReadIntentAcquisitions ?? 0
@@ -318,17 +326,30 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         return value
     }
 
-    /// This is metadata admission only. A cooperative caller may wait without
-    /// allocating workspace while an old write/read releases its real charge.
-    public func acquireReadIntent() -> QwenPrefixDiskReadIntentAdmission {
+    /// Metadata admission only. The optional absolute uptime deadline expires
+    /// priority on subsequent admission/state/statistics access, without timers
+    /// or touching accepted IO. Nil preserves explicit-release ownership.
+    /// A supplied deadline at or before the current uptime returns `.expired`.
+    public func acquireReadIntent(deadlineUptimeNanoseconds: UInt64? = nil) -> QwenPrefixDiskReadIntentAdmission {
         admission.lock(); defer { admission.unlock() }
+        let uptime = uptimeClock()
+        expireReadIntentLocked(at: uptime)
         guard !closed else { return .closed }
         guard !stats.storageUnavailable else { return .unavailable }
+        if let deadlineUptimeNanoseconds, deadlineUptimeNanoseconds <= uptime { return .expired }
         guard foregroundReadIntent == nil else { return .busy }
-        let intent = QwenPrefixDiskReadIntent(store: self, epoch: epoch)
-        foregroundReadIntent = (intent.identity, epoch)
+        let intent = QwenPrefixDiskReadIntent(store: self, epoch: epoch, deadlineUptimeNanoseconds: deadlineUptimeNanoseconds)
+        foregroundReadIntent = (intent.identity, epoch, deadlineUptimeNanoseconds)
         stats.foregroundReadIntentAcquisitions = (stats.foregroundReadIntentAcquisitions ?? 0) + 1
         return .acquired(intent)
+    }
+
+    // Only the metadata priority slot expires. No callback, FD, pending charge
+    // or accepted read is owned here; stale handles retain their old UUID.
+    private func expireReadIntentLocked(at uptime: UInt64? = nil) {
+        guard let deadline = foregroundReadIntent?.deadline,
+              (uptime ?? uptimeClock()) >= deadline else { return }
+        foregroundReadIntent = nil
     }
 
     fileprivate func releaseReadIntent(_ intent: QwenPrefixDiskReadIntent) {
@@ -341,12 +362,21 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             foregroundReadIntent?.identity == intent.identity && foregroundReadIntent?.epoch == intent.epoch
     }
 
+    fileprivate func readIntentHasExpired(_ intent: QwenPrefixDiskReadIntent) -> Bool {
+        admission.lock(); defer { admission.unlock() }
+        expireReadIntentLocked()
+        guard !closed, !stats.storageUnavailable, intent.store === self, intent.epoch == epoch,
+              let deadline = intent.deadlineUptimeNanoseconds else { return false }
+        return uptimeClock() >= deadline
+    }
+
     fileprivate func readAdmissionState(_ intent: QwenPrefixDiskReadIntent) -> QwenPrefixDiskReadAdmissionState {
         admission.lock(); defer { admission.unlock() }
         return readAdmissionStateLocked(intent)
     }
 
     private func readAdmissionStateLocked(_ intent: QwenPrefixDiskReadIntent?) -> QwenPrefixDiskReadAdmissionState {
+        expireReadIntentLocked()
         guard !closed else { return .closed }
         guard !stats.storageUnavailable else { return .unavailable }
         if let intent {
@@ -368,6 +398,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
               payload.count > 0, charge <= limits.maxPendingBytes,
               charge < limits.maxBytes else { reject(); return false }
         admission.lock()
+        expireReadIntentLocked()
         guard foregroundReadIntent == nil else {
             stats.rejected += 1
             stats.optionalWritePriorityRejections = (stats.optionalWritePriorityRejections ?? 0) + 1

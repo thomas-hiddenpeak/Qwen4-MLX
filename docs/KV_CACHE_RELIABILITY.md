@@ -37,7 +37,7 @@ HTTP对完整canonical会话一次分词，查找至prompt倒数第二个token�
 
 cooperative 调度中，同一 namespace 和完整 token 前缀只允许一个冷 producer；其他请求暂停 prefill，等待可用状态。producer 取消/失败后释放资格，下一个请求接管。RAM 无法保留且 SSD 尚在发布时，等待该次写入完成或失败；后台发布与读回分别受默认 5 秒的请求等待期限约束。超期后请求继续冷算，已有 I/O 和 workspace 由完成回调保留，不能提前归还额度。同 key 的未完成归档不会因超期重算而重复入队。等待期间不提交 GPU 工作；存在可运行 decode 时优先照常推进。
 
-SSD 前台读恢复新增一个 store 级、可撤销的 metadata intent。旧的已接收 IO 继续执行，新可选写入暂停准入；等待 intent 不持有归档 Data、FD、IO job 或恢复 workspace。旧 IO 释放后重新查验归档摘要与大小，再申请实际 workspace 和原有读额度，避免使用过时摘要低估内存。统一读取期限覆盖同 key 读等待、IO 准入等待及已接收读取，不因切换阶段重置；超时、取消和 clear 释放本请求意图，迟到 owner 不影响新请求。联合 workspace 不足时保守冷退，不能预支旧回调尚未归还的额度。whole-stages 同步调用遇忙立即冷退。当前仍是一个串行 IO 队列，没有抢占已接收写入、分块传输或读写速率控制，详见[队列设计](research/KV_SSD_QUEUE_DESIGN.md)。
+SSD 前台读恢复新增一个 store 级、可撤销的 metadata intent。旧的已接收 IO 继续执行，新可选写入暂停准入；等待 intent 不持有归档 Data、FD、IO job 或恢复 workspace。旧 IO 释放后重新查验归档摘要与大小，再申请实际 workspace 和原有读额度，避免使用过时摘要低估内存。统一读取期限覆盖同 key 读等待、IO 准入等待及已接收读取，不因切换阶段重置；超时、取消和 clear 释放本请求意图，迟到 owner 不影响新请求。runner始终向store传入同一绝对期限，后续enqueue/acquire/state/statistics访问会撤销过期的未提交优先权，因此暂停游标不再无限阻塞其他可选写。没有后台计时器，也不自动取消该游标的私有请求lease或producer；底层Core调用若显式省略deadline仍遵循手动释放合同。联合 workspace 不足时保守冷退，不能预支旧回调尚未归还的额度。whole-stages 同步调用遇忙立即冷退。当前仍是一个串行 IO 队列，没有抢占已接收写入、分块传输或读写速率控制，详见[队列设计](research/KV_SSD_QUEUE_DESIGN.md)。
 
 完整阶段的同步库调用持有模型 gate，无法等待一个由调用方暂停的外部 producer。这种混合使用场景安全回退到冷计算，可能重复 prefill；HTTP 使用 cooperative 模式。压缩 radix 只能恢复真实完整快照边界，不从中间树节点推导 GDN 状态。
 
@@ -76,6 +76,12 @@ SSD归档是状态缓存，与PLE的n-gram读取分别管理。应用层成功ar
 已接收IO超时探针51项通过：本轮5ms等待期限之后，确有342,798,336-byte归档读取完成，旧IO/lease没有提前归还；6次生成/96 IDs、5组独立状态605张量及host比较通过。原生完整会话71项检查、12组对照192 IDs和33组独立状态事件全部通过。HTTP会话9次及mixed36次成功，432 completion tokens；3次RST均匹配唯一cancelled终态，共48条唯一模型终态。45个成功结果usage、实际前向守恒及新增decode/first-ready/handoff字段独立对账；4次指标抓取44/45 series与idle health相符。mixed工作段57.999秒、229次health采样、17次SSD恢复/6,229,626,880归档字节读回；无自然优先级拒绝，不把受控小写试验当作物理慢盘或自然收益证明。
 
 C1失败记录保留：原探针只以cacheWait检查五秒，漏算同步lookup，实际总和5.001298秒；拆开前后计数/计时断言后C2重跑通过。236个冻结文件及102个模型payload stat postflight通过，参考61971按原argv恢复、idle及MTP/drafter关闭独立核对。此批未包含长期暂停库游标的意图自然过期，补丁另行验证；两小时churn尚未完成。
+
+### C3：暂停调用方的优先权隔离
+
+后续绝对期限补丁已完成：187项相关CPU通过，其中新增9项Core fake-clock和1项期限转换；release66.42秒，binary `78036ae494a196f9c8e26b4b61d0e6b992fb54bcf393dfa89304795847cfac23`。`results/kv-night-c3/`准入探针70项/8次生成、已接收IO超时51项/6次生成全部通过，共128 IDs、12组独立121张量与host比较。新R7保留waiting cursor实际5.054100375秒，不step/discard或查询store；旧小写完成后第一个store访问就是enqueue，成功写入。旧游标随后仅超时一次、无归档读取、冷算正确，并未撤销后来取得的新优先权；最终request/cache/workspace/intent/pending全部归零。
+
+HTTP mixed另36次成功/288 completion tokens、3次RST匹配39条唯一模型终态，新增阶段字段及实际token守恒全部独立对账。44.546秒工作段、179健康采样、17次SSD恢复/6,229,626,880归档字节读回，intent末态为0。239文件/102模型stat postflight通过，参考63602原argv/idle/MTPdrafter关闭独立核对。C3仅重跑受本次修改影响的准入、已接收IO与HTTP混合路径；完整会话/重启/指标格式证据仍绑定C2，不重复记成C3。接下来两小时窗口固定C3运行代码。
 
 ## 2026-09-09 批次B：完整会话、有限关闭和监控
 

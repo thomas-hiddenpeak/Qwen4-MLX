@@ -112,8 +112,8 @@ extension RunnerCLI {
             report["checks"] = checks; report["trials"] = trials; report["state_checks"] = stateChecks
             report["holds"] = try holds.map { try object($0.snapshot) }
             report["passed"] = complete && !checks.isEmpty && checks.values.allSatisfy { $0 } &&
-                trials.count == 7 && trials.allSatisfy { $0["passed"] as? Bool == true } &&
-                stateChecks.count == 7 && stateChecks.allSatisfy { $0["passed"] as? Bool == true }
+                trials.count == 8 && trials.allSatisfy { $0["passed"] as? Bool == true } &&
+                stateChecks.count == 8 && stateChecks.allSatisfy { $0["passed"] as? Bool == true }
             try emit(report, to: output)
         }
         func require(_ label: String, _ value: Bool) throws {
@@ -386,10 +386,60 @@ extension RunnerCLI {
             try require("R6_no_read_or_timeout", try stats().diskHits == beforeWhole.diskHits &&
                 stats().diskReadTimeouts == beforeWhole.diskReadTimeouts)
             wholeHold.release(); try drained("R6")
+
+            // R7: a caller may retain a yielded cursor without polling it.
+            // After its absolute priority deadline, enqueue itself must revoke
+            // the old metadata owner. Do not inspect disk statistics/state or
+            // call a resolver between the pause and this optional enqueue.
+            let pausedHold = try block("R7_paused")
+            let beforePaused = try stats(), beforePausedDisk = disk.statistics
+            let pausedReader = try waiting("R7_paused")
+            defer { try? pausedReader.discard() }
+            let pauseStarted = now()
+            Thread.sleep(forTimeInterval: 5.05)
+            let pausedSeconds = seconds(pauseStarted)
+            let stillBlocked = pausedHold.snapshot
+            pausedHold.release()
+            let drainStarted = now()
+            // Observe only the blocker completion, never the store. Core write
+            // pending is released before this callback marks itself finished.
+            while !pausedHold.snapshot.callbackFinished {
+                guard seconds(drainStarted) < 10 else {
+                    throw CLIError.usage("Paused reader blocker did not finish")
+                }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            let writeAcceptedAfterPause = disk.enqueue(tokens: [19], namespace: "probe.expired.optional",
+                metadata: Data([1]), payload: Data([2]))
+            report["R7_pause_evidence"] = [
+                "unpolled_seconds": pausedSeconds,
+                "old_write_held_through_pause": !stillBlocked.released && !stillBlocked.watchdogFired,
+                "first_store_access_after_pause": "enqueue",
+                "optional_write_accepted": writeAcceptedAfterPause,
+                "processed_before_resume": pausedReader.processedTokenCount,
+                "before_cache": try object(beforePaused), "before_disk": try object(beforePausedDisk),
+                "after_enqueue_disk": try object(disk.statistics)]
+            try save()
+            try require("R7_real_unpolled_pause", pausedSeconds >= 5 && pausedReader.isWaitingForPrefixCache &&
+                pausedReader.processedTokenCount == 0 && !stillBlocked.released && !stillBlocked.watchdogFired)
+            try require("R7_enqueue_expires_old_priority", writeAcceptedAfterPause)
+            guard case .acquired(let replacementIntent) = disk.acquireReadIntent() else {
+                throw CLIError.usage("Could not acquire new priority after paused reader expiry")
+            }
+            defer { replacementIntent.release() }
+            try record("R7_paused", finish("R7_paused", pausedReader), source: "cold", cached: 0)
+            let afterPaused = try stats()
+            try require("R7_old_cursor_times_out_once", afterPaused.diskReadTimeouts == beforePaused.diskReadTimeouts + 1)
+            try require("R7_old_cursor_does_not_read", afterPaused.diskHits == beforePaused.diskHits &&
+                disk.statistics.bytesRead == beforePausedDisk.bytesRead)
+            try require("R7_old_cursor_keeps_new_priority", disk.statistics.foregroundReadIntents == 1 &&
+                (replacementIntent.state == .ready || replacementIntent.state == .busy))
+            replacementIntent.release()
+            try drained("R7")
             let closed = disk.close(drain: true, timeout: 10)
             report["close"] = ["io_completed": closed.ioCompleted, "callbacks_completed": closed.callbacksCompleted]
             try require("finite_close_completed", closed.completed)
-            try require("finite_request_and_state_counts", trials.count == 7 && stateChecks.count == 7)
+            try require("finite_request_and_state_counts", trials.count == 8 && stateChecks.count == 8)
             try save(complete: true)
         } catch {
             gate.release()

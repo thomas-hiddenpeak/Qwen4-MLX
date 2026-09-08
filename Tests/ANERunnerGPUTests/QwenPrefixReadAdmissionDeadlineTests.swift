@@ -16,6 +16,17 @@ final class QwenPrefixReadAdmissionDeadlineTests: XCTestCase {
         XCTAssertEqual(budget.statistics.workspaceBytes, 0)
     }
 
+    func testAbsoluteDeadlineUsesOriginalAttemptAndSafeFiniteConversion() {
+        let start: UInt64 = 20_000_000_000
+        XCTAssertEqual(QwenPrefixDiskRead.waitDeadline(startedAt: start, after: 5), 25_000_000_000)
+        XCTAssertEqual(QwenPrefixDiskRead.waitDeadline(startedAt: start, after: 0.000_000_000_1), start + 1)
+        XCTAssertEqual(QwenPrefixDiskRead.waitDeadline(startedAt: UInt64.max - 2, after: 5), UInt64.max)
+        XCTAssertEqual(QwenPrefixDiskRead.waitDeadline(startedAt: start, after: .greatestFiniteMagnitude), UInt64.max)
+        for invalid in [0.0, -1.0, Double.nan, Double.infinity, -Double.infinity] {
+            XCTAssertNil(QwenPrefixDiskRead.waitDeadline(startedAt: start, after: invalid))
+        }
+    }
+
     func testBackwardClockCannotManufactureTimeoutAndReadyResultRemainsUsable() throws {
         let budget = try QwenStateBudget(maxBytes: 64)
         XCTAssertFalse(QwenPrefixDiskRead.waitHasTimedOut(startedAt: 20, after: 5, now: 10))
