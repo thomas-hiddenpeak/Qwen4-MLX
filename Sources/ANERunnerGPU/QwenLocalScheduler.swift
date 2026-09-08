@@ -61,6 +61,8 @@ public final class QwenLocalScheduler {
         public let errorDescription: String?
         public let processedPromptTokens: Int?
         public let generatedTokenCount: Int?
+        /// Stable machine-readable classification; older reports omit it.
+        public var errorCode: String? = nil
     }
     public struct Snapshot: Codable, Sendable {
         public let queuedPrefills, readyDecodes, reservedTokens: Int
@@ -71,6 +73,9 @@ public final class QwenLocalScheduler {
         public let unavailableReason: String?
         public let queuedPrefillIDs, readyDecodeIDs: [UUID]
         public let residentSequences: Int
+        /// Producers explicitly waiting for SSD IO or another prefix leader.
+        /// Nil in older reports or backends without wait-state observation.
+        public var waitingPrefixSequences: Int? = nil
     }
 
     private let core: QwenLocalSchedulerCore<QwenLocalWork>
@@ -114,7 +119,8 @@ public final class QwenLocalScheduler {
                 let result = try generator.stepDecode(session, cancellation: cancellation, onToken: onToken)
                 return result
             },
-            progress: { ($0.processed, $0.generated) }))
+            progress: { ($0.processed, $0.generated) },
+            isWaitingForPrefixCache: { $0.producer?.isWaitingForPrefixCache ?? false }))
     }
 
     /// Admission reserves prompt.count + maxTokens immediately, including
@@ -179,6 +185,7 @@ final class QwenLocalSchedulerCore<Prepared> {
         var prefillSlice: ((QwenGenerationRequest, QwenCancellation, Prepared?) throws -> PrefillSlice)? = nil
         var decodeSlice: ((Prepared, QwenCancellation, ((Int32) throws -> Void)?) throws -> QwenGenerationResult?)? = nil
         var progress: ((Prepared) -> (prompt: Int, generated: Int))? = nil
+        var isWaitingForPrefixCache: ((Prepared) -> Bool)? = nil
     }
     private final class Job {
         let id = UUID()
@@ -255,7 +262,13 @@ final class QwenLocalSchedulerCore<Prepared> {
               consecutivePrefills: consecutivePrefills,
               isIdle: jobs.isEmpty && active == nil && pendingEvents.isEmpty,
               acceptingJobs: unavailableReason == nil, unavailableReason: unavailableReason,
-              queuedPrefillIDs: prefills, readyDecodeIDs: ready, residentSequences: residentCount)
+              queuedPrefillIDs: prefills, readyDecodeIDs: ready, residentSequences: residentCount,
+              waitingPrefixSequences: backend.isWaitingForPrefixCache.map { waiting in
+                  prefills.reduce(0) { count, id in
+                      guard let prepared = jobs[id]?.prepared else { return count }
+                      return count + (waiting(prepared) ? 1 : 0)
+                  }
+              })
     }
 
     private var residentCount: Int { jobs.values.filter { $0.prefillStartedAt != nil }.count }
@@ -353,7 +366,11 @@ final class QwenLocalSchedulerCore<Prepared> {
             if stage == .prefill { job.prefillEndedAt = ended }
             else { job.decodeEndedAt = ended }
             let kind: Kind = (error as? QwenGenerationError) == .cancelled ? .cancelled : .failed
-            let failed = terminate(job, kind: kind, stage: stage, at: ended, message: error.localizedDescription)
+            let errorCode: String?
+            if case QwenGenerationError.resourceLimit(_) = error { errorCode = "resource_limit" }
+            else { errorCode = nil }
+            let failed = terminate(job, kind: kind, stage: stage, at: ended,
+                message: error.localizedDescription, errorCode: errorCode)
             // The generator has released model admission before throwing here.
             // An original cancellation/busy error does not prove recovery was
             // healthy. Only an explicit unavailable health result poisons us;
@@ -398,8 +415,10 @@ final class QwenLocalSchedulerCore<Prepared> {
         consecutivePrefills = 0; consecutiveDecodes = 0
     }
     private func terminate(_ job: Job, kind: Kind, stage: Stage, at time: UInt64,
-                           result: QwenGenerationResult? = nil, message: String? = nil) -> Event {
-        let output = event(job, kind: kind, stage: stage, at: time, result: result, message: message)
+                           result: QwenGenerationResult? = nil, message: String? = nil,
+                           errorCode: String? = nil) -> Event {
+        let output = event(job, kind: kind, stage: stage, at: time,
+            result: result, message: message, errorCode: errorCode)
         // Release even when decode was rejected before claiming its payload.
         // No failed job is retried, regardless of the error's enum case.
         if let prepared = job.prepared { job.prepared = nil; backend.discard(prepared) }
@@ -409,7 +428,8 @@ final class QwenLocalSchedulerCore<Prepared> {
         return output
     }
     private func event(_ job: Job, kind: Kind, stage: Stage, at time: UInt64,
-                       result: QwenGenerationResult? = nil, message: String? = nil) -> Event {
+                       result: QwenGenerationResult? = nil, message: String? = nil,
+                       errorCode: String? = nil) -> Event {
         let prefillWait = job.prefillWait + (job.prefillEnqueuedAt.map { seconds($0, time) } ?? 0)
         let initialWait = seconds(job.submittedAt, job.prefillStartedAt ?? time)
         let readyWait = job.prefillComplete
@@ -426,6 +446,7 @@ final class QwenLocalSchedulerCore<Prepared> {
             prefillResumeWaitSeconds: max(0, prefillWait - initialWait))
         return .init(jobID: job.id, kind: kind, stage: stage, prefill: job.prefillStatistics,
                      result: result, timing: timing, errorDescription: message,
-                     processedPromptTokens: progress?.prompt, generatedTokenCount: progress?.generated)
+                     processedPromptTokens: progress?.prompt, generatedTokenCount: progress?.generated,
+                     errorCode: errorCode)
     }
 }

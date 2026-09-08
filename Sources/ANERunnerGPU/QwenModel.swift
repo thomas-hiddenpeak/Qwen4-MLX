@@ -73,6 +73,9 @@ public final class QwenModel {
     public let weights: GPUWeights
     public let layerCount: Int
     public let profiler: GPUProfiler
+    /// Logical persistent state and archive workspace reservations. Weights,
+    /// activations and the MLX allocator pool are outside this accounting.
+    public let stateBudget: QwenStateBudget
     private let decodeAsyncSchedule: QwenDecodeAsyncSchedule
     /// Experimental host submission policy, captured once before model loading.
     public var experimentalDecodeAsyncEveryLayers: Int { decodeAsyncSchedule.everyLayers }
@@ -140,7 +143,10 @@ public final class QwenModel {
     public init(modelDirectory: URL, layerLimit: Int? = nil, profiler: GPUProfiler? = nil,
                 reservedOutputIDs: Set<Int32>? = nil, ssdWorkers: Int = 1,
                 prefillAccumulation: GPUMoE.PrefillAccumulation = .reference,
-                decodeModes: [GPUDecodeMode] = [.reference], progress: ((Int, Int) -> Void)? = nil) throws {
+                decodeModes: [GPUDecodeMode] = [.reference],
+                stateBudgetBytes: Int = 4 * 1024 * 1024 * 1024,
+                progress: ((Int, Int) -> Void)? = nil) throws {
+        stateBudget = try QwenStateBudget(maxBytes: stateBudgetBytes)
         decodeAsyncSchedule = try QwenDecodeAsyncSchedule(
             environmentValue: ProcessInfo.processInfo.environment[QwenDecodeAsyncSchedule.environmentVariable])
         let c = try QwenConfiguration(modelDirectory: modelDirectory)
@@ -255,6 +261,114 @@ public final class QwenModel {
             total = sum
         }
         return total
+    }
+
+    private var prefixArchiveLayout: QwenPrefixStateArchiveDescriptor.Layout {
+        let c = configuration
+        return .init(layerTypes: c.layerTypes, pleLayerIndices: c.pleLayerIndices,
+            hiddenSize: c.hiddenSize, hcCount: c.hcCount, ngramSize: c.ngramSize,
+            pleConvKernel: c.pleConvKernel, vocabularySize: c.vocabularySize,
+            maximumPositions: c.maximumPositions)
+    }
+
+    /// No device work or model-state allocation. This is the compact logical
+    /// full-model state size at a committed AR boundary, including PLE history.
+    public func estimatedPrefixStateBytes(at offset: Int) throws -> Int {
+        guard layerCount == configuration.layerCount else {
+            throw GPUError.invalid("Prefix state estimation requires the full model")
+        }
+        if offset == 0 { return 0 }
+        return try QwenPrefixStateArchiveDescriptor.estimatedLogicalPayloadBytes(
+            layout: prefixArchiveLayout, offset: offset)
+    }
+
+    /// Call only on the inference executor while owning the generation gate.
+    /// A bounded host copy is completed before any bytes are handed to disk I/O.
+    public func exportPrefixState(_ source: State,
+            maxPayloadBytes: Int = QwenPrefixStateArchiveDescriptor.defaultMaximumPayloadBytes,
+            checkCancellation: () throws -> Void = {}) throws -> QwenPrefixStateArchive {
+        try checkCancellation()
+        guard layerCount == configuration.layerCount, source.owner == identity, source.valid,
+              source.gdn.count == 48, source.attention.count == 48, source.ple.count == 48,
+              source.gdn.allSatisfy({ $0.verificationCapture == nil }),
+              source.ple.allSatisfy({ $0.verificationCapture == nil }) else {
+            throw GPUError.invalid("Prefix archive requires this full model's valid committed AR state")
+        }
+        let expected = try QwenPrefixStateArchiveDescriptor.expectedTensors(
+            layout: prefixArchiveLayout, offset: source.offset)
+        guard let final = expected.last else { throw GPUError.invalid("Empty prefix archive layout") }
+        let payloadBytes = final.byteOffset + final.byteCount
+        let named = source.namedTensors
+        guard named.count == expected.count else { throw GPUError.invalid("Incomplete prefix tensor set") }
+        for descriptor in expected {
+            guard let tensor = named[descriptor.name], tensor.dtype == MLX_BFLOAT16,
+                  tensor.shape == descriptor.shape, tensor.nbytes == descriptor.byteCount else {
+                throw GPUError.invalid("Invalid prefix tensor \(descriptor.name)")
+            }
+        }
+        let descriptor = QwenPrefixStateArchiveDescriptor(layout: prefixArchiveLayout,
+            offset: source.offset, gdnOffsets: source.gdn.map(\.offset),
+            attentionOffsets: source.attention.map(\.offset), pleHistory: source.ple.map(\.history),
+            tensors: expected, tensorPayloadBytes: payloadBytes,
+            logicalPayloadBytes: try prefixStatePayloadBytes(source))
+        try descriptor.validate(expectedLayout: prefixArchiveLayout, expectedOffset: source.offset,
+            actualPayloadBytes: payloadBytes, maxPayloadBytes: maxPayloadBytes)
+        let metadata = try descriptor.encoded()
+        var ready = source
+        _ = try checkpoint(state: &ready)
+        var payload = Data(); payload.reserveCapacity(payloadBytes)
+        for tensor in expected {
+            try checkCancellation()
+            guard let value = named[tensor.name] else { throw GPUError.invalid("Missing prefix tensor") }
+            try QwenPrefixStateArchiveBytes.append(value, to: &payload)
+        }
+        try checkCancellation()
+        guard payload.count == payloadBytes else { throw GPUError.invalid("Prefix archive byte count changed") }
+        return QwenPrefixStateArchive(metadata: metadata, payload: payload,
+                                      logicalPayloadBytes: descriptor.logicalPayloadBytes)
+    }
+
+    /// Validate all CPU metadata before allocating the first Tensor. Imported
+    /// arrays have private storage and a new session identity, so cache eviction
+    /// or cancellation of another request cannot invalidate the restored state.
+    public func importPrefixState(_ archive: QwenPrefixStateArchive, expectedOffset: Int,
+            maxPayloadBytes: Int = QwenPrefixStateArchiveDescriptor.defaultMaximumPayloadBytes,
+            checkCancellation: () throws -> Void = {}) throws -> State {
+        try checkCancellation()
+        guard layerCount == configuration.layerCount else {
+            throw GPUError.invalid("Prefix archive restore requires the full model")
+        }
+        let descriptor = try QwenPrefixStateArchiveDescriptor.decodeAndValidate(archive.metadata,
+            expectedLayout: prefixArchiveLayout, expectedOffset: expectedOffset,
+            actualPayloadBytes: archive.payload.count, maxPayloadBytes: maxPayloadBytes)
+        guard archive.logicalPayloadBytes == descriptor.logicalPayloadBytes else {
+            throw GPUError.invalid("Prefix archive logical size mismatch")
+        }
+        var result = makeState(); result.offset = expectedOffset
+        let descriptors = Dictionary(uniqueKeysWithValues: descriptor.tensors.map { ($0.name, $0) })
+        func tensor(_ name: String) throws -> Tensor? {
+            guard let d = descriptors[name] else { return nil }
+            try checkCancellation()
+            let bytes = archive.payload.subdata(in: d.byteOffset..<(d.byteOffset + d.byteCount))
+            return try MX.array(data: bytes, shape: d.shape, dtype: MLX_BFLOAT16)
+        }
+        for layer in 0..<48 {
+            try checkCancellation()
+            let prefix = "layer.\(layer)."
+            result.gdn[layer] = try GPUGatedDeltaNet.State(
+                convHistory: tensor(prefix + "gdn.conv"), recurrent: tensor(prefix + "gdn.recurrent"),
+                offset: descriptor.gdnOffsets[layer])
+            result.attention[layer] = try GPUAttention.State(
+                keys: tensor(prefix + "attention.keys"), values: tensor(prefix + "attention.values"),
+                rawIndexerKeys: tensor(prefix + "attention.raw_index"),
+                pooledIndexerKeys: tensor(prefix + "attention.pooled_index"),
+                offset: descriptor.attentionOffsets[layer])
+            result.ple[layer].history = descriptor.pleHistory[layer]
+            result.ple[layer].convolution = try tensor(prefix + "ple.conv")
+        }
+        try evaluate([], state: &result)
+        try checkCancellation()
+        return result
     }
 
     public func restore(_ checkpoint: State, state: inout State) throws {

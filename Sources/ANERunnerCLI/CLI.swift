@@ -92,6 +92,8 @@ struct RunnerCLI {
                 try probeGPUHotspots(arguments)
             case "probe-gpu-prefix-cache":
                 try probeGPUPrefixCache(arguments)
+            case "probe-gpu-cache-reliability":
+                try probeGPUCacheReliability(arguments)
             case "capture-gpu-moe-prefill":
                 try captureGPUMoEPrefill(arguments)
             case "probe-gpu-moe-prefill-tiling":
@@ -310,6 +312,11 @@ struct RunnerCLI {
         Experimental loopback service: serve-gpu --model-dir PATH [--port 11236]
             [--max-connections 8 --max-body-bytes 262144 --output-buffer-bytes 65536]
             [--prefix-cache-bytes 536870912 --prefix-cache-entries 8] (bytes 0 disables)
+            [--prefix-cache-ttl-seconds 86400 --state-budget-bytes 4294967296]
+            [--prefix-cache-directory PRIVATE_DIRECTORY] (SSD cache is off unless configured)
+            [--prefix-cache-disk-bytes 8589934592 --prefix-cache-disk-entries 32]
+            SSD limits require a directory and an enabled RAM cache; parent directory must exist.
+            State budget bounds logical request/cache/copy reservations, not process RSS.
             Greedy text/tool chat and SSE; AR default, explicit experimental mtp_depth=2 for text only.
             Function tools support tool_choice auto|none and ordered tool result history.
         Experimental draft prompt history: --mtp-draft-history full|1024 (default full); target context remains complete.
@@ -352,6 +359,9 @@ struct RunnerCLI {
     probe-gpu-hotspots --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_REPORT_JSON [--max-tokens 128] [--detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert|moe-composed] [--moe-config PATH] [--baseline-moe-config PATH] [--ab-order ABBA|BAAB]
     probe-gpu-prefix-cache --model-dir PATH --tokens-file AGENT_11K.json --output NEW.json
         [--suite long|boundaries|lifecycle|all --max-tokens 128 --state-readback true|false]
+    probe-gpu-cache-reliability --model-dir PATH --tokens-file AGENT_11K.json
+        --cache-directory PRIVATE_DIRECTORY --output NEW.json --mode populate|restore|corrupt|lifecycle
+        [--oracle-report POPULATE_REPORT.json] (required for restore/corrupt)
     capture-gpu-moe-prefill --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_MANIFEST_JSON --fixture-dir NEW_DIRECTORY
     probe-gpu-moe-prefill-tiling --model-dir PATH --manifest PATH --output NEW_REPORT_JSON
     autotune-gpu-moe-prefill --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON

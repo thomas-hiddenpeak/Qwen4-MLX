@@ -208,6 +208,39 @@ final class QwenLocalSchedulerTests: XCTestCase {
         XCTAssertEqual(try core.runNext()?.kind, .completed)
     }
 
+    func testPrefillResourceLimitIsClassifiedAndReleasesAdmissionWithoutPoisoning() throws {
+        let h = Harness()
+        let core = try h.make(.init(maxQueuedPrefills: 1, maxResidentTokens: 4))
+        h.prefillError = QwenGenerationError.resourceLimit("fixture state bytes")
+        let refused = try core.submit(request(1))
+        let failure = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(failure.jobID, refused)
+        XCTAssertEqual(failure.kind, .failed)
+        XCTAssertEqual(failure.stage, .prefill)
+        XCTAssertEqual(failure.errorCode, "resource_limit")
+        XCTAssertTrue(failure.errorDescription?.contains("fixture state bytes") == true)
+        XCTAssertEqual(core.snapshot().reservedTokens, 0)
+        XCTAssertEqual(core.snapshot().residentSequences, 0)
+        XCTAssertEqual(core.snapshot().queuedPrefills, 0)
+        XCTAssertTrue(core.snapshot().isIdle)
+        XCTAssertTrue(core.snapshot().acceptingJobs)
+        XCTAssertNil(core.snapshot().unavailableReason)
+        XCTAssertTrue(h.payloads.isEmpty)
+
+        h.prefillError = nil
+        let next = try core.submit(request(2))
+        XCTAssertEqual(try core.runNext()?.kind, .prefillReady)
+        let completed = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(completed.jobID, next)
+        XCTAssertEqual(completed.kind, .completed)
+        XCTAssertNil(completed.errorCode)
+        XCTAssertEqual(completed.result?.tokens, [2])
+        XCTAssertEqual(h.payloads.map(\.discards), [1])
+        XCTAssertEqual(core.snapshot().reservedTokens, 0)
+        XCTAssertEqual(core.snapshot().residentSequences, 0)
+        XCTAssertTrue(core.snapshot().isIdle)
+    }
+
     func testPoisonAfterCancellationFlushesReadyAndQueuedWithTerminalEvents() throws {
         let h = Harness()
         let core = try h.make(.init(maxReadyDecodes: 2, maxConsecutivePrefills: 2))

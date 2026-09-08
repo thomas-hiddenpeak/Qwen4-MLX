@@ -19,12 +19,28 @@ extension RunnerCLI {
         guard sigaction(SIGPIPE, &pipePolicy, nil) == 0 else {
             throw CLIError.usage("Cannot install HTTP SIGPIPE policy")
         }
-        try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes", "--prefix-cache-bytes", "--prefix-cache-entries"])
+        try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes",
+            "--prefix-cache-bytes", "--prefix-cache-entries", "--prefix-cache-directory",
+            "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
             }
             return n
+        }
+        let prefixCacheBytes = try number("--prefix-cache-bytes", 536_870_912, 0...8_589_934_592)
+        let prefixCacheDirectory: URL?
+        if args["--prefix-cache-directory"] != nil {
+            guard prefixCacheBytes > 0 else {
+                throw CLIError.usage("--prefix-cache-directory requires --prefix-cache-bytes greater than zero")
+            }
+            prefixCacheDirectory = URL(fileURLWithPath: try args.require("--prefix-cache-directory"))
+                .standardizedFileURL.resolvingSymlinksInPath()
+        } else {
+            guard args["--prefix-cache-disk-bytes"] == nil, args["--prefix-cache-disk-entries"] == nil else {
+                throw CLIError.usage("SSD cache limits require --prefix-cache-directory")
+            }
+            prefixCacheDirectory = nil
         }
         let config = GPUHTTPConfiguration(
             modelDirectory: URL(fileURLWithPath: try args.require("--model-dir"))
@@ -33,8 +49,13 @@ extension RunnerCLI {
             maxConnections: try number("--max-connections", 8, 1...32),
             maxBodyBytes: try number("--max-body-bytes", 262_144, 1024...1_048_576),
             outputBytes: try number("--output-buffer-bytes", 65_536, 8192...1_048_576),
-            prefixCacheBytes: try number("--prefix-cache-bytes", 536_870_912, 0...8_589_934_592),
-            prefixCacheEntries: try number("--prefix-cache-entries", 8, 1...256))
+            prefixCacheBytes: prefixCacheBytes,
+            prefixCacheEntries: try number("--prefix-cache-entries", 8, 1...256),
+            prefixCacheDirectory: prefixCacheDirectory,
+            prefixCacheDiskBytes: try number("--prefix-cache-disk-bytes", 8_589_934_592, 1...Int.max),
+            prefixCacheDiskEntries: try number("--prefix-cache-disk-entries", 32, 1...4096),
+            prefixCacheTTLSeconds: try number("--prefix-cache-ttl-seconds", 86_400, 1...Int.max),
+            stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max))
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
         // general CLI catch's synchronous stderr write after a sink failure.
@@ -45,6 +66,11 @@ extension RunnerCLI {
 private struct GPUHTTPConfiguration: Sendable {
     let modelDirectory: URL
     let port, maxConnections, maxBodyBytes, outputBytes, prefixCacheBytes, prefixCacheEntries: Int
+    let prefixCacheDirectory: URL?
+    let prefixCacheDiskBytes, prefixCacheDiskEntries, prefixCacheTTLSeconds, stateBudgetBytes: Int
+    var prefixDiskLimits: QwenPrefixDiskLimits {
+        .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes)
+    }
     var modelID: String { modelDirectory.lastPathComponent }
 }
 
@@ -67,9 +93,14 @@ private final class GPUHTTPInbox: @unchecked Sendable {
         guard !stopping, requests.count < 8 else { return false }
         requests.append(work); condition.signal(); return true
     }
-    func take(wait: Bool) -> GPUHTTPWork? {
+    func take(wait: Bool, timeout: TimeInterval? = nil) -> GPUHTTPWork? {
         condition.lock(); defer { condition.unlock() }
-        while wait && requests.isEmpty && !stopping { condition.wait() }
+        let deadline = timeout.map { Date().addingTimeInterval($0) }
+        while wait && requests.isEmpty && !stopping {
+            if let deadline {
+                if !condition.wait(until: deadline) { break }
+            } else { condition.wait() }
+        }
         guard !stopping, !requests.isEmpty else { return nil }
         return requests.removeFirst()
     }
@@ -88,8 +119,9 @@ private struct GPUHTTPHealth: Sendable {
     var state = "loading", detail: String?
     var runningJob: String?
     var idle = false, active = 0, jobs = 0
-    var prefills = 0, ready = 0, resident = 0, reserved = 0
-    var prefixCacheJSON: Data?
+    var prefills = 0, ready = 0, resident = 0, reserved = 0, waitingPrefix = 0
+    var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?
+    var mlxMemory: [String: Int]?
 }
 
 /// Mutable connection state is confined to GPUHTTPServer.network. The only
@@ -292,12 +324,20 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 ],
                 "idle": h.idle && inbox.count == 0, "active": h.active, "active_jobs": h.jobs,
                 "queued_prefills": h.prefills, "ready_decodes": h.ready,
+                "waiting_prefix_sequences": h.waitingPrefix,
                 "resident_sequences": h.resident, "reserved_tokens": h.reserved,
                 "pending_requests": inbox.count, "connections": clients.count,
                 "running_job": h.runningJob as Any? ?? NSNull(),
                 "running_job_known": h.active == 0 || h.runningJob != nil,
                 "detail": h.detail.map { String($0.prefix(512)) } as Any? ?? NSNull(),
-                "prefix_cache": h.prefixCacheJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull()
+                "prefix_cache": h.prefixCacheJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
+                "prefix_cache_limits": configuration.prefixCacheBytes == 0 ? NSNull() : [
+                    "maxEntries": configuration.prefixCacheEntries, "maxBytes": configuration.prefixCacheBytes,
+                    "maxKeyTokens": 1_048_576, "ttlSeconds": configuration.prefixCacheTTLSeconds] as Any,
+                "prefix_disk_cache": h.prefixDiskJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
+                "prefix_disk_cache_limits": try prefixDiskLimitsJSON(),
+                "state_budget": h.stateBudgetJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
+                "mlx_memory": h.mlxMemory as Any? ?? NSNull()
             ])
             simple(client, data: try QwenHTTPFrames.response(status: h.state == "ready" ? 200 : 503,
                 contentType: "application/json", body: body))
@@ -333,6 +373,13 @@ private final class GPUHTTPServer: @unchecked Sendable {
             reject(client, status: ["/health", "/v1/models", "/v1/chat/completions"].contains(request.path) ? 405 : 404,
                 message: "Unsupported endpoint or method", code: "invalid_request_error")
         }
+    }
+
+    private func prefixDiskLimitsJSON() throws -> Any {
+        guard configuration.prefixCacheDirectory != nil else { return NSNull() }
+        var limits = try JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration.prefixDiskLimits)) as? [String: Any] ?? [:]
+        limits["ttlSeconds"] = configuration.prefixCacheTTLSeconds
+        return limits
     }
 
     private func simple(_ client: GPUHTTPClient, data: Data) {
@@ -477,22 +524,40 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private func inferenceLoop() throws {
         let tokenizer = try QwenTokenizer(modelDirectory: configuration.modelDirectory)
         if inbox.isStopping { return }
+        let diskStore = try configuration.prefixCacheDirectory.map {
+            try QwenPrefixDiskStore(directory: $0, limits: configuration.prefixDiskLimits,
+                ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds))
+        }
+        // Also closes the exclusively owned directory if model construction
+        // fails before the generator can assume its normal shutdown lifecycle.
+        defer { diskStore?.close(drain: true) }
         var previousCache = 0
         try MX.check(mlx_set_cache_limit(&previousCache, 256 * 1024 * 1024), "HTTP allocator cache")
         defer { var ignored = 0; _ = mlx_set_cache_limit(&ignored, previousCache) }
         let model = try QwenModel(modelDirectory: configuration.modelDirectory,
-            reservedOutputIDs: tokenizer.reservedOutputTokenIDs) { count, total in
+            reservedOutputIDs: tokenizer.reservedOutputTokenIDs,
+            stateBudgetBytes: configuration.stateBudgetBytes) { count, total in
                 if count % 8 == 0 || count == total { self.log("HTTP model loaded \(count)/\(total)") }
             }
         let generator = try QwenGenerator(model: model, prefixCacheLimits: configuration.prefixCacheBytes == 0 ? nil :
-            .init(maxEntries: configuration.prefixCacheEntries, maxBytes: configuration.prefixCacheBytes))
+            .init(maxEntries: configuration.prefixCacheEntries, maxBytes: configuration.prefixCacheBytes,
+                  ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds)), prefixDiskStore: diskStore)
         let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
         var jobs: [UUID: GPUHTTPActive] = [:]
         defer {
             for job in jobs.values { job.work.cancellation.cancel() }
             _ = try? scheduler.discardAll()
             jobs.removeAll()
-            try? generator.clearPrefixCache()
+            // Persist admitted SSD writes while releasing request/RAM storage.
+            // Closing the service must not act as an SSD cache purge.
+            do {
+                try generator.flushPrefixCacheWrites()
+                try generator.closePrefixCache(drain: true)
+            } catch {
+                log("HTTP prefix cache shutdown encountered an error")
+                diskStore?.close(drain: true)
+            }
+            try? generator.clearPrefixCache(includingDisk: false)
             try? MX.synchronize()
         }
         health.withLock { $0.state = inbox.isStopping ? "stopping" : "ready"; $0.idle = true }
@@ -500,11 +565,18 @@ private final class GPUHTTPServer: @unchecked Sendable {
         func snapshot(active: Int = 0) {
             let s = scheduler.snapshot()
             let cacheJSON = generator.prefixCacheStatistics.flatMap { try? JSONEncoder().encode($0) }
+            let diskJSON = generator.prefixDiskStatistics.flatMap { try? JSONEncoder().encode($0) }
+            let budgetJSON = try? JSONEncoder().encode(generator.stateBudgetStatistics)
+            // All MLX interaction stays on this inference OS thread. The
+            // network queue sees only the copied numeric values below.
+            let memory = try? MX.memory()
             health.withLock {
                 $0.prefixCacheJSON = cacheJSON
+                $0.prefixDiskJSON = diskJSON; $0.stateBudgetJSON = budgetJSON; $0.mlxMemory = memory
                 $0.active = active; $0.jobs = jobs.count; $0.prefills = s.queuedPrefills
                 $0.runningJob = s.runningJob?.uuidString
                 $0.ready = s.readyDecodes; $0.resident = s.residentSequences; $0.reserved = s.reservedTokens
+                $0.waitingPrefix = s.waitingPrefixSequences ?? 0
                 $0.idle = s.isIdle && active == 0
                 if !s.acceptingJobs { $0.state = "failed"; $0.detail = s.unavailableReason }
             }
@@ -515,7 +587,11 @@ private final class GPUHTTPServer: @unchecked Sendable {
             // admission + inference slice, rather than only when the service exits.
             let keepRunning = try autoreleasepool { () throws -> Bool in
             // At most one bounded tokenization/admission between GPU slices.
-            if let work = inbox.take(wait: scheduler.snapshot().isIdle) {
+            // SSD completion can release workspace after the last GPU slice.
+            // A short idle deadline refreshes health even without another
+            // request, while condition.signal still wakes admission instantly.
+            if let work = inbox.take(wait: scheduler.snapshot().isIdle,
+                                     timeout: diskStore == nil ? nil : 0.1) {
                 snapshot(active: 1)
                 do {
                     try work.cancellation.check()
@@ -545,16 +621,17 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     }
                 } catch {
                     work.cancellation.cancel()
-                    let status: Int
+                    let status: Int, code: String
                     switch error {
-                    case QwenLocalScheduler.Error.queueFull, QwenLocalScheduler.Error.overBudget: status = 429
-                    case QwenLocalScheduler.Error.closed(_), QwenGenerationError.unavailable(_): status = 503
-                    default: status = 400
+                    case QwenGenerationError.resourceLimit(_): status = 429; code = "resource_limit"
+                    case QwenLocalScheduler.Error.queueFull, QwenLocalScheduler.Error.overBudget: status = 429; code = "queue_full"
+                    case QwenLocalScheduler.Error.closed(_), QwenGenerationError.unavailable(_): status = 503; code = "model_unavailable"
+                    default: status = 400; code = "invalid_request_error"
                     }
                     let text = String(error.localizedDescription.prefix(512))
                     network.async {
                         if let client = self.clients[work.connectionID] {
-                            self.reject(client, status: status, message: text, code: status == 429 ? "queue_full" : "invalid_request_error")
+                            self.reject(client, status: status, message: text, code: code)
                         }
                     }
                 }
@@ -566,6 +643,14 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 complete(event, active: active)
             }
             snapshot()
+            let paused = scheduler.snapshot()
+            if paused.readyDecodes == 0, paused.queuedPrefills > 0,
+               paused.waitingPrefixSequences == paused.queuedPrefills {
+                // An SSD read/coalesced prefix can yield without device work.
+                // Back off only when every queued producer is waiting and no
+                // decode is runnable; do not penalize decode for one follower.
+                Thread.sleep(forTimeInterval: 0.001)
+            }
             return true
             }
             if !keepRunning { break }
@@ -662,8 +747,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
             } else {
                 log("HTTP request id=\(work.id) terminal=\(event.kind.rawValue) stage=\(event.stage.rawValue) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds) event=model_terminal")
                 completion = event.kind == .cancelled ? .cancelled : .failed
-                let failure = active.invalidToolCall ? (code: "invalid_tool_call", message: "Model emitted an invalid or incomplete tool call") : active.textBudget.errorResponse(cancelled: event.kind == .cancelled)
-                frame = try failureFrame(work, message: failure.message, code: failure.code)
+                let resourceLimited = event.errorCode == "resource_limit"
+                let failure = resourceLimited ? (code: "resource_limit", message: String((event.errorDescription ?? "State reservation budget exhausted").prefix(512))) :
+                    active.invalidToolCall ? (code: "invalid_tool_call", message: "Model emitted an invalid or incomplete tool call") : active.textBudget.errorResponse(cancelled: event.kind == .cancelled)
+                frame = try failureFrame(work, message: failure.message, code: failure.code, status: resourceLimited ? 429 : 500)
                 outputReason = active.textBudget.failure?.rawValue ?? failure.code
             }
             let finished = work.output.finish(completion, frame: frame)
@@ -693,10 +780,11 @@ private final class GPUHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func failureFrame(_ work: GPUHTTPWork, message: String, code: String) throws -> Data {
-        if work.chat.stream { return try QwenHTTPFrames.sseError(message: message, code: code, type: "server_error") + QwenHTTPFrames.done() }
-        return try QwenHTTPFrames.response(status: 500, contentType: "application/json",
-            body: QwenHTTPFrames.error(message: message, code: code, type: "server_error"))
+    private func failureFrame(_ work: GPUHTTPWork, message: String, code: String, status: Int = 500) throws -> Data {
+        let type = status == 429 ? "rate_limit_error" : "server_error"
+        if work.chat.stream { return try QwenHTTPFrames.sseError(message: message, code: code, type: type) + QwenHTTPFrames.done() }
+        return try QwenHTTPFrames.response(status: status, contentType: "application/json",
+            body: QwenHTTPFrames.error(message: message, code: code, type: type))
     }
 
     private func finite(_ value: Double) -> Any { value.isFinite ? value as Any : NSNull() }

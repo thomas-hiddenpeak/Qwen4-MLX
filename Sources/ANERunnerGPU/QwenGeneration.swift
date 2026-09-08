@@ -6,12 +6,14 @@ import Synchronization
 public enum QwenGenerationError: Error, LocalizedError, Equatable {
     case invalidRequest(String)
     case busy
+    case resourceLimit(String)
     case cancelled
     case unavailable(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidRequest(let reason): return "Invalid generation request: \(reason)"
+        case .resourceLimit(let reason): return "State capacity unavailable: \(reason)"
         case .busy: return "This model is already processing a generation request"
         case .cancelled: return "Generation was cancelled"
         case .unavailable(let reason): return "Generation is unavailable: \(reason)"
@@ -221,6 +223,8 @@ public struct QwenPrefillStatistics: Codable, Sendable {
     public var cacheLookupSeconds: Double? = nil
     public var cacheRestoreSeconds: Double? = nil
     public var cacheSaveSeconds: Double? = nil
+    public var cacheSource: String? = nil
+    public var cacheWaitSeconds: Double? = nil
     public var targetTokensPerSecond: Double? {
         targetSeconds > 0 ? Double(computedTokenCount ?? promptTokenCount) / targetSeconds : nil
     }
@@ -276,27 +280,30 @@ public final class QwenPrefillResult {
     fileprivate let requestStartedAt: UInt64
     fileprivate let payload: QwenSingleUseHandoff<QwenPrefillPayload>
     fileprivate init(model: QwenModel, request: QwenGenerationRequest, state: QwenModel.State,
-                     decoder: QwenMTPDecoder?, firstToken: Int32, statistics: QwenPrefillStatistics,
+                     decoder: QwenMTPDecoder?, requestLease: QwenStateBudget.Lease,
+                     firstToken: Int32, statistics: QwenPrefillStatistics,
                      preparationSeconds: Double, requestStartedAt: UInt64) {
         self.model = model; self.request = request; self.firstToken = firstToken
         self.statistics = statistics; self.preparationSeconds = preparationSeconds
         readyAt = DispatchTime.now().uptimeNanoseconds
         self.requestStartedAt = requestStartedAt
-        payload = QwenSingleUseHandoff(QwenPrefillPayload(state: state, decoder: decoder))
+        payload = QwenSingleUseHandoff(QwenPrefillPayload(requestLease: requestLease, state: state, decoder: decoder))
     }
     /// Release an unused, completed job on the same inference executor.
     public func discard() { payload.discard() }
 }
 
 fileprivate struct QwenPrefillPayload {
+    let requestLease: QwenStateBudget.Lease
     var state: QwenModel.State
     let decoder: QwenMTPDecoder?
 }
 
 /// A request-local prefill cursor on the model's inference executor. One step
 /// consumes one original prompt chunk (including the separate final token).
-/// Completed lookahead reads remain owned here, but no GPU/SSD work is in flight
-/// when a step returns. This class deliberately does not conform to Sendable.
+/// Completed lookahead reads remain owned here. A waiting prefix restore may
+/// retain host-only SSD I/O across a yield; no GPU work remains in flight.
+/// This class deliberately does not conform to Sendable.
 public final class QwenPrefillSession {
     fileprivate let model: QwenModel
     fileprivate let request: QwenGenerationRequest
@@ -305,6 +312,7 @@ public final class QwenPrefillSession {
     public private(set) var processedTokenCount = 0
     public fileprivate(set) var isActive = false
     public var isFinished: Bool { progress == nil }
+    public var isWaitingForPrefixCache: Bool { progress?.cacheResolved == false }
     fileprivate init(model: QwenModel, request: QwenGenerationRequest,
                      cancellation: QwenCancellation?, progress: QwenPrefillProgress) {
         self.model = model; self.request = request; self.cancellation = cancellation
@@ -323,6 +331,7 @@ public final class QwenPrefillSession {
 }
 
 fileprivate final class QwenPrefillProgress {
+    let requestLease: QwenStateBudget.Lease
     var state: QwenModel.State
     let decoder: QwenMTPDecoder?
     let preparationSeconds: Double
@@ -332,9 +341,13 @@ fileprivate final class QwenPrefillProgress {
     var offset = 0, chunks = 0, ssdBytes = 0
     var ssdWait = 0.0, targetSeconds = 0.0, activeSeconds = 0.0, suspensionSeconds = 0.0
     var cacheBoundary = 0, cachedTokens = 0
-    var cacheNamespace: String?
+    var cacheFlight: QwenPrefixCacheFlight?
+    var cacheResolved = true
+    var cacheSource = "cold"
+    var cacheWaitSeconds = 0.0
     var cacheLookupSeconds = 0.0, cacheRestoreSeconds = 0.0, cacheSaveSeconds = 0.0
-    init(state: QwenModel.State, decoder: QwenMTPDecoder?, preparationSeconds: Double, now: UInt64) {
+    init(state: QwenModel.State, decoder: QwenMTPDecoder?, requestLease: QwenStateBudget.Lease, preparationSeconds: Double, now: UInt64) {
+        self.requestLease = requestLease
         self.state = state; self.decoder = decoder; self.preparationSeconds = preparationSeconds
         startedAt = now; lastYieldAt = now
     }
@@ -365,6 +378,7 @@ public final class QwenDecodeSession {
 }
 
 fileprivate final class QwenDecodeProgress {
+    let requestLease: QwenStateBudget.Lease
     var state: QwenModel.State
     let decoder: QwenMTPDecoder?
     let prepared: QwenPrefillResult
@@ -378,6 +392,7 @@ fileprivate final class QwenDecodeProgress {
     var ssdWait = 0.0
     init(payload: QwenPrefillPayload, prepared: QwenPrefillResult,
          handoffWaitSeconds: Double, handoffConsumeSeconds: Double, now: UInt64) {
+        requestLease = payload.requestLease
         state = payload.state; decoder = payload.decoder; self.prepared = prepared
         self.handoffWaitSeconds = handoffWaitSeconds; self.handoffConsumeSeconds = handoffConsumeSeconds
         next = prepared.firstToken; lastYieldAt = now
@@ -398,13 +413,28 @@ public final class QwenGenerator {
     public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
     /// Read only on the owning inference executor, like other model statistics.
     public var prefixCacheStatistics: QwenPrefixCacheStatistics? { prefixCache?.statistics }
-    public func clearPrefixCache(resetStatistics: Bool = false) throws {
-        try model.withExclusiveGeneration { prefixCache?.clear(resetStatistics: resetStatistics) }
+    public var prefixDiskStatistics: QwenPrefixDiskStatistics? { prefixCache?.disk?.statistics }
+    public var stateBudgetStatistics: QwenStateBudget.Statistics { model.stateBudget.statistics }
+    public func clearPrefixCache(resetStatistics: Bool = false, includingDisk: Bool = false) throws {
+        try model.withExclusiveGeneration { prefixCache?.clear(resetStatistics: resetStatistics, includingDisk: includingDisk) }
+    }
+    public func flushPrefixCacheWrites() throws {
+        try model.withExclusiveGeneration { prefixCache?.disk?.flush() }
+    }
+    public func closePrefixCache(drain: Bool = true) throws {
+        try model.withExclusiveGeneration { prefixCache?.disk?.close(drain: drain) }
+    }
+    public func trimPrefixCacheMemory() throws {
+        try model.withExclusiveGeneration { prefixCache?.trimMemory() }
     }
 
-    public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil) throws {
+    public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil,
+                prefixDiskStore: QwenPrefixDiskStore? = nil) throws {
         self.model = model
-        prefixCache = try prefixCacheLimits.map { try QwenPrefixCache(limits: $0) }
+        guard prefixDiskStore == nil || prefixCacheLimits != nil else {
+            throw QwenGenerationError.invalidRequest("SSD prefix cache requires prefix cache limits")
+        }
+        prefixCache = try prefixCacheLimits.map { try QwenPrefixCache(limits: $0, disk: prefixDiskStore, model: model) }
         let stops = try QwenTokenizer(modelDirectory: model.configuration.modelDirectory).eosTokenIDs
         guard !stops.isEmpty, stops.allSatisfy({ $0 >= 0 && Int($0) < model.configuration.vocabularySize }) else {
             throw QwenGenerationError.unavailable("tokenizer has no valid EOS policy")
@@ -430,6 +460,20 @@ public final class QwenGenerator {
         guard model.supportsDecodeMode(request.decodeMode) else {
             throw QwenGenerationError.invalidRequest("model was not prepared for the requested decode kernel mode")
         }
+        _ = try requestStateReservation(request)
+    }
+
+    private func requestStateReservation(_ request: QwenGenerationRequest) throws -> Int {
+        let base = try model.estimatedPrefixStateBytes(at: request.tokens.count + request.maxTokens)
+        // Includes a second state-sized allowance for old/new arrays during
+        // functional updates. MTP additionally retains rollback and draft state.
+        // Weights, general activations and the MLX allocator are separate metrics.
+        let multiplier = request.mtpDepth == 0 ? 2 : request.mtpDepth + 5
+        let (bytes, overflow) = base.multipliedReportingOverflow(by: multiplier)
+        guard !overflow, bytes > 0, bytes <= model.stateBudget.maxBytes else {
+            throw QwenGenerationError.resourceLimit("request state exceeds the configured joint byte budget")
+        }
+        return bytes
     }
     private func recover() {
         do { try MX.synchronize() }
@@ -447,7 +491,8 @@ public final class QwenGenerator {
         }
     }
 
-    /// Nil means exactly one original prompt chunk completed. Admission errors
+    /// Nil means a prompt chunk completed, or cache I/O/a shared producer is
+    /// pending (isWaitingForPrefixCache is true). Admission errors
     /// (including cancellation observed before entering the step) preserve the
     /// cursor; errors after a step starts invalidate it. Caller may discard a
     /// preserved cursor when choosing not to retry admission.
@@ -544,7 +589,13 @@ public final class QwenGenerator {
     }
 
     private func makePrefillSession(_ request: QwenGenerationRequest,
-                                    cancellation: QwenCancellation?) throws -> QwenPrefillSession {
+                                    cancellation: QwenCancellation?, allowPrefixWait: Bool = true) throws -> QwenPrefillSession {
+        let bytes = try requestStateReservation(request)
+        let reservation = prefixCache.map { $0.reserve(bytes: bytes, kind: .request, model: model) }
+            ?? model.stateBudget.reserve(bytes: bytes, kind: .request)
+        guard let requestLease = reservation else {
+            throw QwenGenerationError.resourceLimit("active requests and cache workspace exhaust the joint byte budget")
+        }
         var beganDeviceWork = false
         do {
             var preparationSeconds = 0.0
@@ -561,25 +612,14 @@ public final class QwenGenerator {
             }
             try cancellation?.check()
             let p = QwenPrefillProgress(state: model.makeState(), decoder: decoder,
-                preparationSeconds: preparationSeconds, now: now())
+                requestLease: requestLease, preparationSeconds: preparationSeconds, now: now())
             p.cacheBoundary = model.profiler.isRecording ? 0 : request.prefixCacheBoundary
             if p.cacheBoundary > 0, let prefixCache {
-                let lookupStart = now()
-                let namespace = request.prefixCacheNamespace(accumulation: model.prefillAccumulation.rawValue,
-                    fusedPrefill: model.fusedPrefillEnabled)
-                p.cacheNamespace = namespace
-                var restoreStart = lookupStart
+                p.cacheFlight = prefixCache.begin(request, maximum: p.cacheBoundary, model: model,
+                    allowWaitingForLeader: allowPrefixWait)
+                p.cacheResolved = false
                 beganDeviceWork = true
-                let restored = try prefixCache.restore(tokens: request.tokens, namespace: namespace,
-                    maximum: p.cacheBoundary, model: model, didLookup: {
-                        p.cacheLookupSeconds = self.elapsed(lookupStart)
-                        restoreStart = self.now()
-                    })
-                if let restored {
-                    p.cacheRestoreSeconds = elapsed(restoreStart)
-                    p.state = restored; p.offset = restored.offset; p.cachedTokens = restored.offset
-                    try prefixStateObserver?("restore", restored)
-                }
+                try resolvePrefix(p, checkCancellation: { try cancellation?.check() })
             }
             try cancellation?.check()
             p.activeSeconds = elapsed(p.startedAt)
@@ -593,6 +633,18 @@ public final class QwenGenerator {
         }
     }
 
+    private func resolvePrefix(_ p: QwenPrefillProgress, checkCancellation: () throws -> Void) throws {
+        guard !p.cacheResolved, let prefixCache, let flight = p.cacheFlight,
+              let result = try prefixCache.resolve(flight, model: model, checkCancellation: checkCancellation) else { return }
+        p.cacheResolved = true; p.cacheSource = result.source
+        p.cacheLookupSeconds += result.lookupSeconds; p.cacheRestoreSeconds += result.restoreSeconds
+        p.cacheWaitSeconds = max(0, Double(now() - flight.startedAt) * 1e-9 - result.lookupSeconds - result.restoreSeconds)
+        if let state = result.state {
+            p.state = state; p.offset = state.offset; p.cachedTokens = state.offset
+            try prefixStateObserver?("restore", state)
+        }
+    }
+
     private func prefillStep(_ session: QwenPrefillSession, cancellation: QwenCancellation?,
                              accountSuspension: Bool = true) throws -> QwenPrefillResult? {
         guard let p = session.progress else { throw QwenGenerationError.invalidRequest("prefill cursor is finished") }
@@ -603,6 +655,15 @@ public final class QwenGenerator {
         var beganDeviceWork = false
         do {
             try checkCancellation(session.cancellation, cancellation)
+            if !p.cacheResolved {
+                beganDeviceWork = true
+                try resolvePrefix(p, checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
+                session.recordProcessed(p.offset)
+                guard p.cacheResolved else {
+                    p.activeSeconds += elapsed(start); p.lastYieldAt = now()
+                    return nil
+                }
+            }
             if p.prefetch == nil {
                 p.prefetch = try model.makePrefillPrefetch(tokens: Array(request.tokens[p.offset...]),
                     chunk: request.prefillChunk, state: p.state)
@@ -646,9 +707,9 @@ public final class QwenGenerator {
                 p.prefetch?.finish()
                 try checkCancellation(session.cancellation, cancellation)
                 try prefixStateObserver?("coldBoundary", p.state)
-                if let prefixCache, let namespace = p.cacheNamespace {
+                if let prefixCache, let flight = p.cacheFlight {
                     let saveStart = now()
-                    try prefixCache.publish(tokens: Array(request.tokens.prefix(end)), namespace: namespace,
+                    try prefixCache.publish(flight,
                         state: p.state, model: model,
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) },
                         observer: prefixStateObserver)
@@ -671,9 +732,11 @@ public final class QwenGenerator {
                 stats.cacheLookupSeconds = p.cacheLookupSeconds
                 stats.cacheRestoreSeconds = p.cacheRestoreSeconds
                 stats.cacheSaveSeconds = p.cacheSaveSeconds
+                stats.cacheSource = p.cacheSource
+                stats.cacheWaitSeconds = p.cacheWaitSeconds
             }
             let result = QwenPrefillResult(model: model, request: request, state: p.state, decoder: p.decoder,
-                firstToken: next, statistics: stats, preparationSeconds: p.preparationSeconds,
+                requestLease: p.requestLease, firstToken: next, statistics: stats, preparationSeconds: p.preparationSeconds,
                 requestStartedAt: p.startedAt)
             session.invalidate()
             return result
@@ -687,7 +750,7 @@ public final class QwenGenerator {
 
     private func runPrefill(_ request: QwenGenerationRequest,
                             cancellation: QwenCancellation?) throws -> QwenPrefillResult {
-        let session = try makePrefillSession(request, cancellation: cancellation)
+        let session = try makePrefillSession(request, cancellation: cancellation, allowPrefixWait: false)
         let startupSeconds = session.progress?.activeSeconds ?? 0
         // No gate re-entry. Loop overhead is active service, not a suspension.
         let start = now()
@@ -702,12 +765,13 @@ public final class QwenGenerator {
                     attentionMode: stats.attentionMode, suspensionSeconds: 0,
                     cachedTokenCount: stats.cachedTokenCount, computedTokenCount: stats.computedTokenCount,
                     cacheLookupSeconds: stats.cacheLookupSeconds, cacheRestoreSeconds: stats.cacheRestoreSeconds,
-                    cacheSaveSeconds: stats.cacheSaveSeconds)
+                    cacheSaveSeconds: stats.cacheSaveSeconds, cacheSource: stats.cacheSource, cacheWaitSeconds: stats.cacheWaitSeconds)
                 let payload = try result.payload.take()
                 return QwenPrefillResult(model: model, request: request, state: payload.state, decoder: payload.decoder,
-                    firstToken: result.firstToken, statistics: stats, preparationSeconds: result.preparationSeconds,
+                    requestLease: payload.requestLease, firstToken: result.firstToken, statistics: stats, preparationSeconds: result.preparationSeconds,
                     requestStartedAt: result.requestStartedAt)
             }
+            if session.isWaitingForPrefixCache { Thread.sleep(forTimeInterval: 0.001) }
         }
     }
 

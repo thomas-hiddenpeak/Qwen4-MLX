@@ -13,6 +13,7 @@ final class QwenCooperativeSchedulerTests: XCTestCase {
     private final class Session {
         let request: QwenGenerationRequest
         var prompt = 0, generated = 0, prefillCalls = 0, decodeCalls = 0, discards = 0
+        var waitingForPrefix = false
         init(_ request: QwenGenerationRequest) { self.request = request }
         var token: Int32 { request.tokens[0] }
         var statistics: QwenPrefillStatistics {
@@ -39,6 +40,7 @@ final class QwenCooperativeSchedulerTests: XCTestCase {
         var calls: [String] = []
         var sessions: [Session] = []
         var decodeError: Swift.Error?
+        var waitingTokens: Set<Int32> = []
         var observePrefill: ((Session) -> Void)?
         func advance(_ seconds: UInt64) { tick += seconds * 1_000_000_000 }
         func make(_ limits: Limits) throws -> Core {
@@ -64,6 +66,10 @@ final class QwenCooperativeSchedulerTests: XCTestCase {
                     }
                     self.calls.append("P\(session.token)")
                     self.observePrefill?(session)
+                    session.waitingForPrefix = self.waitingTokens.contains(session.token)
+                    if session.waitingForPrefix {
+                        return .init(value: session, statistics: nil, complete: false)
+                    }
                     self.advance(3)
                     // Preserve the separate final prompt token in the fixture,
                     // so a resumed cursor cannot silently skip its last slice.
@@ -87,7 +93,8 @@ final class QwenCooperativeSchedulerTests: XCTestCase {
                     try cancellation.check()
                     return session.generated == session.request.maxTokens ? session.result : nil
                 },
-                progress: { ($0.prompt, $0.generated) }), now: { self.tick })
+                progress: { ($0.prompt, $0.generated) },
+                isWaitingForPrefixCache: { $0.waitingForPrefix }), now: { self.tick })
         }
     }
 
@@ -135,6 +142,41 @@ final class QwenCooperativeSchedulerTests: XCTestCase {
         XCTAssertEqual(Array(h.calls.prefix(7)), ["P1", "P2", "D2", "D2", "D2", "D2", "P1"])
         XCTAssertEqual(events.filter { $0.kind == .completed }.count, 2)
         XCTAssertEqual(h.sessions.first { $0.token == 1 }?.prefillCalls, 6)
+        assertReleased(core, h)
+    }
+
+    func testPrefixWaitIsVisibleAndDoesNotBlockReadyDecode() throws {
+        let h = Harness(), core = try h.make(limits())
+        h.waitingTokens = [1]
+        let waiting = try core.submit(request(1, prompt: 3, generated: 2))
+        let ready = try core.submit(request(2, generated: 2))
+        let stalled = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(stalled.jobID, waiting)
+        XCTAssertEqual(stalled.kind, .prefillProgress)
+        XCTAssertEqual(stalled.processedPromptTokens, 0)
+        XCTAssertEqual(core.snapshot().waitingPrefixSequences, 1)
+        XCTAssertEqual(core.snapshot().queuedPrefills, 2)
+
+        XCTAssertEqual(try core.runNext()?.kind, .prefillReady)
+        XCTAssertEqual(core.snapshot().readyDecodeIDs, [ready])
+        XCTAssertEqual(core.snapshot().waitingPrefixSequences, 1)
+        let decoding = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(decoding.jobID, ready)
+        XCTAssertEqual(decoding.kind, .decodeProgress)
+        let completed = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(completed.jobID, ready)
+        XCTAssertEqual(completed.kind, .completed)
+        XCTAssertEqual(completed.result?.tokens, [2, 2])
+        XCTAssertEqual(core.snapshot().waitingPrefixSequences, 1)
+        XCTAssertEqual(h.sessions.first { $0.token == 1 }?.prompt, 0)
+
+        h.waitingTokens.remove(1)
+        let resumed = try XCTUnwrap(core.runNext())
+        XCTAssertEqual(resumed.jobID, waiting)
+        XCTAssertEqual(resumed.processedPromptTokens, 2)
+        XCTAssertEqual(core.snapshot().waitingPrefixSequences, 0)
+        let rest = try drain(core)
+        XCTAssertTrue(rest.contains { $0.jobID == waiting && $0.kind == .completed })
         assertReleased(core, h)
     }
 
