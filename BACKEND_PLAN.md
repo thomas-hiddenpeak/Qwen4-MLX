@@ -1,6 +1,6 @@
 # 独立 runner 转型与带宽验证
 
-2026-09-06，依据用户最新要求。当前主线是独立 Swift runner 的整模型性能；现在推进 native MTP，先补生成会话 / API 的稳定性基础，再开发前缀树与 SSD offload 等状态缓存管理。普通单 token decode 保留为对照，先前“MTP 暂缓”的执行限制已被替代。
+2026-09-08，依据用户最新要求调整优先级。当前主线先推进 AR 服务与请求生命周期、完整混合状态前缀复用、缓存额度与淘汰、SSD 状态 offload，以及独立的 prefill / decode 基础性能优化。**MTP 性能优化放到整体计划后段，不再是缓存管理、API 或服务稳定性工作的前置条件。** AR 是当前功能与性能基线；已有显式 MTP 能力保留，正确性、状态隔离与受影响路径回归要求继续生效。
 
 GPU 后端和完整 48 层文本生成已落地，入口为 `generate-gpu`；具体用法与验证见 [GPU_RUNNER.md](GPU_RUNNER.md)。`MoEBlockRunner` 继续保留 Core ML 实验；作者 MLX HTTP 服务用于独立对照。
 
@@ -50,4 +50,4 @@ MoE/block 后端、原始 Q4 路径、完整路由、载荷账本和时间窗口
 
 降低冗余流量、提高缓存复用可能让物理GB/s下降，同时让推理变快；这属于有效优化。因此同时报告耗时、有效载荷和实际流量，不以“DRAM读得越满越好”代替整模型性能。
 
-上述第一轮以 AR 建立基线；现在 MTP 已进入独立开发与验收，不能继续将“MTP 暂缓”作为当前限制。现有本机 cooperative PD、MTP 状态及长输入回归分别以 [PD 说明](docs/PREFILL_DECODE_SEPARATION.md)、[MTP 发布条件](docs/MTP_RELEASE_CRITERIA.md)和各实验记录为准。2026-09-07 新增的 [上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)给出后续实施顺序：GDN 载入实验、MTP 完整成本与输出延迟、完整状态前缀复用及 SSD 缓存。
+上述第一轮是历史 AR 基线；当前执行顺序以 [上游特性吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)的 2026-09-08 调整为准。已有 cooperative PD、MTP 状态及长输入回归分别见 [PD 说明](docs/PREFILL_DECODE_SEPARATION.md)、[MTP 发布条件](docs/MTP_RELEASE_CRITERIA.md)和对应实验记录。MTP 新 kernel、深度调优与收益复测延后，不以其性能尚未通过为由阻塞 AR 缓存和服务工作；后续恢复 MTP 性能开发时仍按原门槛验收。

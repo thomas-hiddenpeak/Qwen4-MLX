@@ -1,15 +1,17 @@
 # 本机调度、前缀缓存与 continuous batching 的顺序
 
-2026-09-07，只读源码与已有结果后的判断。**先用已有 PD 接口补一个确定到达时点的公平性实验；MTP 发布门槛满足后，优先做精确系统前缀 checkpoint；真正跨请求 GPU batching 后置。** PD 的下一步很小，缓存才是针对重复 10k 系统提示词的下一项主要开发。正在运行的 MTP 性能窗口不计入本文证据，也不因这份排序跳过其发布条件。
+2026-09-07 只读源码与已有结果后的判断，2026-09-08 按用户决定调整顺序。**优先推进 AR 完整混合状态的精确系统前缀 checkpoint 与私有恢复，并补齐相关服务生命周期和 PD 调度验证；随后做前缀索引、淘汰与 SSD 状态缓存；MTP 性能调优放在计划后期。** AR 缓存、服务与调度继续推进不再等待 MTP 加速比或整套 MTP 发布验收。真正跨请求 GPU batching 仍需独立证明价值后再实现；本文未新增这些能力。
 
-本文补充 [实施计划](../UPSTREAM_ADOPTION_PLAN.md) 与 [精确前缀设计](../EXACT_PREFIX_CHECKPOINT_DESIGN.md)，不替代它们。[早期上游研究](VLLM_SGLANG.md) 的“HTTP 尚未实现”是当时快照；当前 HTTP/SSE 和固定 12 轮短测已完成，仍不等于生产服务、连续批处理或缓存已经实现。
+本文补充 [实施计划](../UPSTREAM_ADOPTION_PLAN.md) 与 [精确前缀设计](../EXACT_PREFIX_CHECKPOINT_DESIGN.md)，不替代它们。现有 MTP 保持显式选项，其数值正确性、请求与回滚状态隔离、受影响路径的 AR 回归不能放松；[MTP 发布条件](../MTP_RELEASE_CRITERIA.md) 约束 MTP 本身的性能结论与默认发布，不再作为 AR 工作的前置条件。[早期上游研究](VLLM_SGLANG.md) 的“HTTP 尚未实现”是当时快照；当前 HTTP/SSE 和固定 12 轮短测已完成，仍不等于生产服务、连续批处理或缓存已经实现。
 
 ## 排序及实际改动量
 
 | 能力 | 处理方式 | 当前落点与收益边界 |
 | --- | --- | --- |
 | PD 调度策略与计量 | **可直接吸收设计**；优先补现有探针，不换 kernel | 库默认 wholeStages，HTTP 显式 cooperative；都有同一模型、单执行器。已有 chunk/round、FIFO、背压、取消及原始 callback 时钟。先分清 TTFT、输出途中等待和整组吞吐；不能把重新排序称为权重复用。 |
-| 精确系统前缀缓存 | **需本机改造**；下一项主要开发 | 已有明确的 K 边界与私有恢复设计，可以保留现有 generator/scheduler。首版 AR trunk checkpoint，MTP 明确冷 miss。它减少重复 prefill 和对其他 decode 的干扰；首版私有复制不承诺减少每请求 KV 占用或增加准入容量。 |
+| 精确系统前缀缓存 | **需本机改造**；下一项主要开发 | 已有明确的 K 边界与私有恢复设计，可以保留现有 generator/scheduler。首版 AR trunk checkpoint，MTP 明确冷 miss，继续原有完整 prefill 与 MTP decode，不能静默改成 AR。它减少重复 prefill 和对其他 decode 的干扰；首版私有复制不承诺减少每请求 KV 占用或增加准入容量。 |
+| 前缀索引、淘汰与 SSD | **在 AR 私有恢复通过后分步实现** | 从单条完整状态扩展索引与容量预算，再处理淘汰及磁盘状态恢复；每一步验证身份、完整混合状态、取消/失败和内存上界，不以 MTP 性能为依赖。当前均未实现。 |
+| MTP 性能调优 | **计划后期** | 基础推理、服务与缓存稳定后再集中优化和评估默认启用。当前显式 MTP 路径继续维护正确性；AR 缓存成功不代表 MTP 缓存已支持。 |
 | continuous batching | **暂缓实现** | 当前能动态进入/退出调度队列，但每次只运行一个请求的完整步骤。真正跨请求 batch 需要让一个模型步骤消费多个独立状态，处理不同长度、位置、EOS、MTP 接受数和释放时点；不是调大 max-connections/max-resident 或把多个请求拼成一个 sequence。先确认长期有多个 ready 请求、真实专家路由重叠及共享权重读取机会，再决定改动。 |
 
 固定 vLLM `6865e67f0be02d53694517f6f71d7fb96492792d` 的 scheduler 在一个 token/input budget 内遍历 running，再处理 waiting，输出按请求记录的 token 数和 block 分配；这与本机一次 `runNext` 只调用一个 backend slice 的接口不同。可吸收“保护已运行请求、限制新 prefill”的策略，不能只移植 Python 队列就获得相同 batching 效果。[固定源码 schedule](https://github.com/vllm-project/vllm/blob/6865e67f0be02d53694517f6f71d7fb96492792d/vllm/v1/core/sched/scheduler.py#L521)
@@ -46,7 +48,7 @@
 
 ### 1. 已开始 decode 后再到达长 prefill
 
-只扩展现有 cooperative probe 的到达时点，不改 scheduler/kernel：选择短提示、已冻结完整输出且实际至少生成64 tokens的请求，在第8个callback记录11k长请求到达；当前slice返回后再submit，避免从callback重入scheduler，并分别记录到达/提交时刻。保留相同416分块、数值配置、两份resident和输出预算。先固定AR消费者；MTP若已完成发布门槛，可用一个另列的固定配置复核，不能混合统计。
+只扩展现有 cooperative probe 的到达时点，不改 scheduler/kernel：选择短提示、已冻结完整输出且实际至少生成64 tokens的请求，在第8个callback记录11k长请求到达；当前slice返回后再submit，避免从callback重入scheduler，并分别记录到达/提交时刻。保留相同416分块、数值配置、两份resident和输出预算。先固定AR消费者；后续如复核显式MTP配置，应沿用已验证的数值与状态合同并另列结果，不能混合统计，也不以其性能结果阻塞AR调度验收。
 
 使用已热身的独立参考，预定 **4→8→8→4** 四组。记录完整 IDs、submit/step/callback 时钟、prefill 活动秒数、decode compute 秒数、消费者到达后剩余完成时间、burst-gap p95/max、生产者 TTFT/完成以及组墙钟。必须从事件证明新 prefill 确实插在消费者第 8 个 token 与终态之间；预取/取消后状态和所有额度归零。
 
@@ -54,10 +56,10 @@
 
 ### 2. 单条 AR 精确 checkpoint，两个后缀 A/B/A
 
-按既有设计，仅增加同模型实例的一条不可变缓存及私有恢复，默认关闭；实施依赖仍服从 MTP/生命周期门槛。用完整 chat 编码逐 ID 核对系统前缀，取 `K=416*floor(S/416)` 且 `0<K<P`，在真实冷 prefill 的 K 边界保存。完整 GDN/conv、Attention KV/QSA、PLE conv/hash 都恢复；prefetch 只接收 `tokens[K...]`，其 initialOffset 为 K，不能把整份 tokens 重送。MTP 请求整体冷 miss，不复用 AR checkpoint 后宣称获得了 MTP 缓存。
+按既有设计，仅增加同模型实例的一条不可变缓存及私有恢复，默认关闭；实施不等待 MTP 性能或整套发布验收，但自身的数值、私有状态、取消与失败清理仍须通过。用完整 chat 编码逐 ID 核对系统前缀，取 `K=416*floor(S/416)` 且 `0<K<P`，在真实冷 prefill 的 K 边界保存。完整 GDN/conv、Attention KV/QSA、PLE conv/hash 都恢复；prefetch 只接收 `tokens[K...]`，其 initialOffset 为 K，不能把整份 tokens 重送。MTP 请求整体冷 miss，继续执行原来的完整 prefill 和显式请求的 MTP decode，不能静默降级为 AR，也不复用 AR checkpoint 后宣称获得了 MTP 缓存。共享路径受改动影响时，保留现有 MTP 数值与生命周期回归。
 
 先冷 A/B，再命中 A/B/A；改变后缀首 token 与长度，穿插一个副本推进后取消。K 处全部持久 tensor/整数 history/offset/nil、最终 logits 和完整输出 IDs 对照；checkpoint 与另一副本不可被污染。复用设计中的小 QSA 边界用例 K=1664、P=2051/2053，不另造通用缓存框架。
 
 性能判据沿用设计：真实约 10k 命中 **TTFT 至少下降 50%**，decode 无可重复超过 3% 的回退；保存/恢复和全部复制成本必须实记，逻辑 payload 与 MLX 实际峰值分开，prefill 吞吐分子只用实际执行的 P−K。首版不能改变完整 prompt 的 API usage/context/准入配额。MTP head 的历史起点依赖完整 P，h[K−1] 还会与新 token[K] 配对；原 chunk 的 trunk tail 重建是后续独立能力，不属于这次 AR 成功的外推范围。[MTP 实际消费关系](../../Sources/ANERunnerGPU/QwenMTPDecoder.swift#L76)、[完整设计与门槛](../EXACT_PREFIX_CHECKPOINT_DESIGN.md)
 
-本次仅新增研究文档，没有运行新模型或修改源码/配置。外部复核只读取上述固定 upstream commit；没有复制实现。vLLM/SGLang 对应来源为 Apache-2.0，若未来移植代码仍须按具体文件保留版权/NOTICE 和修改记录。
+2026-09-08 仅调整文档中的计划顺序，没有运行新模型、实现缓存或修改源码/配置；以上历史数值保持原记录。外部复核只读取上述固定 upstream commit；没有复制实现。vLLM/SGLang 对应来源为 Apache-2.0，若未来移植代码仍须按具体文件保留版权/NOTICE 和修改记录。

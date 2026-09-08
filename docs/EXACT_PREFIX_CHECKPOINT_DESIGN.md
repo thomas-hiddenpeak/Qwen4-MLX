@@ -1,8 +1,15 @@
 # 精确 system-prefix checkpoint：最小设计
 
-2026-09-07 源码审阅。**本文只有设计，没有实现缓存、修改推理路径或运行新的 GPU 实验。实施前仍须完成 [MTP 发布条件](MTP_RELEASE_CRITERIA.md) 中的性能与生命周期门槛。** 已通过一轮回归的 [HTTP/SSE 实验服务](HTTP_SERVER_EXPERIMENT.md) 不因本文获得缓存能力。
+2026-09-07 源码审阅，2026-09-08 按用户决定调整实施顺序。**本文只有设计，没有实现缓存、修改推理路径或运行新的 GPU 实验。AR 缓存、服务生命周期与本机调度继续推进，不再以 MTP 性能或整套 MTP 发布验收通过为前提；MTP 性能调优排在计划后期。** 已有 [HTTP/SSE 实验服务](HTTP_SERVER_EXPERIMENT.md) 不因本文获得缓存能力。
 
-首版建议只保存一个、同模型实例内的不可变完整 trunk checkpoint，在原有 416-token prefill 边界复用精确系统前缀。命中后为请求恢复私有状态，继续现有 prefill → 单次 handoff → decode。先验收 AR；MTP 请求保持原来的完整 prefill，不能把 AR-only 缓存称为 MTP 缓存支持。后文给出 MTP 的最小补充方案。
+首版建议只保存一个、同模型实例内的不可变完整 trunk checkpoint，在原有 416-token prefill 边界复用精确系统前缀。命中后为请求恢复私有状态，继续现有 prefill → 单次 handoff → decode。先验收 AR；MTP 仍是显式选项，首版 MTP 请求整体冷 miss，保持原来的完整 prefill 与 MTP decode，不能悄悄降级成 AR，也不能把 AR-only 缓存称为 MTP 缓存支持。后文保留 MTP 的最小补充设计，不作为首版 AR 缓存的实施依赖。
+
+## 当前实施顺序
+
+1. 先推进 AR 的完整混合状态精确前缀 checkpoint 与请求私有恢复，同时补齐对应的取消、失败清理、内存预算和服务调度验证。数值正确、状态隔离与生命周期安全是这一能力自己的验收条件。
+2. 单条 checkpoint 通过后，再扩展前缀索引、容量预算与淘汰，随后开发 SSD 状态卸载和恢复。磁盘缓存必须保存完整混合状态，不能只落盘 Attention KV。上述能力都不等待 MTP 加速比。
+3. MTP 缓存适配按其功能需求另行验收；原有 MTP 配置继续显式启用，并持续保留已有数值正确性、接受/回滚状态隔离及 AR 回归检查。AR 缓存通过不等于 MTP 缓存通过。
+4. 在基础推理、服务与缓存能力稳定后，再集中做 MTP 性能调优及默认启用评估。[MTP 发布条件](MTP_RELEASE_CRITERIA.md) 仍约束 MTP 本身的性能结论和默认发布，不再阻塞前面的 AR 工作。
 
 ## 当前落点与合法边界
 
@@ -73,14 +80,14 @@ store 首版限一条，建议起始 entry 额度 512 MiB；超出就不发布�
 
 上述可以保留原 head 数值分段，同时跳过前缀 trunk 重算；其等价性与收益仍是**待验证的设计判断**。只有一份 raw tail 也不代表支持 full-history、任意 H、MTP 生成后任意位置分叉，或 head QSA 阈值之外的输出预算。材料不全或配置不支持时继续冷 prefill，不能悄悄把请求从 MTP 改成 AR。
 
-## 两组关键验收，实施时再跑
+## 分阶段验收，实施时再跑
 
 1. **AR 完整状态与私有性**：冻结一个约 10k 的真实系统前缀，按同一 chunk/profile 跑冷 A、冷 B，再 cache A/B/A；A/B 后缀内容不同。K 处比较全部持久 tensor 位值、PLE UInt32 history、每层 offset/nil 与最终 logits/完整输出 IDs。中间让一个恢复副本推进后取消，确认 entry 内容和另一副本不变；包含一个系统边界跨 416 的变体，并在同组小输入中用 K=1664、P=2051/2053 验证后缀跨 QSA 启用边界。不能只比较生成文本。
-2. **MTP 补充材料**：在上述结果通过后，H=1024、depth2、已准入的 verification/profile，分别令 A/B 的 token[K] 不同、P 改变到 s 跨 4-token 边界；与各自冷路径对照完整 head state、最终 previousStream、draft/accept/reject/输出 IDs。复用已有会产生接受与拒绝的冻结任务，并做取消后再次命中；证据不能只覆盖高接受的一个任务。没有材料或不支持的 profile 必须观察到冷 miss。
+2. **后续 MTP 补充材料**：只在开发 MTP 缓存适配时执行，不是 AR 缓存或前缀索引/淘汰/SSD 的前置条件。在 AR 状态验收通过后，H=1024、depth2、已准入的 verification/profile，分别令 A/B 的 token[K] 不同、P 改变到 s 跨 4-token 边界；与各自冷路径对照完整 head state、最终 previousStream、draft/accept/reject/输出 IDs。复用已有会产生接受与拒绝的冻结任务，并做取消后再次命中；证据不能只覆盖高接受的一个任务。没有材料或不支持的 profile 必须观察到冷 miss。
 
-两组都分别报告保存/恢复耗时、命中 token 数、实际执行的后缀 prefill token/秒数、head 重建时间、TTFT、decode 有效吞吐、逻辑 payload 与 MLX 内存峰值。`promptTokenCount` / API usage 保留完整 P；prefill compute 吞吐分子只能用实际计算的 P-K，不能把跳过的 token 算进带宽或 kernel 吞吐。本请求 chunkCount 与 SSD 字节从零累计，另记 cached tokens；禁止复制原请求的计时或“省下的时间”塞入本次 compute。
+每一阶段在实施时分别报告保存/恢复耗时、命中 token 数、实际执行的后缀 prefill token/秒数、TTFT、decode 有效吞吐、逻辑 payload 与 MLX 内存峰值；MTP 缓存阶段另报 head 重建时间。AR 缓存接入共享生成器或调度器时，仍须复跑受影响的现有 MTP 数值与状态生命周期回归，确认冷 miss 后继续执行所请求的 MTP 模式；这不是要求先取得 MTP 性能提升。`promptTokenCount` / API usage 保留完整 P；prefill compute 吞吐分子只能用实际计算的 P-K，不能把跳过的 token 算进带宽或 kernel 吞吐。本请求 chunkCount 与 SSD 字节从零累计，另记 cached tokens；禁止复制原请求的计时或“省下的时间”塞入本次 compute。
 
-继续沿用研究计划的性能目标：真实 10k 命中 TTFT 至少下降 50%，decode 无可重复超过 3% 的回退；复制/历史重建/额外内存若抵消收益，就保留冷路径，不因功能正确而默认启用。不为这两组另造通用缓存测试框架。
+AR 缓存继续沿用研究计划的性能目标：真实 10k 命中 TTFT 至少下降 50%，decode 无可重复超过 3% 的回退；复制或额外内存若抵消收益，就保留冷路径，不因功能正确而默认启用。后续 MTP 缓存适配再单独计入历史重建成本并验收收益；MTP 投机解码的加速比调优仍属计划后期。不为这两阶段另造通用缓存测试框架。
 
 ## 上游借鉴的边界
 

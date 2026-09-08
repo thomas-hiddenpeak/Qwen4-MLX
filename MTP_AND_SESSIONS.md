@@ -1,8 +1,8 @@
 # Native MTP 与生成会话
 
-2026-09-06。用户调整了开发顺序：现在接入 MTP，随后做前缀树和 SSD offload 等状态缓存管理；前提是 runner 和 API 可稳定使用。无 MTP 的 AR 默认路径保留为对照。
+2026-09-08 更新开发顺序：用户要求 MTP 性能优化放到整体计划后段。先推进 AR 服务、完整混合状态前缀复用、缓存额度/淘汰和 SSD offload，并分别优化 prefill / decode 基础路径；这些工作不再等待 MTP 收益验收。AR 保持默认和基线，现有显式 MTP 的正确性、状态隔离与受影响路径回归继续维护。本文保留已实现的 MTP 与会话合同，当前优先级见[综合计划](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)。
 
-最新要求进一步明确：**prefill 与 decode 先做业务分离，随后独立优化内核，并按阶段统计性能。** MTP 的主要性能门槛是 decode 有效吞吐/TPOT；prefill 和初始化/交接分别验收、披露，整请求耗时保留为辅助指标。当前 Swift API 已拆为独立 `prefill` / `decode` 作业与单次消费的完整状态句柄，`generate` 保留组合调用。同执行器已有有界 prefill / ready decode 队列和 token 准入；默认完整阶段调度，显式 `cooperative` 可按 prompt chunk / 完整 AR 或 MTP round 继续执行。增量接口与调度通过 26 项 CPU、55 项实模检查；GPU 保持串行，尚未实现独立进程 PD 服务。接口与能力边界见 [阶段分离设计](docs/PREFILL_DECODE_SEPARATION.md)。
+既有要求继续生效：**prefill 与 decode 先做业务分离，随后独立优化内核，并按阶段统计性能。** MTP 的主要性能门槛是 decode 有效吞吐/TPOT；prefill 和初始化/交接分别验收、披露，整请求耗时保留为辅助指标。当前 Swift API 已拆为独立 `prefill` / `decode` 作业与单次消费的完整状态句柄，`generate` 保留组合调用。同执行器已有有界 prefill / ready decode 队列和 token 准入；默认完整阶段调度，显式 `cooperative` 可按 prompt chunk / 完整 AR 或 MTP round 继续执行。增量接口与调度通过 26 项 CPU、55 项实模检查；GPU 保持串行，尚未实现独立进程 PD 服务。接口与能力边界见 [阶段分离设计](docs/PREFILL_DECODE_SEPARATION.md)。
 
 ## 实现范围
 
@@ -80,7 +80,7 @@ HTTP 层、多请求压力、设备故障注入、验证中途取消以及完整
 
 ## MTP 发布前修复与回归
 
-上线条件见 [MTP_RELEASE_CRITERIA.md](docs/MTP_RELEASE_CRITERIA.md)。HTTP 与前缀树 / SSD offload 管理暂不推进。
+MTP 自身的上线条件见 [MTP_RELEASE_CRITERIA.md](docs/MTP_RELEASE_CRITERIA.md)。以下保留发布前修复与回归记录；[HTTP 服务](docs/HTTP_SERVER_EXPERIMENT.md)、前缀树和 SSD offload 按当前主计划独立推进，不受 MTP 性能尚未通过阻塞。
 
 `results/mtp-release-numerics/long-numerics.json` 从同一 AR checkpoint 比较 S1 与 S2。四个 11k 位置在改变未来草稿后，当前行的全部 trace/logits 逐位不变；S1/S2 则从前几层微小误差逐步扩大，最终 logit 最大绝对差约 0.19–0.31。固定 MLX 的 GEMV / gemv_wide 使用不同的加法分组，已据此实现 `GPUVerificationLinear`。
 

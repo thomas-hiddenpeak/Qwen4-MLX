@@ -4,6 +4,8 @@
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
+当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：先推进 AR 服务与完整状态前缀复用、缓存额度/淘汰和 SSD 状态缓存，分别优化 prefill / decode 基础路径；**MTP 性能优化放到计划后段，不再阻塞这些工作**。现有 MTP 保持显式选择，正确性和状态隔离要求不变；计划项不代表已经实现。
+
 ## 构建与生成
 
 需要兼容的外部 MLX / MLX C 原生库。现有工作区默认位置为 `../qwen38-ssd/runtime/mlx-serve/lib/mlx`，也可设置 `ANERUNNER_MLX_ROOT`；版本、库布局和完整用法见 [GPU runner](GPU_RUNNER.md)。Package 最低目标为 macOS 26.2，已有 macOS 26.6.2 / Swift 6.3.3 构建记录，当前 MLX 路径不要求 macOS 27。

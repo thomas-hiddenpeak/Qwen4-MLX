@@ -21,7 +21,9 @@ head history 求值本身约 0.045 s，不能把首 token 前全部 0.301 s 差�
 
 后续报告固定拆为三类：主干 prefill 的 input token/s 和处理延迟；decode 的有效输出 token/s、平均 TPOT 及各轮 draft/verify/commit/history 成本；初始化/交接的冷、热耗时与内存。初始化不挪入 decode 来混淆内核对比，也不能从请求总成本中消失；callback、首 token 和 EOS 采用明确且一致的计数规则。
 
-## 当前应该优化什么
+## 当时的 MTP 优化建议（当前已后置）
+
+2026-09-08 用户要求将 MTP 性能放到整体计划后段。下述候选顺序与计时保留为专项历史依据，不代表当前主线下一步；AR 服务、完整状态缓存和基础 prefill/decode 工作按[最新计划](UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)先行。已经实现的后续 MoE 探针及负结果仍以对应实验文档为准。
 
 实施顺序先建立独立的 prefill 产物与 decode 输入合同，再用相同完整状态重放 decode，最后逐项替换内核。交接状态包含 GDN、PLE、KV、QSA、MTP head 的历史与位置、pending token 和提交边界；只传 attention K/V 不足以恢复本模型。本机业务分离与合作调度现已实现并验证，见阶段分离设计；下面的 MoE/GDN 顺序是后续 decode 优化优先级，不是新增内核的性能承诺。
 

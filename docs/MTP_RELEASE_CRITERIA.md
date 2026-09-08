@@ -1,16 +1,18 @@
 # Native MTP 上线标准与候选状态
 
-更新：2026-09-07。适用范围：本机 M5 Max、单请求、greedy、当前下载权重与独立 Swift runner。本文规定发布门槛，不代表已经通过，也不承诺覆盖所有未来输入。
+更新：2026-09-08。适用范围：本机 M5 Max、单请求、greedy、当前下载权重与独立 Swift runner。本文规定 MTP 的发布门槛，不代表已经通过，也不承诺覆盖所有未来输入。
 
-当前对外推荐采用 **兼容现有 AR 的 greedy 输出合同**：固定权重、tokenizer、提示词 token IDs、输出屏蔽、EOS、上下文与 prefill 配置后，MTP 应输出与已验证 AR 相同的 token IDs。先解决 MTP 的正确性与实际收益，再推进后续缓存工作。
+当前对外推荐采用 **兼容现有 AR 的 greedy 输出合同**：固定权重、tokenizer、提示词 token IDs、输出屏蔽、EOS、上下文与 prefill 配置后，MTP 应输出与已验证 AR 相同的 token IDs。
 
-用户最新要求将 **prefill 与 decode 在业务接口和执行责任上分离，再分别优化内核**。性能验收相应按阶段进行：MTP 的主要性能门槛是 decode 有效吞吐与 TPOT，prefill 和初始化/交接成本独立报告。端到端时间是辅助指标，不能因 prefill 占比大而否定已经成立的 decode 收益，也不能省略 MTP 额外成本。当前已实现同一模型 / 执行器上的独立 `prefill` / `decode` 作业交接，`generate` 保留组合调用。本机调度器默认按完整阶段执行，可显式开启 chunk / round 合作调度；增量接口通过 26 项 CPU 与 55 项实模检查。GPU 仍串行，没有实现独立进程 PD 服务或 GPU 并行调度。实现与后续边界见 [阶段分离设计](PREFILL_DECODE_SEPARATION.md)。
+**2026-09-08 用户调整：MTP 性能优化放到整体计划后段。** 本文的 MTP 性能及完整发布门槛不再作为 AR 缓存、API、服务生命周期或基础 kernel 工作的前置条件。现有 MTP 保持显式启用；其输出正确性、状态隔离及受影响路径回归仍需维护。后续重新推进 MTP 性能和默认启用时，继续使用下述门槛，不把调整优先级写成已经通过发布验收。
+
+既有要求继续生效：**prefill 与 decode 在业务接口和执行责任上分离，再分别优化内核**。性能验收相应按阶段进行：MTP 的主要性能门槛是 decode 有效吞吐与 TPOT，prefill 和初始化/交接成本独立报告。端到端时间是辅助指标，不能因 prefill 占比大而否定已经成立的 decode 收益，也不能省略 MTP 额外成本。当前已实现同一模型 / 执行器上的独立 `prefill` / `decode` 作业交接，`generate` 保留组合调用。本机调度器默认按完整阶段执行，可显式开启 chunk / round 合作调度；增量接口通过 26 项 CPU 与 55 项实模检查。GPU 仍串行，没有实现独立进程 PD 服务或 GPU 并行调度。实现与后续边界见 [阶段分离设计](PREFILL_DECODE_SEPARATION.md)。
 
 ## 当前状态
 
 部署范围已由用户确认：先完成本机的 prefill / decode 分离，独立部署以后再考虑。本阶段验收不要求跨进程状态传输或独立 PD 服务；本机阶段指标、交接正确性与已实现的准入行为仍需验证。
 
-**已修复主基准的数值分叉；当前为显式启用的实验候选，尚未通过默认启用门槛。** 默认仍为 AR，显式 MTP 的默认验证器仍为 scalar。候选配置为 `--mtp-depth 2 --mtp-verification batchedScalarLinear --mtp-draft-history 1024`，最后一项默认仍是 full。HTTP 实验入口另行验收，尚未上线；这里不推进前缀树或 SSD 状态缓存。
+**已修复主基准的数值分叉；当前为显式启用的实验候选，尚未通过默认启用门槛。** 默认仍为 AR，显式 MTP 的默认验证器仍为 scalar。候选配置为 `--mtp-depth 2 --mtp-verification batchedScalarLinear --mtp-draft-history 1024`，最后一项默认仍是 full。[HTTP 实验入口](HTTP_SERVER_EXPERIMENT.md)已有有限文本服务及独立回归，尚未完成生产验收。AR 前缀及 SSD 状态缓存按[当前主计划](UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)独立推进，不等待 MTP 收益验收。
 
 - 旧模式的 S1/S2 dense 投影使用不同加法分组，误差经过层间传播后导致第 57 token 分叉。保留 S1 累积顺序并共享权重读取的新内核，使四个 11k checkpoint 的全部 trace/logits/提交状态对照恢复逐位一致（[数值诊断](../results/mtp-scalar-linear/long-numerics.json)）。这四个位置的诊断不等于所有输入的数学证明。
 - 新验证器加 shared MoE、SDPA 两行拆分后，depth1/2 短请求和 11k/128 的两次输出均匹配已有 AR golden（[短输入](../results/mtp-shared-linear/short.json)、[长输入](../results/mtp-shared-linear/long.json)）。
