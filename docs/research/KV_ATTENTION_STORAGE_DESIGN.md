@@ -1,6 +1,6 @@
 # K07 第一增量：AR decode 的 K/V 容量追加
 
-审阅日期：2026-09-09。本文只做代码设计审查，未改运行源码，未 build、运行 GPU 或测量性能。依据是本地 runner、实际安装的 MLX 对应源码，以及已经固定版本的上游研究。
+审阅日期：2026-09-09。前六节保留最初设计与验收要求；随后已完成独立 Metal 机制探针，结果见末节。生产 attention 尚未改变，没有整模型性能结论。依据是本地 runner、实际安装的 MLX 对应源码，以及已经固定版本的上游研究。
 
 建议先做一个默认关闭的 **单 token AR decode K/V capacity append**：保留容量 buffer，追加新行，现有 SDPA 读取逻辑前缀 view。先证明 MLX 确实复用了 buffer，再考虑 QSA 辅助数组和分页 reader。它有独立的收益机会，但不等于 K07 的跨请求页共享、尾页 COW 或 K08 增量持久化已经完成。
 
@@ -102,3 +102,13 @@ QSA raw/pooled 是后续收益较小的增量。raw 可复用相同容量机制�
 - [vLLM 研究](KV_VLLM_REVIEW.md)已固定 release `2cf0a6915ce544dc493a0990f2ea38d81601128a` 与 main `1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d`。吸收的是不可变共享、COW 源/目标引用留到完成、direct reader 才有分页收益；本增量仅验证追加/读取布局，不实现 block pool 或跨请求共享。
 - [SGLang 研究](KV_SGLANG_REVIEW.md)已固定 `30e7a3072d3f1e9bd70cd5e44146ca27c80522c4`。共同可恢复边界和 recurrent 私有化仍适用于 Qwen GDN/PLE；Attention 容量不产生任意 token 的 GDN checkpoint。统一内存无需照搬 CUDA 的完整 CPU/GPU 双池。
 - K07 后续真正页化应接不可变完整页、私有尾页及直接读页的 SDPA/QSA；快照仍可在选定 checkpoint 时 materialize。整请求页共享、减少 system+tail 重复快照、降低 SSD 写放大都是后续目标，不能由本次 append 优化的收益代替验收。
+
+## 8. 已完成的独立 Metal 机制验证
+
+源码已纳入 [native/kv-capacity](../../native/kv-capacity/README.md)，与受测 ignored 原稿逐字节相同。追加源码 SHA256 `7e4cb48a5936a3aa46b333e7e20595e4b0d09933f47cc4a364abc44af153cb74`，GQA 源码 `d0090b79a3d737efdc81761d42ff279483c29ebe608f3768487bee7b624d8705`。安装头文件/库/本地实现共17项及GQA相关源已固定指纹；两份C++程序均用原SDK编译通过，没有重建或替换MLX。
+
+`results/kv-capacity-mechanism-v1/` 五case全部通过。同步、async submit后同步等待、附加双头无mask SDPA三种追加模式，各17次追加：13次未增长复用原Metal buffer、2次容量增长、2次保留旧alias时的安全COW。原始BF16元素与独立concat oracle一致，旧alias内容保持不变；root另从NDJSON重新核对每步buffer身份/offset/allocation和13/2/2分类，不以allocator用量不变代替复用证据。
+
+真实Q24/KV2、GQA12、D256的SDPA布局对照，在同步与async两模式各通过14个长度、49组case。逻辑K/V view的head stride保留容量间隙；unmasked、alltrue、last-row-only及代表性512完整块加尾部bool mask输出与独立紧凑输入逐位相同。last-row-only还独立验证Q head到KV head映射。代表性mask没有运行真实learned indexer/argpartition，也不证明SDPA内部没有其他临时复制。
+
+262个冻结文件/102模型stat postflight通过，参考62443按原参数恢复、idle及MTP/drafter关闭独立核对。探针的allocation身份有实证；其peak字段为0，没有形成有效的生产峰值观测，不能解释成零内存占用。无模型加载、无实际吞吐/带宽测量、无Swift ARC/profiler集成。因此第一关通过，下一关仍是Swift所有权与增长峰值及完整模型数值/资源回归；生产默认concat保持不变。
