@@ -3,7 +3,7 @@ import ANERunnerGPU
 import CMLX
 import Foundation
 
-private struct CacheReliabilityAnchor: Codable, Equatable {
+struct CacheReliabilityAnchor: Codable, Equatable {
     struct Value: Codable, Equatable {
         let shape: [Int]
         let dtype, byteCount: Int
@@ -50,6 +50,15 @@ private struct CacheReliabilityAnchor: Codable, Equatable {
     }
 }
 
+/// Deterministic policy time only. This never changes the host clock, emits
+/// macOS memory-pressure events or allocates memory to create real pressure.
+private final class CacheReliabilityPressureClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 100
+    func now() -> TimeInterval { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ time: TimeInterval) { lock.lock(); defer { lock.unlock() }; value = time }
+}
+
 extension RunnerCLI {
     /// Separate populate/restore invocations make process-restart reuse a real
     /// test. Diagnostic tensor readback means these are not throughput trials.
@@ -57,9 +66,9 @@ extension RunnerCLI {
         try args.validate(["--model-dir", "--tokens-file", "--cache-directory", "--output", "--mode", "--oracle-report"])
         let output = try args.require("--output"), mode = try args.require("--mode")
         guard !FileManager.default.fileExists(atPath: output),
-              ["populate", "restore", "corrupt", "lifecycle"].contains(mode),
+              ["populate", "restore", "corrupt", "lifecycle", "pressure"].contains(mode),
               !["restore", "corrupt"].contains(mode) || args["--oracle-report"] != nil else {
-            throw CLIError.usage("Cache reliability probe needs new --output, --mode populate|restore|corrupt|lifecycle; restore/corrupt also need --oracle-report")
+            throw CLIError.usage("Cache reliability probe needs new --output, --mode populate|restore|corrupt|lifecycle|pressure; restore/corrupt also need --oracle-report")
         }
         var report: [String: Any] = ["schema": "qwen38-cache-reliability-v1", "mode": mode,
             "complete": false, "passed": false,
@@ -117,8 +126,15 @@ extension RunnerCLI {
                 }
             }
             defer { try? MX.synchronize() }
+            let pressureClock = CacheReliabilityPressureClock()
+            let pressurePolicy: QwenMemoryPressurePolicy?
+            if mode == "pressure" {
+                pressurePolicy = try QwenMemoryPressurePolicy(recoveryStableSeconds: 5,
+                    clock: { pressureClock.now() })
+            } else { pressurePolicy = nil }
             let generator = try QwenGenerator(model: model,
-                prefixCacheLimits: .init(maxEntries: 8, maxBytes: 512 * 1024 * 1024), prefixDiskStore: disk)
+                prefixCacheLimits: .init(maxEntries: 8, maxBytes: 512 * 1024 * 1024), prefixDiskStore: disk,
+                memoryPressurePolicy: pressurePolicy)
             func request(_ tokens: [Int32], _ prefix: Int, output: Int = 32) -> QwenGenerationRequest {
                 QwenGenerationRequest(tokens: tokens, maxTokens: output, contextLimit: 16_384,
                     prefillChunk: 416, mtpDepth: 0, prefixCacheMaxTokens: prefix)
@@ -283,6 +299,254 @@ extension RunnerCLI {
                     try clean("private_lifetime", requireEmptyCache: true)
                 }
                 report["state_event_counts"] = eventCounts
+            } else if mode == "pressure" {
+                guard let pressurePolicy else { throw CLIError.usage("Missing injected pressure policy") }
+                report["pressure_validation_kind"] = "injected_policy_real_model"
+                report["actual_system_pressure_tested"] = false
+                report["pressure_monitor_started"] = false
+                report["pressure_scope"] = "Injected policy events and virtual stability clock with real model/caches; not actual macOS pressure, allocation-failure or HTTP transport validation. State hashes compare complete mixed prefix checkpoints, not final decode tensors."
+                var pressureSnapshots = [[String: Any]]()
+                func pressureSnapshot(_ label: String) throws {
+                    pressureSnapshots.append(["label": label, "policy": try object(pressurePolicy.snapshot),
+                        "budget": try object(generator.stateBudgetStatistics),
+                        "ram": try object(generator.prefixCacheStatistics), "disk": try object(disk.statistics)])
+                    report["pressure_snapshots"] = pressureSnapshots
+                    try write()
+                }
+                func rejectNewRequest(_ req: QwenGenerationRequest, label: String) throws {
+                    let before = generator.stateBudgetStatistics
+                    var rejected = false
+                    do {
+                        let unwanted = try generator.beginPrefill(req)
+                        try unwanted.discard()
+                    } catch QwenGenerationError.resourceLimit(_) { rejected = true }
+                    try require(label + "_resource_limit", rejected)
+                    try require(label + "_no_state_allocation", generator.stateBudgetStatistics == before)
+                }
+                let cold = try QwenGenerator(model: model)
+                pressurePolicy.observe(.normal)
+                try require("pressure_initial_event_is_injected", pressurePolicy.snapshot.operatingSystemEvents == 0 &&
+                    pressurePolicy.snapshot.injectedEvents == 1 && pressurePolicy.snapshot.effectiveLevel == .normal)
+                for (length, prefix) in [(833, 416), (2053, 1664)] {
+                    let label = "pressure_p\(length)_k\(prefix)", tokens = Array(prompt.prefix(length))
+                    let req = request(tokens, prefix, output: 16)
+                    try generator.clearPrefixCache(includingDisk: true)
+                    try clean(label + "_start", requireEmptyCache: true)
+
+                    // Establish the reference from an independent cache-disabled
+                    // generation. The subsequent stateChecks all compare a
+                    // different execution/storage path against this anchor.
+                    var referenceAnchor: CacheReliabilityAnchor?
+                    var referenceEvents = 0
+                    cold.prefixStateObserver = { event, state in
+                        guard event == "coldBoundary", state.offset == prefix else {
+                            throw CLIError.usage("Unexpected pressure reference state event")
+                        }
+                        referenceEvents += 1
+                        referenceAnchor = try CacheReliabilityAnchor(state)
+                    }
+                    defer { cold.prefixStateObserver = nil }
+                    let oracle = try cold.generate(req)
+                    cold.prefixStateObserver = nil
+                    guard let anchor = referenceAnchor else { throw CLIError.usage("Missing independent cold anchor") }
+                    // maxTokens is an upper bound, not a promise to emit that
+                    // many tokens. The P833 fixture naturally ends with EOS
+                    // after three tokens. Retain native stopping semantics;
+                    // three tokens still leave a live decode after the two
+                    // warning steps, so critical continuation is exercised.
+                    let minimumOracleTokens = 3
+                    let endsInEOS = oracle.tokens.last.map { cold.eosTokenIDs.contains($0) } ?? false
+                    let noEarlierEOS = oracle.tokens.dropLast().allSatisfy { !cold.eosTokenIDs.contains($0) }
+                    let stopIsValid = oracle.finishReason == .eos ? endsInEOS :
+                        oracle.tokens.count == req.maxTokens && !endsInEOS
+                    let outputIsValid = oracle.tokens.count >= minimumOracleTokens &&
+                        oracle.tokens.count <= req.maxTokens && noEarlierEOS && stopIsValid
+                    // Persist each actual condition before the combined guard;
+                    // a failed run must retain enough evidence to diagnose it.
+                    report[label + "_cold_reference_anchor"] = try object(anchor)
+                    report[label + "_cold_reference_result"] = try object(oracle)
+                    report[label + "_cold_reference_validation"] = [
+                        "observed_cold_boundary_events": referenceEvents, "expected_cold_boundary_events": 1,
+                        "anchor_valid": anchor.valid, "anchor_host_valid": anchor.host.valid,
+                        "anchor_offset": anchor.host.offset, "expected_anchor_offset": prefix,
+                        "anchor_tensor_count": anchor.tensors.count,
+                        "nonfinite_tensor_names": anchor.tensors.filter { !$0.value.finite }.keys.sorted(),
+                        "gdn_capture_present": anchor.host.gdnCapturePresent.contains(true),
+                        "ple_capture_present": anchor.host.pleCapturePresent.contains(true),
+                        "actual_generated_tokens": oracle.tokens.count, "minimum_generated_tokens": minimumOracleTokens,
+                        "max_generated_tokens": req.maxTokens, "finish_reason": oracle.finishReason.rawValue,
+                        "ends_in_eos": endsInEOS, "no_earlier_eos": noEarlierEOS,
+                        "stop_is_valid": stopIsValid, "output_is_valid": outputIsValid,
+                        "actual_generated_token_ids": oracle.tokens]
+                    try require(label + "_independent_reference_valid", referenceEvents == 1 && anchor.valid &&
+                        anchor.host.offset == prefix && outputIsValid)
+
+                    var phase = "seed", injectAtPublish = false, injectedPublications = 0
+                    var eventCounts = [String: Int]()
+                    generator.prefixStateObserver = { event, state in
+                        let observed = try CacheReliabilityAnchor(state)
+                        let exact = state.offset == prefix && anchor.matches(observed)
+                        eventCounts[phase + ":" + event, default: 0] += 1
+                        stateChecks.append(["label": label, "phase": phase, "event": event,
+                            "offset": state.offset, "passed": exact, "reference": "independent_cache_disabled_prefill",
+                            "tensor_count": observed.tensors.count, "all_finite": observed.valid,
+                            "observed": try object(observed)])
+                        try write()
+                        guard exact else { throw CLIError.usage("Pressure path state differs from independent cold anchor") }
+                        if injectAtPublish, event == "publish" {
+                            injectedPublications += 1
+                            pressurePolicy.observe(.warning)
+                        }
+                    }
+                    defer { generator.prefixStateObserver = nil }
+                    let seed = try generator.generate(req)
+                    try record(label + "_seed", seed, tokens: oracle.tokens,
+                        finish: oracle.finishReason.rawValue, cached: 0, source: "cold")
+                    try clean(label + "_seed")
+                    try require(label + "_seed_both_tiers", generator.prefixCacheStatistics?.entries == 1 && disk.statistics.entries == 1)
+
+                    // Retain a private RAM-restored cursor across warning,
+                    // incremental cache release, another restore and critical.
+                    phase = "active_restore"
+                    let activePrefill = try generator.beginPrefill(req)
+                    defer { try? activePrefill.discard() }
+                    try require(label + "_active_ram_restore", activePrefill.processedTokenCount == prefix &&
+                        eventCounts["active_restore:restore"] == 1)
+                    let activeBudget = generator.stateBudgetStatistics
+                    pressurePolicy.observe(.warning)
+                    try pressureSnapshot(label + "_warning")
+                    try require(label + "_warning_decisions", pressurePolicy.snapshot.allowsNewRequests &&
+                        !pressurePolicy.snapshot.allowsOptionalCache && pressurePolicy.takeTrimRequest() != nil)
+                    let trimmed = try generator.trimPrefixCacheMemory(maxEntries: 1)
+                    try require(label + "_bounded_trim_keeps_active_state", trimmed == 1 &&
+                        generator.prefixCacheStatistics?.entries == 0 && generator.stateBudgetStatistics.cacheBytes == 0 &&
+                        generator.stateBudgetStatistics.requestBytes == activeBudget.requestBytes && activeBudget.requestBytes > 0)
+                    let activeReady = try finishPrefill(activePrefill)
+                    defer { activeReady.discard() }
+                    let activeDecode = try generator.beginDecode(activeReady)
+                    defer { try? activeDecode.discard() }
+                    var activeTokens = [Int32]()
+                    for _ in 0..<2 {
+                        let early = try generator.stepDecode(activeDecode, onToken: { activeTokens.append($0) })
+                        try require(label + "_decode_not_finished_early_\(activeTokens.count)", early == nil)
+                    }
+                    try require(label + "_warning_prefill_and_decode_progress", activeTokens == Array(oracle.tokens.prefix(2)))
+
+                    // Foreground disk restoration belongs to an admitted
+                    // request; its optional RAM promotion must stay disabled.
+                    phase = "warning_disk"
+                    let beforeDisk = disk.statistics
+                    let beforePublished = generator.prefixCacheStatistics?.published
+                    let fromDisk = try generator.generate(req)
+                    try record(label + "_warning_disk_without_promotion", fromDisk, tokens: oracle.tokens,
+                        finish: oracle.finishReason.rawValue, cached: prefix, source: "disk")
+                    try generator.flushPrefixCacheWrites()
+                    try require(label + "_warning_import_did_not_fill", eventCounts["warning_disk:restore"] == 1 &&
+                        generator.prefixCacheStatistics?.entries == 0 && generator.stateBudgetStatistics.cacheBytes == 0 &&
+                        generator.prefixCacheStatistics?.published == beforePublished && disk.statistics.published == beforeDisk.published &&
+                        disk.statistics.bytesWritten == beforeDisk.bytesWritten && disk.statistics.pendingJobs == 0)
+
+                    // A new cold request is allowed at warning but its complete
+                    // checkpoint must not add either a RAM or SSD cache entry.
+                    try generator.clearPrefixCache(includingDisk: true)
+                    phase = "warning_cold"
+                    let beforeWarningColdDisk = disk.statistics
+                    let warningCold = try generator.generate(req)
+                    try record(label + "_warning_cold_without_fill", warningCold, tokens: oracle.tokens,
+                        finish: oracle.finishReason.rawValue, cached: 0, source: "cold")
+                    try generator.flushPrefixCacheWrites()
+                    try require(label + "_warning_cold_publication_skipped", eventCounts["warning_cold:coldBoundary"] == 1 &&
+                        eventCounts["warning_cold:publish"] == nil && generator.prefixCacheStatistics?.entries == 0 &&
+                        disk.statistics.entries == 0 && disk.statistics.published == beforeWarningColdDisk.published)
+
+                    // Submit while warning still allows admission, then change
+                    // pressure before its first model allocation. The failure
+                    // must not poison the scheduler or touch the active decode.
+                    let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
+                    defer { _ = try? scheduler.discardAll() }
+                    let queuedID = try scheduler.submit(req)
+                    pressurePolicy.observe(.critical)
+                    try pressureSnapshot(label + "_critical")
+                    try rejectNewRequest(req, label: label + "_critical_direct")
+                    let beforeRejectedJob = generator.stateBudgetStatistics
+                    let rejected = try scheduler.runNext()
+                    try require(label + "_queued_first_allocation_rejected", rejected?.jobID == queuedID &&
+                        rejected?.kind == .failed && rejected?.stage == .prefill && rejected?.errorCode == "resource_limit")
+                    try require(label + "_rejection_does_not_poison_scheduler_or_allocate", scheduler.snapshot().acceptingJobs &&
+                        scheduler.snapshot().isIdle && scheduler.snapshot().reservedTokens == 0 &&
+                        generator.stateBudgetStatistics == beforeRejectedJob)
+                    phase = "active_decode_critical"
+                    var activeResult: QwenGenerationResult?
+                    let decodeDeadline = Date().addingTimeInterval(120)
+                    while activeResult == nil && Date() < decodeDeadline {
+                        activeResult = try generator.stepDecode(activeDecode, onToken: { activeTokens.append($0) })
+                    }
+                    guard let activeResult else { throw CLIError.usage("Pressure survivor decode stalled") }
+                    try record(label + "_active_survives_warning_trim_and_critical", activeResult,
+                        tokens: oracle.tokens, finish: oracle.finishReason.rawValue, cached: prefix, source: "memory")
+                    try require(label + "_active_callback_tokens_exact", activeTokens == oracle.tokens)
+                    try clean(label + "_critical_complete", requireEmptyCache: true)
+
+                    let recoveryStarted = pressureClock.now()
+                    pressurePolicy.observe(.normal)
+                    pressureClock.set(recoveryStarted + 4.9)
+                    try pressureSnapshot(label + "_recovery_hold")
+                    try rejectNewRequest(req, label: label + "_recovery_hold")
+                    try require(label + "_recovery_hold_still_critical", pressurePolicy.snapshot.effectiveLevel == .critical &&
+                        pressurePolicy.snapshot.recoveryRemainingSeconds.map { $0 > 0 } == true)
+                    pressureClock.set(recoveryStarted + 5)
+                    try require(label + "_recovery_window_completed", pressurePolicy.snapshot.effectiveLevel == .normal &&
+                        pressurePolicy.snapshot.allowsNewRequests && pressurePolicy.snapshot.allowsOptionalCache)
+                    phase = "recovered_scheduler"
+                    let recoveredID = try scheduler.submit(req)
+                    var recovered: QwenGenerationResult?
+                    let schedulerDeadline = Date().addingTimeInterval(600)
+                    while recovered == nil && Date() < schedulerDeadline {
+                        if let event = try scheduler.runNext(), event.jobID == recoveredID {
+                            if event.kind == .completed { recovered = event.result }
+                            else if event.kind == .failed || event.kind == .cancelled {
+                                throw CLIError.usage("Recovered scheduler failed: \(event.errorDescription ?? event.kind.rawValue)")
+                            }
+                        }
+                        if (scheduler.snapshot().waitingPrefixSequences ?? 0) > 0 { Thread.sleep(forTimeInterval: 0.001) }
+                    }
+                    guard let recovered else { throw CLIError.usage("Recovered scheduler stalled") }
+                    try record(label + "_same_scheduler_recovers", recovered, tokens: oracle.tokens,
+                        finish: oracle.finishReason.rawValue, cached: 0, source: "cold")
+                    try clean(label + "_recovered")
+                    try require(label + "_recovered_scheduler_idle", scheduler.snapshot().isIdle && scheduler.snapshot().acceptingJobs)
+
+                    // The copy has finished when the publish observer runs.
+                    // Inject warning here to exercise the final admission guard
+                    // immediately before insertion; no unfinished storage is
+                    // released and no cache candidate may become retained.
+                    try generator.clearPrefixCache(includingDisk: true)
+                    phase = "publish_race"; injectAtPublish = true
+                    let racePublished = generator.prefixCacheStatistics?.published
+                    let raceDisk = disk.statistics
+                    let race = try generator.generate(req)
+                    injectAtPublish = false
+                    try record(label + "_warning_between_copy_and_insert", race, tokens: oracle.tokens,
+                        finish: oracle.finishReason.rawValue, cached: 0, source: "cold")
+                    try clean(label + "_publish_race", requireEmptyCache: true)
+                    try require(label + "_completed_candidate_not_published", injectedPublications == 1 &&
+                        eventCounts["publish_race:publish"] == 1 && generator.prefixCacheStatistics?.published == racePublished &&
+                        generator.prefixCacheStatistics?.entries == 0 && disk.statistics.entries == 0 &&
+                        disk.statistics.published == raceDisk.published && disk.statistics.bytesWritten == raceDisk.bytesWritten)
+                    report[label + "_state_event_counts"] = eventCounts
+                    try pressureSnapshot(label + "_publish_race_warning")
+                    let finalRecovery = pressureClock.now()
+                    pressurePolicy.observe(.normal)
+                    pressureClock.set(finalRecovery + 5)
+                    try require(label + "_next_trial_normal", pressurePolicy.snapshot.effectiveLevel == .normal)
+                    generator.prefixStateObserver = nil
+                }
+                try require("pressure_os_events_never_synthesized", pressurePolicy.snapshot.operatingSystemEvents == 0 &&
+                    pressurePolicy.snapshot.events == pressurePolicy.snapshot.injectedEvents)
+                try require("pressure_denials_observed", pressurePolicy.snapshot.newRequestDenials >= 6 &&
+                    pressurePolicy.snapshot.optionalCacheDenials > 0)
+                try pressureSnapshot("pressure_complete")
+                try clean("pressure_complete", requireEmptyCache: true)
             } else {
                 let cold = try QwenGenerator(model: model)
                 for (length, prefix) in [(833, 416), (2053, 1664)] {

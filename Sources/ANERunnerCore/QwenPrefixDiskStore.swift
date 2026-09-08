@@ -13,13 +13,35 @@ public struct QwenPrefixDiskLimits: Codable, Equatable, Sendable {
     public let maxPendingJobs: Int
     public let maxPendingBytes: Int
     public let maxMetadataBytes: Int
+    /// Leave this much space available to the current user on the cache volume
+    /// after allocating a complete temporary archive. Zero disables sampling.
+    public let minAvailableBytes: Int
 
     public init(maxEntries: Int = 32, maxBytes: Int = 8_589_934_592,
                 maxKeyTokens: Int = 1_048_576, maxPendingJobs: Int = 2,
-                maxPendingBytes: Int = 536_870_912, maxMetadataBytes: Int = 1_048_576) {
+                maxPendingBytes: Int = 536_870_912, maxMetadataBytes: Int = 1_048_576,
+                minAvailableBytes: Int = 1_073_741_824) {
         self.maxEntries = maxEntries; self.maxBytes = maxBytes
         self.maxKeyTokens = maxKeyTokens; self.maxPendingJobs = maxPendingJobs
         self.maxPendingBytes = maxPendingBytes; self.maxMetadataBytes = maxMetadataBytes
+        self.minAvailableBytes = minAvailableBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case maxEntries, maxBytes, maxKeyTokens, maxPendingJobs, maxPendingBytes, maxMetadataBytes
+        case minAvailableBytes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(maxEntries: try values.decode(Int.self, forKey: .maxEntries),
+                  maxBytes: try values.decode(Int.self, forKey: .maxBytes),
+                  maxKeyTokens: try values.decode(Int.self, forKey: .maxKeyTokens),
+                  maxPendingJobs: try values.decode(Int.self, forKey: .maxPendingJobs),
+                  maxPendingBytes: try values.decode(Int.self, forKey: .maxPendingBytes),
+                  maxMetadataBytes: try values.decode(Int.self, forKey: .maxMetadataBytes),
+                  minAvailableBytes: try values.decodeIfPresent(Int.self, forKey: .minAvailableBytes)
+                    ?? 1_073_741_824)
     }
 }
 
@@ -41,6 +63,19 @@ public struct QwenPrefixDiskStatistics: Codable, Equatable, Sendable {
     public var bytesRead = 0
     public var bytesWritten = 0
     public var recoveredEntries = 0
+    public var spaceChecks = 0
+    /// Optional writes skipped because the latest sample cannot preserve the
+    /// configured floor. These also contribute to `rejected`.
+    public var spaceRejections = 0
+    /// Query failures also skip the optional write and contribute to `rejected`.
+    public var spaceQueryFailures = 0
+    /// Transitions from a failed space check to a sufficient sample; a later
+    /// publication may still fail for an unrelated reason.
+    public var spaceRecoveries = 0
+    public var availableSpaceBytes: UInt64? = nil
+    /// Last check failed (low space or unknown space). Reads remain enabled;
+    /// subsequent writes retry the check without requiring clear or restart.
+    public var spaceConstrained = false
     /// An owned file could not be removed, so new SSD work is disabled rather
     /// than allowing unaccounted files to accumulate. Successful clear resets it.
     public var storageUnavailable = false
@@ -89,6 +124,8 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     public let limits: QwenPrefixDiskLimits
     private let ttlSeconds: TimeInterval?
     private let clock: @Sendable () -> TimeInterval
+    private let availableSpace: @Sendable (Int32) throws -> UInt64
+    private let publicationDirectorySync: @Sendable (Int32) throws -> Void
     private let queue = DispatchQueue(label: "qwen.prefix.ssd", qos: .utility)
     private let callbackQueue = DispatchQueue(label: "qwen.prefix.ssd.callback", qos: .utility)
     private let queueKey = DispatchSpecificKey<Bool>()
@@ -111,6 +148,9 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     // Below are owned exclusively by queue (including startup before exposure).
     private let index: QwenPrefixCacheIndex<String>
     private var records: [String: Record] = [:]
+    // A clear invalidates public metadata immediately, before its queued file
+    // removal runs. Old queue work must not refill that metadata meanwhile.
+    private var recordsEpoch: UInt64 = 0
     private var order: UInt64 = 0
     private var fileAllocationUnit = 4096
     private static let prefix = "qwen-prefix-v1-"
@@ -144,17 +184,39 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         let payloadBytes: Int
     }
 
-    public init(directory: URL, limits: QwenPrefixDiskLimits = .init(),
+    public convenience init(directory: URL, limits: QwenPrefixDiskLimits = .init(),
                 ttlSeconds: TimeInterval? = nil,
-                now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) throws {
+                now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
+                availableSpace: (@Sendable (Int32) throws -> UInt64)? = nil) throws {
+        try self.init(directory: directory, limits: limits, ttlSeconds: ttlSeconds,
+                      now: now, availableSpace: availableSpace,
+                      publicationDirectorySync: { fd in
+                          guard fsync(fd) == 0 else { throw Self.io("fsync directory") }
+                      })
+    }
+
+    // Module-internal fault injection for the publication commit boundary.
+    // The callback borrows the directory FD, runs without admission held, and
+    // must neither close the FD nor call a waiting store operation.
+    init(directory: URL, limits: QwenPrefixDiskLimits = .init(),
+         ttlSeconds: TimeInterval? = nil,
+         now: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 },
+         availableSpace: (@Sendable (Int32) throws -> UInt64)? = nil,
+         publicationDirectorySync: @escaping @Sendable (Int32) throws -> Void) throws {
         guard limits.maxEntries > 0, limits.maxBytes > 0,
               limits.maxKeyTokens > 0, limits.maxPendingJobs > 0,
               limits.maxPendingBytes > 0, limits.maxMetadataBytes > 0,
+              limits.minAvailableBytes >= 0,
               limits.maxMetadataBytes <= Self.maxManifestBytes / 2,
               ttlSeconds.map({ $0.isFinite && $0 > 0 }) ?? true,
               directory.isFileURL else { throw StoreError.invalidLimits }
         self.directory = directory; self.limits = limits
         self.ttlSeconds = ttlSeconds; self.clock = now
+        // The optional sampler is an injection point for deterministic CPU
+        // faults. It runs only on the IO queue, borrows the open directory FD,
+        // and must not retain or close that FD or call back into this store.
+        self.availableSpace = availableSpace ?? { try Self.sampleAvailableSpace(directoryFD: $0) }
+        self.publicationDirectorySync = publicationDirectorySync
         self.index = try QwenPrefixCacheIndex(maxEntries: limits.maxEntries,
                                              maxBytes: limits.maxBytes,
                                              maxKeyTokens: limits.maxKeyTokens)
@@ -212,6 +274,10 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         guard admitLocked(bytes: charge) else { admission.unlock(); return false }
         let submittedEpoch = epoch
         queue.async { [self] in
+            // A callback can start on its separate queue before this IO block
+            // returns. Keep its captured transfer owner through our own final
+            // use of the archive, independently of callback completion timing.
+            defer { withExtendedLifetime(completion) {} }
             let success = isCurrent(submittedEpoch) && write(
                 tokens: tokens, namespace: namespace, metadata: metadata,
                 payload: payload, submittedEpoch: submittedEpoch)
@@ -328,6 +394,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         admission.lock()
         guard !closed else { admission.unlock(); return }
         epoch &+= 1
+        let submittedEpoch = epoch
         summaries.removeAll(keepingCapacity: false)
         let semaphore = DispatchSemaphore(value: 0)
         queue.async { [self] in
@@ -337,15 +404,18 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             }
             if !removeOwnedTemporaryFiles() { removedAll = false }
             if fsync(directoryFD) != 0 { removedAll = false }
+            recordsEpoch = submittedEpoch
             admission.lock()
             stats.storageUnavailable = !removedAll
             if resetStatistics {
                 let pendingJobs = stats.pendingJobs, pendingBytes = stats.pendingBytes
                 let unavailable = stats.storageUnavailable
+                let available = stats.availableSpaceBytes, constrained = stats.spaceConstrained
                 let entries = stats.entries, bytes = stats.diskBytes, keys = stats.keyTokens
                 stats = .init(); stats.pendingJobs = pendingJobs; stats.pendingBytes = pendingBytes
                 stats.entries = entries; stats.diskBytes = bytes; stats.keyTokens = keys
                 stats.storageUnavailable = unavailable
+                stats.availableSpaceBytes = available; stats.spaceConstrained = constrained
             }
             admission.unlock()
             semaphore.signal()
@@ -393,7 +463,9 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     private func isCurrent(_ submittedEpoch: UInt64) -> Bool {
         admission.lock(); defer { admission.unlock() }; return epoch == submittedEpoch
     }
-    private func refreshAccounting() {
+    @discardableResult
+    private func refreshAccounting(publishing submittedEpoch: UInt64? = nil,
+                                   writtenBytes: Int = 0) -> Bool {
         let entries = records.count
         let bytes = records.values.reduce(0) { $0 + $1.bytes }
         let tokens = records.values.reduce(0) { $0 + $1.manifest.tokens.count }
@@ -407,8 +479,14 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         }
         admission.lock()
         stats.entries = entries; stats.diskBytes = bytes; stats.keyTokens = tokens
-        summaries = snapshot
+        let current = recordsEpoch == epoch && (submittedEpoch.map { $0 == epoch } ?? true)
+        if current { summaries = snapshot }
+        else { summaries.removeAll(keepingCapacity: false) }
+        if submittedEpoch != nil, current {
+            stats.published += 1; stats.bytesWritten += writtenBytes
+        }
         admission.unlock()
+        return current
     }
 
     private func write(tokens: [Int32], namespace: String, metadata: Data,
@@ -421,7 +499,16 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         let name = Self.fileName(tokens: tokens, namespace: namespace)
         let temporary = Self.prefix + UUID().uuidString.lowercased() + ".tmp"
         var fd: Int32 = -1
+        var installedCandidate = false
+        var published = false
         defer {
+            // A successful rename is not yet a published cache entry. Clear
+            // or immediate close may invalidate it while directory IO runs.
+            // The serial queue prevents a replacement from racing this cleanup.
+            if installedCandidate && !published {
+                _ = removeRecord(name)
+                if fsync(directoryFD) != 0 { update { $0.writeFailures += 1 } }
+            }
             if fd >= 0 { Darwin.close(fd) }
             if unlinkat(directoryFD, temporary, 0) != 0, errno != ENOENT {
                 update { $0.storageUnavailable = true; $0.writeFailures += 1 }
@@ -434,6 +521,14 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             let total = try Self.sum(Self.headerBytes, encoded.count, payload.count)
             let reserved = try roundedAllocation(total)
             guard reserved <= limits.maxBytes else { reject(); return false }
+            // This queue has a single physical writer. Queued jobs hold RAM
+            // reservations, but cannot allocate a temporary file until their
+            // own fresh space check. Existing published bytes are already
+            // excluded by f_bavail; do not subtract them again, or credit a
+            // same-key file that rename has not replaced yet. Check before LRU
+            // eviction so an optional low-space write cannot evict useful data.
+            guard hasAvailableSpace(forAdditionalBytes: reserved) else { return false }
+            guard isCurrent(submittedEpoch) else { return false }
             removeExpired()
             // Reserve room for a temporary complete file before creating it.
             // A replacement keeps its old file until this reservation requires
@@ -459,30 +554,95 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             }
             let cost = try Self.diskCost(info)
             guard cost <= limits.maxBytes else { reject(); return false }
+            // Another process can consume the volume after the first sample.
+            // The temporary file is now allocated, so check only the floor;
+            // charging its size again would double-count those bytes. Failure
+            // drops the temporary archive. Actual ENOSPC still follows the IO
+            // failure path; a sampled floor is not an OS reservation guarantee.
+            guard hasAvailableSpace(forAdditionalBytes: 0) else { return false }
             guard makeRoom(bytes: cost, tokens: tokens.count, entries: 1) else { return false }
-            // The publication and epoch check share the admission lock. Clear
-            // cannot invalidate an epoch between its check and atomic rename.
             admission.lock()
             guard epoch == submittedEpoch else { admission.unlock(); return false }
-            let renamed = renameat(directoryFD, temporary, directoryFD, name) == 0
-            let renameError = errno
-            let synced = renamed && fsync(directoryFD) == 0
-            let syncError = errno
+            // A replacement can have a different payload size. Do not let a
+            // new peek size its restore from the old file while rename/sync
+            // replaces that file. Already admitted reads stay queue ordered.
+            summaries.removeValue(forKey: name)
             admission.unlock()
-            guard renamed else { throw StoreError.io(operation: "rename snapshot", code: renameError) }
-            guard synced else {
-                _ = unlinkat(directoryFD, name, 0)
-                removeRecord(name)
-                throw StoreError.io(operation: "fsync directory", code: syncError)
+            // Physical IO never holds admission: even a delayed directory sync
+            // must leave metadata, new admissions and clear's epoch responsive.
+            guard renameat(directoryFD, temporary, directoryFD, name) == 0 else {
+                throw Self.io("rename snapshot")
             }
+            installedCandidate = true
             // If a same-key file survived reservation, rename replaced it.
             if let old = records.removeValue(forKey: name) {
                 _ = index.remove(tokens: old.manifest.tokens, namespace: old.manifest.namespace)
             }
-            insertRecord(name: name, manifest: manifest, bytes: cost, payloadBytes: payload.count)
-            update { $0.published += 1; $0.bytesWritten += total }
+            // Track the candidate for cleanup/accounting, but keep it out of
+            // public summaries until both durable IO and the epoch check pass.
+            stageRecord(name: name, manifest: manifest, bytes: cost, payloadBytes: payload.count)
+            try publicationDirectorySync(directoryFD)
+            guard refreshAccounting(publishing: submittedEpoch, writtenBytes: total) else { return false }
+            published = true
             return true
-        } catch { update { $0.writeFailures += 1 }; return false }
+        } catch {
+            // If rename failed, the prior archive still exists and may regain
+            // its summary only if clear has not invalidated this record epoch.
+            if !installedCandidate { refreshAccounting() }
+            update { $0.writeFailures += 1 }
+            return false
+        }
+    }
+
+    private func hasAvailableSpace(forAdditionalBytes bytes: Int) -> Bool {
+        guard limits.minAvailableBytes > 0 else { return true }
+        do {
+            let available = try availableSpace(directoryFD)
+            let floor = UInt64(limits.minAvailableBytes)
+            // Subtraction avoids overflowing floor + archive reservation.
+            let sufficient = available >= floor && available - floor >= UInt64(bytes)
+            update {
+                $0.spaceChecks += 1; $0.availableSpaceBytes = available
+                if sufficient {
+                    if $0.spaceConstrained { $0.spaceRecoveries += 1 }
+                    $0.spaceConstrained = false
+                } else {
+                    $0.spaceConstrained = true
+                    $0.spaceRejections += 1; $0.rejected += 1
+                }
+            }
+            return sufficient
+        } catch {
+            update {
+                $0.spaceChecks += 1; $0.availableSpaceBytes = nil
+                $0.spaceConstrained = true
+                $0.spaceQueryFailures += 1; $0.rejected += 1
+            }
+            return false
+        }
+    }
+
+    private static func sampleAvailableSpace(directoryFD: Int32) throws -> UInt64 {
+        var fs = statvfs()
+        guard fstatvfs(directoryFD, &fs) == 0 else { throw io("sample available snapshot space") }
+        guard let blocks = UInt64(exactly: fs.f_bavail),
+              let fragment = UInt64(exactly: fs.f_frsize) else {
+            throw StoreError.io(operation: "sample available snapshot space", code: EOVERFLOW)
+        }
+        return try availableSpaceByteCount(blocks: blocks, fragmentBytes: fragment)
+    }
+
+    /// Kept internal so arithmetic edge cases can be checked without changing
+    /// filesystem state or requiring an unusually large physical volume.
+    static func availableSpaceByteCount(blocks: UInt64, fragmentBytes: UInt64) throws -> UInt64 {
+        guard fragmentBytes > 0 else {
+            throw StoreError.io(operation: "sample available snapshot space", code: EINVAL)
+        }
+        let (bytes, overflow) = blocks.multipliedReportingOverflow(by: fragmentBytes)
+        guard !overflow else {
+            throw StoreError.io(operation: "sample available snapshot space", code: EOVERFLOW)
+        }
+        return bytes
     }
 
     private func lookupOnQueue(tokens: [Int32], namespace: String,
@@ -615,12 +775,15 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     }
 
     private func insertRecord(name: String, manifest: Manifest, bytes: Int, payloadBytes: Int) {
+        stageRecord(name: name, manifest: manifest, bytes: bytes, payloadBytes: payloadBytes)
+        refreshAccounting()
+    }
+    private func stageRecord(name: String, manifest: Manifest, bytes: Int, payloadBytes: Int) {
         order &+= 1
         records[name] = Record(manifest: manifest, bytes: bytes, payloadBytes: payloadBytes, order: order)
         let accepted = index.insert(tokens: manifest.tokens, namespace: manifest.namespace,
                                     value: name, logicalPayloadBytes: bytes)
         precondition(accepted, "validated SSD cache record exceeded limits")
-        refreshAccounting()
     }
     @discardableResult
     private func makeRoom(bytes: Int, tokens: Int, entries: Int) -> Bool {
@@ -641,6 +804,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         guard unlinkat(directoryFD, name, 0) == 0 || errno == ENOENT else {
             // Keep the unreachable file's accounting and stop new admissions.
             update { $0.storageUnavailable = true; $0.writeFailures += 1 }
+            refreshAccounting()
             return false
         }
         records.removeValue(forKey: name)

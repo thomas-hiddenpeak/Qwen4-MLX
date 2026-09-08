@@ -1,5 +1,15 @@
 # 自主研究与开发接续
 
+## 2026-09-09 八小时自主窗口：KV 管理批次 A 开发中
+
+用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `002d68d`，根代理唯一 build/GPU/Git owner，MTP 性能后置。
+
+K02 tokenizer计划接口已提交推送 `30c847b`（7项CPU通过），完整会话运行时尚未接线。批次A的最终54项相关CPU检查和release61.96秒构建通过，`results/kv-night-a2/` pressure89checks、timeouts50checks、44成功HTTP+4日志确认取消均通过。实模20请求/229IDs、独立跨状态23组/2567张量及host状态；HTTP21次SSD恢复/7.70GB归档读回，无残留request/workspace/pending。二进制`fc02358d...38502e`，215文件/102模型stat postflight通过。详见可靠性记录，勿把注入pressure或70秒HTTP窗口说成真实物理压力/小时长稳。
+
+最新参考恢复ledger为 `results/kv-night-a2/run-ledger.json`，PID52289、精确argv、idle、MTP/drafter关闭已独立复核；无GPU实验，冻结解除。a1失败因短fixture合法3-token EOS被错误的maxTokens==16假设拒绝，保留原始失败报告，a2已修正并通过。
+
+根侧正提交本批可靠性源码/测试/文档。下一步并行分工：K02完整lookup/系统producer/双checkpoint发布与有效token统计；有界close/drain，避免HTTP冗余无界flush/close抵消deadline。之后真实多轮工具/分叉回归，再在小RAM/有限SSD上跑2小时多前缀churn。新churn脚本9项根侧CPU控制测试通过，尚无真实长窗。macOS `memory_pressure -S`不执行：为系统级purge/通知，异常退出不能保证复位；真实压力验收仍保留，依据已入research文档。不要重复开发已准备接口、另启GPU控制器或重用旧PID。
+
 ## 2026-09-09 当前方向：KV cache 关键能力与开源设计吸收
 
 用户明确要求 KV cache 为当前重点，吸收开源项目优势并制定本项目关键能力。已核对 `cb75be3` 源码与 vLLM、SGLang、LMCache、DwarfStar、MLX LM 的固定提交，形成[统一能力计划](KV_CACHE_CAPABILITIES.md)与三份源码研究。现有 SSD/额度/同前缀合并作为基线；HTTP 自动复用当前限系统/工具前缀，完整会话历史和真正 KV 分页仍有缺口。README 中过期的“SSD 状态缓存尚未实现”已修正。

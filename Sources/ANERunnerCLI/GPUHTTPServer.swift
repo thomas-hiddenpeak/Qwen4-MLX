@@ -21,7 +21,8 @@ extension RunnerCLI {
         }
         try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes",
             "--prefix-cache-bytes", "--prefix-cache-entries", "--prefix-cache-directory",
-            "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes"])
+            "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes",
+            "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
@@ -37,7 +38,8 @@ extension RunnerCLI {
             prefixCacheDirectory = URL(fileURLWithPath: try args.require("--prefix-cache-directory"))
                 .standardizedFileURL.resolvingSymlinksInPath()
         } else {
-            guard args["--prefix-cache-disk-bytes"] == nil, args["--prefix-cache-disk-entries"] == nil else {
+            guard args["--prefix-cache-disk-bytes"] == nil, args["--prefix-cache-disk-entries"] == nil,
+                  args["--prefix-cache-min-free-bytes"] == nil, args["--prefix-cache-restore-timeout-seconds"] == nil else {
                 throw CLIError.usage("SSD cache limits require --prefix-cache-directory")
             }
             prefixCacheDirectory = nil
@@ -55,6 +57,8 @@ extension RunnerCLI {
             prefixCacheDiskBytes: try number("--prefix-cache-disk-bytes", 8_589_934_592, 1...Int.max),
             prefixCacheDiskEntries: try number("--prefix-cache-disk-entries", 32, 1...4096),
             prefixCacheTTLSeconds: try number("--prefix-cache-ttl-seconds", 86_400, 1...Int.max),
+            prefixCacheMinFreeBytes: try number("--prefix-cache-min-free-bytes", 1_073_741_824, 0...Int.max),
+            prefixCacheRestoreTimeoutSeconds: try number("--prefix-cache-restore-timeout-seconds", 5, 1...300),
             stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max))
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
@@ -67,9 +71,12 @@ private struct GPUHTTPConfiguration: Sendable {
     let modelDirectory: URL
     let port, maxConnections, maxBodyBytes, outputBytes, prefixCacheBytes, prefixCacheEntries: Int
     let prefixCacheDirectory: URL?
-    let prefixCacheDiskBytes, prefixCacheDiskEntries, prefixCacheTTLSeconds, stateBudgetBytes: Int
+    let prefixCacheDiskBytes, prefixCacheDiskEntries, prefixCacheTTLSeconds: Int
+    let prefixCacheMinFreeBytes, prefixCacheRestoreTimeoutSeconds: Int
+    let stateBudgetBytes: Int
     var prefixDiskLimits: QwenPrefixDiskLimits {
-        .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes)
+        .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes,
+              minAvailableBytes: prefixCacheMinFreeBytes)
     }
     var modelID: String { modelDirectory.lastPathComponent }
 }
@@ -122,6 +129,7 @@ private struct GPUHTTPHealth: Sendable {
     var prefills = 0, ready = 0, resident = 0, reserved = 0, waitingPrefix = 0
     var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?
     var mlxMemory: [String: Int]?
+    var pressureMonitorRunning = false
 }
 
 /// Mutable connection state is confined to GPUHTTPServer.network. The only
@@ -190,6 +198,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private let network = DispatchQueue(label: "ane-runner.http.network", autoreleaseFrequency: .workItem)
     private let inbox = GPUHTTPInbox()
     private let health = Mutex(GPUHTTPHealth())
+    private let memoryPressure: QwenMemoryPressurePolicy
     private let finished = DispatchSemaphore(value: 0)
     private let failure = Mutex<String?>(nil)
     private let logger: QwenHTTPLogger
@@ -202,6 +211,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
 
     init(configuration: GPUHTTPConfiguration) throws {
         self.configuration = configuration
+        memoryPressure = try QwenMemoryPressurePolicy()
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1",
             port: NWEndpoint.Port(rawValue: UInt16(configuration.port))!)
@@ -333,11 +343,14 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 "prefix_cache": h.prefixCacheJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "prefix_cache_limits": configuration.prefixCacheBytes == 0 ? NSNull() : [
                     "maxEntries": configuration.prefixCacheEntries, "maxBytes": configuration.prefixCacheBytes,
-                    "maxKeyTokens": 1_048_576, "ttlSeconds": configuration.prefixCacheTTLSeconds] as Any,
+                    "maxKeyTokens": 1_048_576, "ttlSeconds": configuration.prefixCacheTTLSeconds,
+                    "diskRestoreTimeoutSeconds": configuration.prefixCacheRestoreTimeoutSeconds] as Any,
                 "prefix_disk_cache": h.prefixDiskJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "prefix_disk_cache_limits": try prefixDiskLimitsJSON(),
                 "state_budget": h.stateBudgetJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
-                "mlx_memory": h.mlxMemory as Any? ?? NSNull()
+                "mlx_memory": h.mlxMemory as Any? ?? NSNull(),
+                "memory_pressure": try JSONSerialization.jsonObject(with: JSONEncoder().encode(memoryPressure.snapshot)),
+                "memory_pressure_monitor_running": h.pressureMonitorRunning
             ])
             simple(client, data: try QwenHTTPFrames.response(status: h.state == "ready" ? 200 : 503,
                 contentType: "application/json", body: body))
@@ -348,6 +361,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
             let chat = try QwenHTTPChatRequest.decode(request.body, expectedModel: configuration.modelID)
             guard health.withLock({ $0.state == "ready" }) else {
                 reject(client, status: 503, message: "Model is not ready", code: "model_unavailable"); return
+            }
+            guard memoryPressure.checkNewRequestAdmission() else {
+                reject(client, status: 429, message: "System memory pressure temporarily prevents a new request",
+                       code: "resource_limit"); return
             }
             let overflow: Data
             let limits: QwenSSEOutputBuffer.Limits
@@ -524,6 +541,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
     private func inferenceLoop() throws {
         let tokenizer = try QwenTokenizer(modelDirectory: configuration.modelDirectory)
         if inbox.isStopping { return }
+        let pressureMonitor = QwenMemoryPressureMonitor(policy: memoryPressure)
+        health.withLock { $0.pressureMonitorRunning = true }
+        defer { pressureMonitor.stop(); health.withLock { $0.pressureMonitorRunning = false } }
         let diskStore = try configuration.prefixCacheDirectory.map {
             try QwenPrefixDiskStore(directory: $0, limits: configuration.prefixDiskLimits,
                 ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds))
@@ -541,7 +561,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
             }
         let generator = try QwenGenerator(model: model, prefixCacheLimits: configuration.prefixCacheBytes == 0 ? nil :
             .init(maxEntries: configuration.prefixCacheEntries, maxBytes: configuration.prefixCacheBytes,
-                  ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds)), prefixDiskStore: diskStore)
+                  ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds),
+                  diskRestoreTimeoutSeconds: TimeInterval(configuration.prefixCacheRestoreTimeoutSeconds)),
+            prefixDiskStore: diskStore, memoryPressurePolicy: memoryPressure)
         let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
         var jobs: [UUID: GPUHTTPActive] = [:]
         defer {
@@ -586,12 +608,19 @@ private final class GPUHTTPServer: @unchecked Sendable {
             // Drain transient Foundation/Objective-C objects after each bounded
             // admission + inference slice, rather than only when the service exits.
             let keepRunning = try autoreleasepool { () throws -> Bool in
+            // Pressure callbacks never touch MLX or walk old tensor contents.
+            // At an executor boundary release at most one retained snapshot;
+            // private active states and unfinished I/O keep their own leases.
+            _ = memoryPressure.takeTrimRequest()
+            if !memoryPressure.snapshot.allowsOptionalCache {
+                _ = try generator.trimPrefixCacheMemory(maxEntries: 1)
+            }
             // At most one bounded tokenization/admission between GPU slices.
             // SSD completion can release workspace after the last GPU slice.
             // A short idle deadline refreshes health even without another
             // request, while condition.signal still wakes admission instantly.
             if let work = inbox.take(wait: scheduler.snapshot().isIdle,
-                                     timeout: diskStore == nil ? nil : 0.1) {
+                                     timeout: 0.1) {
                 snapshot(active: 1)
                 do {
                     try work.cancellation.check()

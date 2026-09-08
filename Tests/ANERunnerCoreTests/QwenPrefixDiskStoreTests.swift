@@ -28,6 +28,64 @@ final class QwenPrefixDiskStoreTests: XCTestCase {
             return 1_000
         }
     }
+    private final class SpaceProbe: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var samples: [UInt64?]
+        private var calls = 0
+        private var shouldBlock = false
+        init(_ samples: [UInt64?]) { precondition(!samples.isEmpty); self.samples = samples }
+        func set(_ samples: [UInt64?]) {
+            precondition(!samples.isEmpty)
+            lock.lock(); self.samples = samples; lock.unlock()
+        }
+        func blockNext() { lock.lock(); shouldBlock = true; lock.unlock() }
+        func count() -> Int { lock.lock(); defer { lock.unlock() }; return calls }
+        func sample(_ fd: Int32) throws -> UInt64 {
+            // Verify the injection point borrows a live directory descriptor.
+            var info = stat()
+            guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
+                throw QwenPrefixDiskStore.StoreError.unsafeDirectory
+            }
+            lock.lock()
+            calls += 1
+            let value = samples.count > 1 ? samples.removeFirst() : samples[0]
+            let block = shouldBlock; shouldBlock = false
+            lock.unlock()
+            if block { entered.signal(); resume.wait() }
+            guard let value else {
+                throw QwenPrefixDiskStore.StoreError.io(operation: "injected space sample", code: EIO)
+            }
+            return value
+        }
+    }
+    private final class PublicationSyncProbe: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var shouldBlock = false
+        private var shouldFail = false
+        func blockNext(fail: Bool = false) {
+            lock.lock(); shouldBlock = true; shouldFail = fail; lock.unlock()
+        }
+        func sync(_ fd: Int32) throws {
+            lock.lock()
+            let block = shouldBlock, fail = shouldFail
+            shouldBlock = false; shouldFail = false
+            lock.unlock()
+            if block {
+                entered.signal()
+                guard resume.wait(timeout: .now() + 10) == .success else {
+                    throw QwenPrefixDiskStore.StoreError.io(operation: "publication test watchdog", code: ETIMEDOUT)
+                }
+            }
+            if fail {
+                throw QwenPrefixDiskStore.StoreError.io(operation: "injected publication sync", code: EIO)
+            }
+            guard fsync(fd) == 0 else {
+                throw QwenPrefixDiskStore.StoreError.io(operation: "test directory sync", code: errno)
+            }
+        }
+    }
     private func directory() throws -> URL {
         // Foundation resolvingSymlinksInPath canonicalizes /private/var back
         // to the /var alias on macOS. Use the POSIX path without resolving it
@@ -45,9 +103,11 @@ final class QwenPrefixDiskStoreTests: XCTestCase {
         return root
     }
     private func limits(entries: Int = 8, bytes: Int = 1_048_576,
-                        tokens: Int = 1_000, pending: Int = 524_288) -> QwenPrefixDiskLimits {
+                        tokens: Int = 1_000, pending: Int = 524_288,
+                        minimumFree: Int = 0) -> QwenPrefixDiskLimits {
         .init(maxEntries: entries, maxBytes: bytes, maxKeyTokens: tokens,
-              maxPendingJobs: 2, maxPendingBytes: pending, maxMetadataBytes: 1_024)
+              maxPendingJobs: 2, maxPendingBytes: pending, maxMetadataBytes: 1_024,
+              minAvailableBytes: minimumFree)
     }
     private func store(_ directory: URL, entries: Int = 8, bytes: Int = 1_048_576,
                        tokens: Int = 1_000) throws -> QwenPrefixDiskStore {
@@ -424,6 +484,389 @@ final class QwenPrefixDiskStoreTests: XCTestCase {
         XCTAssertEqual(lookup(cache, [1])?.payload, Data([9]))
         XCTAssertFalse(cache.invalidateAsync(tokens: [999], namespace: "model/runtime/tenant-a"))
         XCTAssertEqual(cache.statistics.pendingJobs, 0)
+    }
+
+    func testSpaceFloorDefaultsLimitsValidationAndOldCodableCompatibility() throws {
+        XCTAssertEqual(QwenPrefixDiskLimits().minAvailableBytes, 1_073_741_824)
+        let old = Data("""
+        {"maxEntries":8,"maxBytes":1048576,"maxKeyTokens":1000,
+         "maxPendingJobs":2,"maxPendingBytes":524288,"maxMetadataBytes":1024}
+        """.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(QwenPrefixDiskLimits.self, from: old).minAvailableBytes,
+                       1_073_741_824)
+        let disabled = limits(minimumFree: 0)
+        XCTAssertEqual(try JSONDecoder().decode(QwenPrefixDiskLimits.self,
+                       from: JSONEncoder().encode(disabled)), disabled)
+        XCTAssertThrowsError(try QwenPrefixDiskStore(directory: directory(), limits: limits(minimumFree: -1))) {
+            XCTAssertEqual($0 as? QwenPrefixDiskStore.StoreError, .invalidLimits)
+        }
+    }
+
+    func testAvailableSpaceByteCountRejectsOverflowAndInvalidFragments() throws {
+        XCTAssertEqual(try QwenPrefixDiskStore.availableSpaceByteCount(blocks: 0, fragmentBytes: 4096), 0)
+        XCTAssertEqual(try QwenPrefixDiskStore.availableSpaceByteCount(blocks: 7, fragmentBytes: 4096), 28_672)
+        XCTAssertEqual(try QwenPrefixDiskStore.availableSpaceByteCount(blocks: UInt64.max, fragmentBytes: 1),
+                       UInt64.max)
+        XCTAssertThrowsError(try QwenPrefixDiskStore.availableSpaceByteCount(blocks: 1, fragmentBytes: 0))
+        XCTAssertThrowsError(try QwenPrefixDiskStore.availableSpaceByteCount(blocks: UInt64.max, fragmentBytes: 4096))
+    }
+
+    func testLowSpaceSkipsBeforeEvictionKeepsReadsAndAutomaticallyRecovers() throws {
+        let dir = try directory(), samples = SpaceProbe([UInt64.max]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(entries: 1, minimumFree: 1024),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1])
+        samples.set([0])
+        XCTAssertTrue(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2]),
+                                    completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertTrue(cache.statistics.spaceConstrained)
+        XCTAssertEqual(cache.statistics.spaceRejections, 1)
+        XCTAssertEqual(cache.statistics.rejected, 1)
+        XCTAssertEqual(cache.statistics.availableSpaceBytes, 0)
+        XCTAssertEqual(cache.statistics.evictions, 0)
+        XCTAssertFalse(cache.statistics.storageUnavailable)
+        XCTAssertNotNil(lookup(cache, [1]))
+        let reads = CompletionBox()
+        XCTAssertTrue(cache.lookupAsync(tokens: [1], namespace: "model/runtime/tenant-a") {
+            reads.append($0?.payload.count == 200)
+        })
+        cache.flush()
+        XCTAssertEqual(reads.read(), [true])
+        XCTAssertEqual(samples.count(), 3, "reads must not query or be denied by free-space policy")
+        samples.set([UInt64.max])
+        put(cache, [2])
+        XCTAssertNotNil(lookup(cache, [2]))
+        XCTAssertFalse(cache.statistics.spaceConstrained)
+        XCTAssertEqual(cache.statistics.spaceRecoveries, 1)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+    }
+
+    func testSpaceQueryFailureIsObservableAndLaterWritesRetry() throws {
+        let samples = SpaceProbe([nil]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(minimumFree: 1),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                    completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.spaceQueryFailures, 1)
+        XCTAssertEqual(cache.statistics.spaceRejections, 0)
+        XCTAssertEqual(cache.statistics.writeFailures, 0)
+        XCTAssertNil(cache.statistics.availableSpaceBytes)
+        XCTAssertTrue(cache.statistics.spaceConstrained)
+        XCTAssertFalse(cache.statistics.storageUnavailable)
+        samples.set([UInt64.max])
+        put(cache, [1])
+        XCTAssertNotNil(lookup(cache, [1]))
+        XCTAssertEqual(cache.statistics.spaceRecoveries, 1)
+    }
+
+    func testZeroFloorDisablesSpaceSamplerAndKeepsLogicalQuota() throws {
+        let samples = SpaceProbe([nil])
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(entries: 1, minimumFree: 0),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1]); put(cache, [2])
+        XCTAssertNotNil(lookup(cache, [2]))
+        XCTAssertNil(lookup(cache, [1]))
+        XCTAssertEqual(cache.statistics.entries, 1)
+        XCTAssertEqual(cache.statistics.evictions, 1)
+        XCTAssertEqual(samples.count(), 0)
+        XCTAssertEqual(cache.statistics.spaceChecks, 0)
+        XCTAssertNil(cache.statistics.availableSpaceBytes)
+    }
+
+    func testTemporaryReplacementNeedsFullSpaceAndExactThresholdPasses() throws {
+        let dir = try directory(), samples = SpaceProbe([UInt64.max]), box = CompletionBox()
+        let minimum = 1024
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(minimumFree: minimum),
+                                           now: { 1000 }, availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1], byte: 7)
+        var fs = statvfs()
+        let directoryFD = open(dir.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(directoryFD, 0)
+        defer { if directoryFD >= 0 { Darwin.close(directoryFD) } }
+        XCTAssertEqual(fstatvfs(directoryFD, &fs), 0)
+        let fragment = max(512, Int(fs.f_frsize))
+        let file = try XCTUnwrap(files(dir).first)
+        let fileBytes = try Data(contentsOf: file).count
+        let reserved = (fileBytes + fragment - 1) / fragment * fragment
+        samples.set([UInt64(minimum + reserved - 1)])
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "model/runtime/tenant-a",
+                                    metadata: Data("manifest".utf8), payload: Data(repeating: 8, count: 200),
+                                    completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(lookup(cache, [1])?.payload.first, 7, "old replacement bytes must not be pre-credited")
+        // The second sample is after the temporary file exists. Only the floor
+        // remains due then, not the archive allocation a second time.
+        samples.set([UInt64(minimum + reserved), UInt64(minimum)])
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "model/runtime/tenant-a",
+                                    metadata: Data("manifest".utf8), payload: Data(repeating: 8, count: 200),
+                                    completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false, true])
+        XCTAssertEqual(lookup(cache, [1])?.payload.first, 8)
+        XCTAssertEqual(try files(dir).count, 1)
+        XCTAssertEqual(cache.statistics.spaceRecoveries, 1)
+    }
+
+    func testExternalSpaceDropBeforePublishRemovesTemporaryAndPreservesOldValue() throws {
+        let dir = try directory(), samples = SpaceProbe([UInt64.max]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(minimumFree: 1024),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1], byte: 7)
+        let previous = cache.statistics
+        samples.set([UInt64.max, 1023])
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "model/runtime/tenant-a", metadata: Data(),
+                                    payload: Data([8]), completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(lookup(cache, [1])?.payload.first, 7)
+        XCTAssertEqual(cache.statistics.diskBytes, previous.diskBytes)
+        XCTAssertEqual(cache.statistics.published, previous.published)
+        XCTAssertEqual(cache.statistics.spaceRejections, 1)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        XCTAssertFalse(names.contains { $0.hasSuffix(".tmp") })
+    }
+
+    func testQueuedWritesResampleSpaceAndCompleteExactlyOnce() throws {
+        let samples = SpaceProbe([UInt64.max, UInt64.max, 0]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(minimumFree: 1),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        for key: Int32 in 1...2 {
+            XCTAssertTrue(cache.enqueue(tokens: [key], namespace: "a", metadata: Data(), payload: Data([1]),
+                                        completion: { box.append($0) }))
+        }
+        cache.flush()
+        XCTAssertEqual(box.read(), [true, false])
+        XCTAssertEqual(samples.count(), 3)
+        XCTAssertEqual(cache.statistics.entries, 1)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+    }
+
+    func testPostWriteSpaceQueryFailureDropsTemporaryAndClearKeepsLastCondition() throws {
+        let dir = try directory(), samples = SpaceProbe([UInt64.max, nil]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(minimumFree: 1024),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                    completion: { box.append($0) }))
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.entries, 0)
+        XCTAssertEqual(cache.statistics.spaceQueryFailures, 1)
+        XCTAssertEqual(cache.statistics.spaceChecks, 2)
+        XCTAssertTrue(cache.statistics.spaceConstrained)
+        XCTAssertTrue(try files(dir).isEmpty)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: dir.path).contains {
+            $0.hasSuffix(".tmp")
+        })
+        cache.clear(resetStatistics: true)
+        XCTAssertEqual(cache.statistics.spaceQueryFailures, 0)
+        XCTAssertTrue(cache.statistics.spaceConstrained, "clear is not a new volume-space sample")
+        samples.set([UInt64.max])
+        put(cache, [2])
+        XCTAssertNotNil(lookup(cache, [2]))
+        XCTAssertEqual(cache.statistics.spaceRecoveries, 1)
+    }
+
+    func testSpaceComparisonDoesNotOverflowAtLargestConfiguredFloor() throws {
+        let samples = SpaceProbe([UInt64.max])
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(minimumFree: Int.max),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1])
+        XCTAssertNotNil(lookup(cache, [1]))
+        XCTAssertEqual(cache.statistics.availableSpaceBytes, UInt64.max)
+        samples.set([UInt64(Int.max)])
+        put(cache, [2])
+        XCTAssertNil(lookup(cache, [2]))
+        XCTAssertEqual(cache.statistics.spaceRejections, 1)
+    }
+
+    func testClearDuringLateSpaceSampleNeverRepublishesAndReleasesAdmission() throws {
+        let samples = SpaceProbe([UInt64.max]), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(minimumFree: 1),
+                                           availableSpace: { try samples.sample($0) })
+        defer { cache.close() }
+        put(cache, [1])
+        samples.blockNext()
+        XCTAssertTrue(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2]),
+                                    completion: { box.append($0) }))
+        XCTAssertEqual(samples.entered.wait(timeout: .now() + 5), .success)
+        defer { samples.resume.signal() }
+        XCTAssertEqual(cache.statistics.pendingJobs, 1)
+        let cleared = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { cache.clear(); cleared.signal() }
+        let deadline = Date().addingTimeInterval(5)
+        while cache.peek(tokens: [1], namespace: "model/runtime/tenant-a") != nil, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        XCTAssertNil(cache.peek(tokens: [1], namespace: "model/runtime/tenant-a"))
+        XCTAssertEqual(cache.statistics.pendingJobs, 1, "late sampler still owns its pending admission")
+        samples.resume.signal()
+        XCTAssertEqual(cleared.wait(timeout: .now() + 5), .success)
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.entries, 0)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+    }
+
+    func testPublicationDirectorySyncDoesNotBlockMetadataOrWriteAdmission() throws {
+        let gate = PublicationSyncProbe(), box = CompletionBox(), observations = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: directory(), limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); cache.close() }
+        put(cache, [1], namespace: "a")
+        gate.blockNext()
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([8]),
+                                    completion: { box.append($0) }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        let inspected = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let stats = cache.statistics
+            observations.append(stats.pendingJobs == 1 && stats.published == 1)
+            // The candidate has been renamed but is not public until sync;
+            // the prior payload size must not be offered for the replacement.
+            observations.append(cache.peek(tokens: [1], namespace: "a") == nil)
+            observations.append(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2])))
+            inspected.signal()
+        }
+        XCTAssertEqual(inspected.wait(timeout: .now() + 3), .success,
+                       "metadata and admission must finish while the directory sync is still blocked")
+        XCTAssertEqual(observations.read(), [true, true, true])
+        gate.resume.signal(); cache.flush()
+        XCTAssertEqual(box.read(), [true])
+        XCTAssertEqual(lookup(cache, [1], namespace: "a")?.payload, Data([8]))
+        XCTAssertEqual(lookup(cache, [2], namespace: "a")?.payload, Data([2]))
+        XCTAssertEqual(cache.statistics.published, 3)
+        XCTAssertEqual(cache.statistics.writeFailures, 0)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+    }
+
+    func testClearInvalidatesSyncingPublicationAndAllowsNewEpochAdmission() throws {
+        let dir = try directory(), gate = PublicationSyncProbe(), box = CompletionBox()
+        let observations = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); cache.close() }
+        put(cache, [1], namespace: "a"); put(cache, [2], namespace: "a")
+        gate.blockNext()
+        XCTAssertTrue(cache.enqueue(tokens: [3], namespace: "a", metadata: Data(), payload: Data([3]),
+                                    completion: { box.append($0) }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        let cleared = DispatchSemaphore(value: 0), inspected = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { cache.clear(); cleared.signal() }
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(3)
+            while cache.peek(tokens: [1], namespace: "a") != nil, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            observations.append(cache.peek(tokens: [1], namespace: "a") == nil &&
+                                cache.peek(tokens: [2], namespace: "a") == nil)
+            observations.append(cache.statistics.pendingJobs == 1)
+            observations.append(cache.enqueue(tokens: [4], namespace: "a", metadata: Data(),
+                                               payload: Data([4]), completion: { box.append($0) }))
+            inspected.signal()
+        }
+        XCTAssertEqual(inspected.wait(timeout: .now() + 4), .success)
+        XCTAssertEqual(observations.read(), [true, true, true])
+        XCTAssertEqual(cleared.wait(timeout: .now()), .timedOut,
+                       "clear invalidates immediately but still owns its queued physical cleanup")
+        gate.resume.signal()
+        XCTAssertEqual(cleared.wait(timeout: .now() + 3), .success)
+        cache.flush()
+        XCTAssertEqual(box.read(), [false, true])
+        XCTAssertEqual(cache.statistics.published, 3, "the cancelled candidate is not counted as published")
+        XCTAssertEqual(cache.statistics.entries, 1)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        for key: Int32 in [1, 2, 3] { XCTAssertNil(lookup(cache, [key], namespace: "a")) }
+        XCTAssertEqual(lookup(cache, [4], namespace: "a")?.payload, Data([4]))
+        cache.close()
+        let reopened = try store(dir)
+        XCTAssertEqual(reopened.statistics.recoveredEntries, 1)
+        XCTAssertNil(lookup(reopened, [3], namespace: "a"))
+        XCTAssertEqual(lookup(reopened, [4], namespace: "a")?.payload, Data([4]))
+    }
+
+    func testImmediateCloseDuringDirectorySyncRemovesUnpublishedCandidate() throws {
+        let dir = try directory(), gate = PublicationSyncProbe(), box = CompletionBox()
+        let observations = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); cache.close() }
+        put(cache, [1], namespace: "a")
+        gate.blockNext()
+        XCTAssertTrue(cache.enqueue(tokens: [2], namespace: "a", metadata: Data(), payload: Data([2]),
+                                    completion: { box.append($0) }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        let closed = DispatchSemaphore(value: 0), inspected = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { cache.close(drain: false); closed.signal() }
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(3)
+            while cache.peek(tokens: [1], namespace: "a") != nil, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            observations.append(cache.peek(tokens: [1], namespace: "a") == nil)
+            observations.append(cache.statistics.pendingJobs == 1)
+            observations.append(!cache.enqueue(tokens: [3], namespace: "a", metadata: Data(), payload: Data([3])))
+            inspected.signal()
+        }
+        XCTAssertEqual(inspected.wait(timeout: .now() + 4), .success)
+        XCTAssertEqual(observations.read(), [true, true, true])
+        XCTAssertEqual(closed.wait(timeout: .now()), .timedOut)
+        gate.resume.signal()
+        XCTAssertEqual(closed.wait(timeout: .now() + 3), .success)
+        cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.published, 1)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        let reopened = try store(dir)
+        XCTAssertEqual(reopened.statistics.recoveredEntries, 1)
+        XCTAssertNotNil(lookup(reopened, [1], namespace: "a"))
+        XCTAssertNil(lookup(reopened, [2], namespace: "a"))
+    }
+
+    func testPublicationDirectorySyncFailureCleansRenamedArchiveBeforeRestart() throws {
+        let dir = try directory(), gate = PublicationSyncProbe(), box = CompletionBox()
+        let cache = try QwenPrefixDiskStore(directory: dir, limits: limits(),
+                                           publicationDirectorySync: { try gate.sync($0) })
+        defer { gate.resume.signal(); cache.close() }
+        gate.blockNext(fail: true)
+        XCTAssertTrue(cache.enqueue(tokens: [1], namespace: "a", metadata: Data(), payload: Data([1]),
+                                    completion: { box.append($0) }))
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        // The file really passed atomic rename, so this exercises commit
+        // failure cleanup rather than a pre-write rejection.
+        XCTAssertEqual(try files(dir).count, 1)
+        gate.resume.signal(); cache.flush()
+        XCTAssertEqual(box.read(), [false])
+        XCTAssertEqual(cache.statistics.published, 0)
+        XCTAssertEqual(cache.statistics.writeFailures, 1)
+        XCTAssertEqual(cache.statistics.entries, 0)
+        XCTAssertEqual(cache.statistics.diskBytes, 0)
+        XCTAssertEqual(cache.statistics.pendingJobs, 0)
+        XCTAssertEqual(cache.statistics.pendingBytes, 0)
+        XCTAssertTrue(try files(dir).isEmpty)
+        cache.close()
+        let reopened = try store(dir)
+        XCTAssertEqual(reopened.statistics.recoveredEntries, 0)
+        XCTAssertNil(lookup(reopened, [1], namespace: "a"))
     }
 
 }

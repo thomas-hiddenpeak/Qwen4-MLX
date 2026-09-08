@@ -16,6 +16,10 @@ public struct QwenPrefixCacheStatistics: Codable, Equatable, Sendable {
     public var restoredHits: Int = 0
     public var diskHits: Int = 0
     public var diskFallbacks: Int = 0
+    /// Requests that stopped waiting for an unfinished SSD read. Its workspace
+    /// may remain live until the independent I/O owner actually completes.
+    public var diskReadTimeouts: Int = 0
+    public var diskPublicationTimeouts: Int = 0
     public var pressureEvictions: Int = 0
     public var budgetSkipped: Int = 0
     public var duplicateSkipped: Int = 0

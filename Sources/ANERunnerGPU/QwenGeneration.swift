@@ -408,6 +408,7 @@ public final class QwenGenerator {
     public let eosTokenIDs: Set<Int32>
     private var mtpHead: QwenMTP?
     private let prefixCache: QwenPrefixCache?
+    private let memoryPressure: QwenMemoryPressurePolicy?
     /// Diagnostics only: readback here perturbs execution and is excluded from
     /// production timing trials. Do not mutate tensors or reenter generation.
     public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
@@ -424,17 +425,22 @@ public final class QwenGenerator {
     public func closePrefixCache(drain: Bool = true) throws {
         try model.withExclusiveGeneration { prefixCache?.disk?.close(drain: drain) }
     }
-    public func trimPrefixCacheMemory() throws {
-        try model.withExclusiveGeneration { prefixCache?.trimMemory() }
+    @discardableResult
+    public func trimPrefixCacheMemory(maxEntries: Int = Int.max) throws -> Int {
+        try model.withExclusiveGeneration { prefixCache?.trimMemory(maxEntries: maxEntries) ?? 0 }
     }
 
     public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil,
-                prefixDiskStore: QwenPrefixDiskStore? = nil) throws {
+                prefixDiskStore: QwenPrefixDiskStore? = nil,
+                memoryPressurePolicy: QwenMemoryPressurePolicy? = nil) throws {
         self.model = model
+        memoryPressure = memoryPressurePolicy
         guard prefixDiskStore == nil || prefixCacheLimits != nil else {
             throw QwenGenerationError.invalidRequest("SSD prefix cache requires prefix cache limits")
         }
-        prefixCache = try prefixCacheLimits.map { try QwenPrefixCache(limits: $0, disk: prefixDiskStore, model: model) }
+        prefixCache = try prefixCacheLimits.map {
+            try QwenPrefixCache(limits: $0, disk: prefixDiskStore, model: model, memoryPressure: memoryPressurePolicy)
+        }
         let stops = try QwenTokenizer(modelDirectory: model.configuration.modelDirectory).eosTokenIDs
         guard !stops.isEmpty, stops.allSatisfy({ $0 >= 0 && Int($0) < model.configuration.vocabularySize }) else {
             throw QwenGenerationError.unavailable("tokenizer has no valid EOS policy")
@@ -590,6 +596,12 @@ public final class QwenGenerator {
 
     private func makePrefillSession(_ request: QwenGenerationRequest,
                                     cancellation: QwenCancellation?, allowPrefixWait: Bool = true) throws -> QwenPrefillSession {
+        // A queued request can reach its first allocation after pressure has
+        // escalated. Recheck here, not just at HTTP enqueue. Existing cursors
+        // retain their reservation and continue through warning/critical.
+        guard memoryPressure?.checkNewRequestAdmission() ?? true else {
+            throw QwenGenerationError.resourceLimit("system memory pressure temporarily prevents a new request")
+        }
         let bytes = try requestStateReservation(request)
         let reservation = prefixCache.map { $0.reserve(bytes: bytes, kind: .request, model: model) }
             ?? model.stateBudget.reserve(bytes: bytes, kind: .request)

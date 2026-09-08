@@ -12,7 +12,8 @@ RAM 前缀缓存默认 512 MiB / 8 条。SSD 是显式开启的可选层，服�
 .build/release/ane-runner serve-gpu --model-dir /absolute/model/path \
   --prefix-cache-directory /Users/yourname/qwen-cache \
   --prefix-cache-disk-bytes 8589934592 --prefix-cache-disk-entries 32 \
-  --prefix-cache-ttl-seconds 86400 --state-budget-bytes 4294967296
+  --prefix-cache-ttl-seconds 86400 --prefix-cache-min-free-bytes 1073741824 \
+  --prefix-cache-restore-timeout-seconds 5 --state-budget-bytes 4294967296
 ```
 
 父目录必须存在；最后一级由 store 创建为 0700，也可使用已有的专属 0700 目录。文件为 0600；同一目录只允许一个 store，通过进程锁拒绝重复持有。底层逐级打开目录且不跟随符号链接。请使用物理路径，尤其注意 macOS 的 `/tmp`、`/var` 是别名路径。缓存管理只删除符合自身命名格式的文件。禁用 RAM 缓存时不能同时配置 SSD。
@@ -29,9 +30,11 @@ RAM 与 SSD 都有条目、字节、key token 和 TTL 上限。RAM TTL 从本层
 
 这套额度覆盖逻辑模型状态和相应副本余量，**不是进程物理内存硬上限**。权重、一般 activation、MLX allocator 保留及初始化工作单独观察。不能拿 ledger 的峰值替代 RSS 或系统内存压力测试。
 
-cooperative 调度中，同一 namespace 和完整 token 前缀只允许一个冷 producer；其他请求暂停 prefill，等待可用状态。producer 取消/失败后释放资格，下一个请求接管。RAM 无法保留且 SSD 尚在发布时，仍等待该次写入完成或失败。等待期间不提交 GPU 工作；存在可运行 decode 时优先照常推进。
+cooperative 调度中，同一 namespace 和完整 token 前缀只允许一个冷 producer；其他请求暂停 prefill，等待可用状态。producer 取消/失败后释放资格，下一个请求接管。RAM 无法保留且 SSD 尚在发布时，等待该次写入完成或失败；后台发布与读回分别受默认 5 秒的请求等待期限约束。超期后请求继续冷算，已有 I/O 和 workspace 由完成回调保留，不能提前归还额度。同 key 的未完成归档不会因超期重算而重复入队。等待期间不提交 GPU 工作；存在可运行 decode 时优先照常推进。
 
 完整阶段的同步库调用持有模型 gate，无法等待一个由调用方暂停的外部 producer。这种混合使用场景安全回退到冷计算，可能重复 prefill；HTTP 使用 cooperative 模式。压缩 radix 只能恢复真实完整快照边界，不从中间树节点推导 GDN 状态。
+
+服务接入 macOS Dispatch 内存压力通知。warning 暂停可选缓存保存/提升，并在推理执行器安全点每次回收一条 RAM 快照；critical 还会在 HTTP 入队和首次状态分配前拒绝新请求，已拥有私有状态的请求继续执行。收到较低级别后需稳定 5 秒再恢复准入。回调只修改小型策略状态，不访问 Tensor。首次事件前明确报告 unknown，不能视作已观察到系统正常；这一策略与逻辑字节账本共同工作，仍不构成进程物理内存硬上限。
 
 ## 持久化和故障
 
@@ -39,17 +42,38 @@ cooperative 调度中，同一 namespace 和完整 token 前缀只允许一个�
 
 namespace 绑定 checkpoint、本次运行实现及数值配置。小模型配置、tokenizer、模板、可执行程序和相关 MLX 动态库使用内容摘要；大权重和 n-gram 文件绑定物理路径、设备/inode、大小及纳秒 mtime/ctime。这是本机不可变 checkpoint 的缓存身份，不能作为可搬迁的模型内容证明。更新程序或 checkpoint 会自然 miss；旧文件仍受 TTL/LRU/总额度约束。
 
+SSD 默认保留 1 GiB 文件系统可用空间，可通过 `--prefix-cache-min-free-bytes` 调整，0 禁用该保护。写入前按 `f_bavail × f_frsize` 检查水位和完整临时归档占用；临时文件写完并同步后再检查水位。空间不足或查询失败时跳过可选写入，已有归档仍可读，后续写入重新检查并允许恢复。该水位是尽力保护，不能防止其他进程在检查后占用磁盘。
+
 损坏、截断、未知版本或状态描述错误回退正常 prefill。设备同步恢复失败仍沿用模型不可用机制；不能用缓存 miss 掩盖设备故障。目录不可写或删除失败时停止 SSD 新 admission，保留字节账目，避免失控累积；成功清理后可恢复。
 
 ## 观测与验收
 
-`/health` 包含 `prefix_cache`、`prefix_cache_limits`、`prefix_disk_cache`、`prefix_disk_cache_limits`、`state_budget`、`mlx_memory` 和 `waiting_prefix_sequences`。SSD 开启时空闲快照至少每 100 ms 刷新。分别看索引 hits、真正 restoredHits、diskHits、corruptions/writeFailures、pending jobs/bytes、liveFlights，以及 request/workspace 在空闲后的归零。
+`/health` 包含 `prefix_cache`、`prefix_cache_limits`、`prefix_disk_cache`、`prefix_disk_cache_limits`、`state_budget`、`mlx_memory` 、`memory_pressure`、`memory_pressure_monitor_running` 和 `waiting_prefix_sequences`。空闲执行器每 100 ms 刷新快照。分别看索引 hits、真正 restoredHits、diskHits、corruptions/writeFailures、pending jobs/bytes、liveFlights、diskReadTimeouts/diskPublicationTimeouts、spaceRejections/spaceQueryFailures/spaceRecoveries，以及 request/workspace 在空闲后的归零。
 
 prefill 报告 `cacheSource`、cached/computed tokens、lookup/restore/save/wait 时间；prefill 与 decode 分开统计。SSD 归档是状态缓存，与 PLE 的 n-gram SSD 读取不是同一种 I/O。诊断全状态读回会影响时间，不作为吞吐结论。
 
 工业发布门槛要求：完整输出与混合状态正确；并发、取消、清理及预算耗尽后恢复；跨进程重启与损坏回退；长期压力下额度不越界、请求/临时 lease 不残留、资源不持续增长；有明确的长提示词尾延迟和恢复成本。短窗口验证只是这些门槛的一部分，不自动意味着可生产部署。Paged KV、跨请求 GPU batching、跨机器 PD 和 MTP 缓存尚未交付。
 
-验证命令：`probe-gpu-cache-reliability --mode populate|restore|corrupt|lifecycle`；每次需新 output，restore/corrupt 需要对应 populate oracle。HTTP `scripts/probe_http_cache_reliability.py` 在已受控启动的服务上运行 100 次并发混合请求并持续采样。客户端 RST 的记录还应与服务器终态日志按请求 ID 对照。
+验证命令：`probe-gpu-cache-reliability --mode populate|restore|corrupt|lifecycle|pressure`；每次需新 output，restore/corrupt 需要对应 populate oracle。HTTP `scripts/probe_http_cache_reliability.py` 在已受控启动的服务上运行 100 次并发混合请求并持续采样。客户端 RST 的记录还应与服务器终态日志按请求 ID 对照。
+
+## 2026-09-09 压力策略与 SSD 等待回归
+
+本轮实现 macOS 压力通知接线、warning/critical 准入与恢复滞回、逐条 RAM 回收、SSD 最小可用空间及读回/后台发布等待期限。目录 rename/fsync 移出共享 admission 锁，迟到提交仍经 epoch 验证；读、写、提交线程与完成回调各保留自己的 workspace owner。CPU 先运行108项相关检查，最后修改后再运行54项压力/读owner/SSD检查（14+4+36），均通过；另9项新 churn 脚本控制测试通过。最后 release 构建61.96秒。
+
+`results/kv-night-a2/` 使用二进制 `fc02358d194a3b8af858eef1153a61b61da2916208a57807f9da6ab0dd38502e`：
+
+| 实模场景 | 完整请求 / 生成 IDs | 独立跨状态检查 |
+| --- | --- | --- |
+| warning、critical、取消资格/恢复、复制后压力变化 | 14 / 133，含2个冷基准 | 18组 / 1962个张量及host状态 |
+| 11,057-token SSD读取期限、等待发布期限及恢复 | 6 / 96，含1个冷基准 | 5组 / 605个张量及host状态，剔除基准自身 |
+
+压力模式的89项检查通过：活跃prefill/decode继续、已有私有状态不受RAM trim影响、warning下不保存/提升、critical拒绝首次分配且调度器仍可恢复。这里使用注入事件和虚拟稳定时钟，**不是实际系统内存压力**。真实HTTP监视器已运行，本窗口未收到OS事件，health明确为unknown。没有运行系统级 `memory_pressure -S`，该工具影响其他进程且不等于物理压力验证，依据见[macOS压力验收边界](research/KV_MACOS_PRESSURE_VALIDATION.md)。
+
+SSD模式50项检查通过：1微秒测试期限确实触发一次未完成读回超时；5秒期限触发一次后台发布等待超时。请求均安全冷算；原I/O和workspace继续持有至完成，同key未重复归档，后续请求正常从SSD恢复。后台发布延迟由CPU可用空间采样门控制，并非真实挂盘；普通读取仍为实际文件读回。两套模型probe最终request/cache/workspace及leases均为零。当前 `flush/close` 仍可能等待正在运行的POSIX I/O；有限请求等待不等于有限服务关闭，后者继续开发。
+
+同一二进制的强制SSD HTTP smoke为70.59秒，4个基准加40个并发请求，共44次成功/352生成tokens。4次客户端RST全部按ID核对唯一服务取消终态，44次成功也匹配唯一终态及prompt/completion/cached用量。实际21次SSD恢复、7,695,421,440 B归档读回、10次同前缀等待合并；282次health采样，无恢复失败、损坏、写失败或额度越界，最终request/workspace/pending jobs/bytes为零，仅保留有效RAM缓存93,523,976 B。该短窗不代替小时级churn。
+
+215项源码/二进制/脚本冻结摘要与102项模型payload stat复核无变化。控制器恢复原参数参考，最新ledger为 `results/kv-night-a2/run-ledger.json`，本次PID52289、精确argv/idle/关闭MTP与drafter已另行复核。a1的失败报告保留：pressure测试误把maxTokens上限当成必须输出16个，P833合法EOS提前停止；修正测试后重跑通过，不将首次失败隐去。
 
 ## 2026-09-08 状态与故障回归
 

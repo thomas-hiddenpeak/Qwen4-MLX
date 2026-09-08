@@ -94,6 +94,8 @@ struct RunnerCLI {
                 try probeGPUPrefixCache(arguments)
             case "probe-gpu-cache-reliability":
                 try probeGPUCacheReliability(arguments)
+            case "probe-gpu-cache-timeouts":
+                try probeGPUCacheTimeouts(arguments)
             case "capture-gpu-moe-prefill":
                 try captureGPUMoEPrefill(arguments)
             case "probe-gpu-moe-prefill-tiling":
@@ -360,8 +362,10 @@ struct RunnerCLI {
     probe-gpu-prefix-cache --model-dir PATH --tokens-file AGENT_11K.json --output NEW.json
         [--suite long|boundaries|lifecycle|all --max-tokens 128 --state-readback true|false]
     probe-gpu-cache-reliability --model-dir PATH --tokens-file AGENT_11K.json
-        --cache-directory PRIVATE_DIRECTORY --output NEW.json --mode populate|restore|corrupt|lifecycle
+        --cache-directory PRIVATE_DIRECTORY --output NEW.json --mode populate|restore|corrupt|lifecycle|pressure
         [--oracle-report POPULATE_REPORT.json] (required for restore/corrupt)
+    probe-gpu-cache-timeouts --model-dir PATH --tokens-file AGENT_11K.json
+        --cache-directory PRIVATE_DIRECTORY --output NEW.json
     capture-gpu-moe-prefill --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_MANIFEST_JSON --fixture-dir NEW_DIRECTORY
     probe-gpu-moe-prefill-tiling --model-dir PATH --manifest PATH --output NEW_REPORT_JSON
     autotune-gpu-moe-prefill --model-dir PATH --manifest PATH --output NEW_REPORT_JSON --config-output NEW_CONFIG_JSON
