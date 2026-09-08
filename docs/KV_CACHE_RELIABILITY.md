@@ -6,6 +6,25 @@
 
 操作步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)，本页保留完整合同与分版本证据。
 
+## C3 两小时持续淘汰验证（2026-09-09）
+
+运行源码 `1ca481b`、二进制 SHA256 `78036ae494a196f9c8e26b4b61d0e6b992fb54bcf393dfa89304795847cfac23` 完成 **7205.783 秒工作段**，另有模型加载、10个冷参考请求和最终排空。期间 `e74ac1d` 只改文档，未改变运行源码。配置为 RAM160 MiB、SSD1 GiB、联合逻辑状态额度4 GiB，8个不同10k+长前缀与2个短前缀的独立归档合计3,118,656,042 B，为SSD额度的2.904倍。4个client workers配合30k在途prompt额度，并不代表4个长请求同时驻留。
+
+| 检查 | 本轮实际结果 |
+| --- | --- |
+| 请求与终态 | 677工作成功、68主动断连，另10冷参考；755条唯一JSON模型终态全部对账，无遗漏/重复 |
+| 输出与用量 | 完整文本哈希、finish、prompt/completion/cached及实际前向守恒通过；HTTP未暴露原始token IDs，故不称逐ID对照 |
+| 持续SSD活动 | 24个完整300秒窗口均发生读回、写入和淘汰；工作段归档读68,252,999,680 B、写132,176,436,973 B，187次恢复、426次淘汰 |
+| 健康与错误 | 3698健康样本，客户端/健康错误、归档损坏、写失败和准入拒绝均0 |
+| 排空与关闭 | 前半段11次主动排空，3600.154秒起不再人为排空，直至最终排空；请求/workspace、SSD pending、read intent、single-flight均0，正常有限关闭完成 |
+| 合法剩余缓存 | 最终1个RAM lease、93,523,976 B；联合额度峰值1,955,243,990 B，未把有效缓存误判为泄漏 |
+
+244个独立进程样本的RSS范围28.801–35.105 GB、FD范围11–16；首末四分位中位数分别变化−66,732,032 B和0。独立libproc sidecar仅覆盖中途开始的 **82.048分钟、165个有效点**：footprint中位80.481 GB、采样最大81.021 GB，首末变化−155,598,872 B；目标退出后的一个不可用点被排除并正常停止。此处GB为十进制，RSS与footprint不同，后者不能补称完整两小时峰值。采样范围、逻辑账本和归档字节各自独立，不能倒算物理DRAM或NAND带宽。
+
+完整终态分析与新增phase分析都通过，prefill计算/active/suspension、模型首token就绪、decode round/service/suspension及handoff分别保留。每请求平均decode耗时的分位数不是逐token TPOT；不同cache来源的负载混合也不构成同条件性能A/B。未发现本窗口内持续未回收增长，但24小时发布配置、真实OS内存压力和固定trace性能/公平门槛仍未完成；本轮压力通知计数为0、level为unknown，不记为真实压力验收。
+
+原始材料在本地 `results/kv-night-churn-2h/`：`analysis.json`、`phase-analysis.json`、`partial-telemetry-summary.json`，以及绑定14份最终文件的`final-root-verification.json`。根侧重新核对240个冻结文件及102个模型payload stat无变化，参考服务PID74180按原参数恢复，idle且MTP/drafter关闭。上述结果只归属C3配置，不能转记为之后容量追加候选的耐久证据。
+
 ## 使用合同
 
 RAM 前缀缓存默认 512 MiB / 8 条。SSD 是显式开启的可选层，服务重启保留内容：

@@ -63,4 +63,4 @@ prefill计算、decode round、active service、suspension和网络端到端耗�
 
 只读进程观测入口：`.build/release/ane-telemetry --pid PID --output NEW_PATH --interval-ms 30000 --max-samples 240`；填本次服务PID，输出父目录须存在且文件不能已存在。采样以PID和启动时刻校验身份；`process.rusage.physical_footprint_bytes`来自`proc_pid_rusage`的`ri_phys_footprint`，与RSS、MLX内存、逻辑账本分别记录，RSS单独不能代表全部Metal内存。IOReport bin/residency尚未校准，不能倒算物理DRAM GB/s。
 
-截至2026-09-09 06:00，600秒持续淘汰预检已完成；C3的2小时窗口正在单独验收，未有最终完整对账前不记通过。2小时候选门槛与24小时发布配置门槛分开，真实OS压力与24小时混合负载仍未关闭；最新状态以[关键能力计划](KV_CACHE_CAPABILITIES.md)与对应冻结运行证据为准。
+截至2026-09-09 07:19，C3已完成7205.783秒持续淘汰、677成功/68取消及10冷参考的755条唯一终态对账；24个五分钟窗口持续SSD读写淘汰，最终请求/workspace/IO/等待者归零，有限关闭完成。具体配置和采样范围见[可靠性记录](KV_CACHE_RELIABILITY.md)。这份两小时候选证据与24小时发布配置门槛分开，真实OS压力、24小时混合负载及固定trace性能/公平门槛仍未关闭；后续二进制不能沿用C3的耐久通过标签。

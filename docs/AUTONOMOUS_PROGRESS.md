@@ -2,6 +2,12 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+07:19 更新：2h controller/session16782已exit0，实际7205.783秒工作段，677工作成功/68取消+10oracle=755唯一JSON终态；原完整与新phase分析均passed/无issues，24个300秒窗口全部持续SSD读写淘汰。根侧postflight240hash/102stat、参考74180精确argv/idle/MTPdrafter关闭通过；当前最新ledger=`results/kv-night-churn-2h/run-ledger.json`。final-root-verification.json另绑定14最终输入并显式核对read intent/liveFlight/有限close。sidecar/session97893也exit0，165有效点82.048分钟partial footprint，目标退出后不可用一点排除；不能称全程footprint。源码冻结已解除，无GPU实验正在运行。root先提交2h证据，然后按integration-prep清单集成Swift机制7文件/CLI，统一build并受控sync/async，再额外原模型O512 golden；之后才安装完整Model/Generation/State overlay/CPU6/GPU5/probe/bench。默认reference不变，HTTP容量候选仍ignored且未运行。截止09:56:04不变。
+
+06:32 更新：纯docs增量`e74ac1d`已推送，远程SHA一致；运行源码和binary仍冻结C3。第一段闭区间独立审计`results/kv-night-churn-2h/first-hour-review.json`已通过：只到第11次drain、soak3378.418秒，310工作成功+31取消，另10oracle；root重核events/server闭前缀SHA及351条唯一JSON终态。11次drain资源条件成立；不能把第一小时剩余221.58秒或第二小时算进该区间通过。3600.154秒进入uninterrupted模式，观察至4442.173秒没有追加forced drain。完整2h仍进行，后续保持原controller/最终postflight和双分析器流程。partial-footprint-0623.json为31.018分钟/63点只读观测，footprint中位80.511GB、首末四分位中位差6.05MB，只是局部稳定证据。
+
+候选额外只读结论在`results/kv-capacity-model-candidate/SDPA_PATH_REVIEW.md`：pinned MLX的B1/S1/Q24-KV2/D256/11k/bool mask走vector 2pass；KV末维stride1且B1时不会因head stride=C×256先连续化完整KV，kernel分别消费head/seq stride与逻辑T，padding不进循环。仍有2pass partial/output分配，不能据源码倒算真实DRAM字节或称Swift/fullmodel已复用；继续先过Swift机制，再模型正确性和真实性能。没有新增build/GPU任务或改动候选manifest。
+
 用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。运行代码基线 `1ca481b`已推送并核对远程SHA，后续纯文档提交不改变该冻结版本；根代理唯一 build/GPU/Git owner，MTP 性能后置。
 
 06:08 更新：本轮只提升运维入口并修正README/HTTP旧能力矛盾、缺少的三个SSD参数及关闭合同；独立审查后明确较浅RAM回退、已启动SSE的错误事件、目录权限/路径规范化及压力降级语义。另修正原native结果的MLX raw_peak解释。纯docs文件不在plan冻结集合中；根侧06:05只读重核240文件hash/102模型stat均未变，结果`docs-midrun-verification.json`。运行基线仍为C3 `1ca481b`及78036ae4…cfac23二进制，不把文档提交SHA当长测二进制版本。长测仍未完成，运维与能力页保留运行中状态；候选源、build/GPU冻结和原controller均继续。
