@@ -1,0 +1,32 @@
+# vLLM KV cache 机制核对与本项目映射
+
+调研日期：2026-09-09。范围：官方仓库源码与官方文档；只做研究，不运行 vLLM 或本项目 GPU，不移植源码。下面的本项目能力是设计建议，现有实现状态由总审计另行核对。
+
+## 固定版本与证据边界
+
+- 官方最新 release API 返回 [v0.28.0](https://github.com/vllm-project/vllm/releases/tag/v0.28.0)，发布时间 2026-08-26，tag 对应 commit `2cf0a6915ce544dc493a0990f2ea38d81601128a`。
+- 本次 main 快照为 [`1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d`](https://github.com/vllm-project/vllm/commit/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d)。以下固定链接不会随 main 漂移。发布状态由对应 release 文件复核，不能把“已有源码”当作针对本模型的实测证明。
+- [Hybrid KV 文档](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/docs/design/hybrid_kv_cache_manager.md)仍保留“基于旧 commit 458e74”“Mamba prefix 在开发”“仅两种 attention group”的描述。当前源码已有 MambaManager 和迭代协调算法；本调研以具体代码为准，不能把旧文档的限制当成当前整体结论。
+- vLLM [Apache-2.0 许可](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/LICENSE)。本文件只提炼机制；未来若复用代码须保留适用的版权与许可通知。
+
+## 最值得吸收的八项机制
+
+| 机制与上游证据 | 本项目应形成的能力 | 必须守住的边界 |
+|---|---|---|
+| **1. 物理块池、逻辑块表、不可变共享和引用计数。** release 中 `BlockPool` 预分配 block 元数据，引用计数区分在用块与可淘汰块；缓存索引移除不等于释放仍在使用的物理块。[release block_pool.py](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/v1/core/block_pool.py#L140) | Attention KV/QSA 的长前缀按页共享；每请求只持页表和可写尾部。GDN/PLE checkpoint 单独存储、单独核算。拥有者从“整份快照”改成 request/cache/I/O 三类引用。 | Swift 对象共享或 MLX array copy 不等于安全的物理页共享。必须有直接读取页表的 Metal/MLX attention 路径；每步重新 concat 成连续大张量会抵消主要收益。先小型 A/B 验证后替换。 |
+| **2. COW 与异步复制完成前的保留。** release `_apply_cow` 将部分块命中重定向至私有块，复制源和目标额外保留引用，防止同一步释放/复用。[release single_type manager](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/v1/core/single_type_kv_cache_manager.py#L402) | 缓存完整页不可变；续写尾页及 recurrent state 私有。引入 copy/I/O fence，GPU 完成后才回收源/目标和额度。取消、清缓存、淘汰只撤销查找资格，不破坏活跃请求。 | MLX 是惰性执行；提交复制不代表复制完成。不能仅靠 host 函数返回或 request 结束释放引用。两请求分叉、取消一支、另一支继续必须逐状态及 token 验证。 |
+| **3. 前缀身份是链式哈希加计算语义和隔离域。** release 哈希包含父前缀、token、LoRA/多模态/embeds 等额外身份及首块 `cache_salt`；提供 SHA-256 与可复现序列化选项。[release kv_cache_utils.py](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/v1/core/kv_cache_utils.py#L560)、[hash 配置](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/config/cache.py#L139) | 明确 CacheIdentity：模型/量化/权重身份、执行语义、状态格式、token 精确序列、可信租户或会话共享域；RAM/SSD/后续 PD 使用同一协议。使用规范编码，不能依赖 Swift/Python 随机 hash。 | 客户端任意 salt 只是分区键，不是认证授权；隔离域应由服务端从可信身份确定。tokenizer/chat template 已变更但 token 完全一致时是否拒绝，是本项目明确的保守策略。输出采样参数通常不影响已算 prompt state，勿无理由碎片化。 |
+| **4. 混合状态以共同可恢复边界命中。** 当前协调器不断收缩候选长度直到各组一致；Attention 需要完整 KV 前缀，Mamba 可从某一 recurrent checkpoint 恢复，不能只取某一组最深命中。[coordinator](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/v1/core/kv_cache_coordinator.py#L808)、[Mamba lookup](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/v1/core/single_type_kv_cache_manager.py#L1456) | 一份恢复句柄必须证明在同一 token offset 具备 Attention KV、QSA 辅助状态、GDN 递归/卷积状态、PLE 历史/卷积状态。按页淘汰后重新计算可恢复边界；短回退或冷算必须显式。 | GDN state 不可像 token KV 一样从更深状态切片退回。不得以 QSA 被 sparse mask 暂时忽略为由永久淘汰未经证明不再访问的历史数据。主流框架的 Mamba 分组不能直接证明本项目 PLE 的完整性。 |
+| **5. 匹配粒度、物理页粒度、checkpoint 间距、prefill chunk 解耦。** release 已有 `prefix_match_unit`，可小于物理块，但不改变实际保存状态的频率；release 有 align/all 策略。[release cache.py](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/config/cache.py#L57) | 面向 10k+ agent 系统词，在稳定系统边界、真实分叉点及有限间隔保存 recurrent checkpoint；匹配仍做细粒度索引。用“增加一次 checkpoint 的字节/复制成本”交换后续重算减少。调度器在选定 checkpoint 边界停 chunk 并安全发布。 | 细哈希不会凭空产生中间 GDN 状态。每个小页都保存全部 GDN 会造成大量固定状态重复。main 中 `enable_mamba_fine_grained_prefix_cache` 仍默认关闭且依赖特定 EAGLE/MTP 条件，不能作为本项目现在启用 MTP 的理由。[main 条件](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/config/cache.py#L198) |
+| **6. 缓存分配与请求调度联合。** release 分配前计算所需块、保留其他 in-flight 请求额度、对等待/被抢占请求留 watermark，容量不够返回不可分配；跨组先 pin 所有命中，再分配，避免把另一组的命中淘汰。[release admission](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/v1/core/kv_cache_manager.py#L466)、[跨组次序](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/v1/core/single_type_kv_cache_manager.py#L303) | 已有活跃 decode 优先保有续写及临时副本空间；新 prefill/SSD 导入有 admission headroom；查找→pin→reserve→publish 为明确事务。容量不足时有界排队或拒绝，缓存填充可跳过；禁止多方都以“即将淘汰”重复计算同一份空闲。 | 主机预算与统一内存真实占用并不等价。应分别观测 MLX allocator、状态逻辑字节、活跃临时副本、I/O 队列。任何请求排序优化都必须保留等待时间上界，不能让热门前缀永久挤占冷请求。 |
+| **7. 分离查找、分配、传输、完成和失败，传输期间固定引用。** release connector API 区分匹配/分配、worker load/save、finished、load errors、shutdown，异步失败仍须报告完成以释放所有权；混合组命中分歧需 connector 补齐，否则协调回退。[release connector](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/distributed/kv_transfer/kv_connector/v1/base.py)、[混合 transfer](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm/v1/core/kv_cache_manager.py#L300) | 本机 SSD 与将来 PD 共用 transfer ticket/manifest：精确边界、全组状态、校验身份、字节预算、取消/超时/完成一次、失败回退。将“索引命中”与“已导入且可计算”分为不同状态；状态就绪后才交 decode。 | vLLM 基类 API 不是所有 connector 都支持所有 hybrid 模型的证明。CUDA/NIXL、layer-by-layer CUDA 流复制不适合直接移植 Apple。本项目先实现本机 ticket 契约，远端只扩展 transport，不提前构建分布式控制面。 |
+| **8. token 口径与缓存生命周期指标。** 当前统计区分 prompt computed、local hit、external transfer，维护总量恒等式，并提供 block lifetime/idle/reuse gap 分布。[stats](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/v1/metrics/stats.py#L379)、[metrics](https://github.com/vllm-project/vllm/blob/1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d/vllm/v1/metrics/loggers.py#L1013) | 固定 `prompt tokens = 实算 + RAM 恢复 + SSD 恢复 (+ 将来 PD)`；同时报告请求命中率和 token 命中率、查找/恢复成功、回退原因、等待/导入/重算耗时、恢复字节、被固定字节、碎片、淘汰后再次加载和写放大。prefill 吞吐只按实算 token 计。 | 高命中率不代表收益；导入慢于重算时应允许绕过 SSD。p50/p95/p99 TTFT、decode TPOT 与吞吐分阶段，冷/热/压力/恢复样本分开。lifetime 指标的策略借鉴已核对 main，不据此宣称 release 全量相同或本项目已经实现。 |
+
+## 建议落地顺序与验收
+
+1. **先把所有权、共同边界和容量契约写死。** 在现有整快照实现上补齐 identity/隔离域、查找与有效恢复指标、transfer ticket 生命周期及超时/取消状态；以故障测试确认没有缓存额度泄露或活跃请求被清除破坏。
+2. **再做分页 KV 的独立小路径。** 选定本模型的 Attention/QSA 页格式，完成一页/跨页/共享尾页 COW 的直接读写与 attention 数值验证，再验证长前缀分叉减少多少真实复制和常驻内存。成功后替换整前缀复制。GDN/PLE checkpoint 先保留现有完整正确路径。
+3. **随后优化 checkpoint 保留和 SSD 成本。** 同前缀复用、不同分叉、10k 系统词、淘汰回读、重复取消作为固定工作负载。记录 checkpoint 密度的复用收益和复制字节，形成默认参数；不要照搬 vLLM 的 CUDA 页大小。
+4. **最后把已经验证的状态协议扩展到 PD。** 本机 prefill/decode handoff、SSD 导入都先用相同 manifest 和完成语义，再做远端 transport。MTP 性能继续后置。
+
+本次研究没有执行上游/本地运行测试，不证明工业验收已经通过。建议验收至少包括：页池/引用/额度守恒；两请求分叉互不污染；缓存 clear/TTL/淘汰与 GPU copy/I/O 交错；所有 mixed-state 恢复边界有效；取消和异常完成一次；SSD 损坏/超时冷回退；有限预算下长时间多前缀压力的资源平台期；相同 token 与状态的冷/热输出一致；收益与 decode 回退单独评估。

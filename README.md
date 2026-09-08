@@ -4,7 +4,7 @@
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
-当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：AR工具服务、完整状态前缀复用及缓存额度/淘汰已完成本轮回归；当前集中完善[KV cache可靠性](docs/KV_CACHE_RELIABILITY.md)：联合状态额度、同前缀请求合并与可选持久化SSD层已接入；各项测试证据与发布边界分别记录。**MTP性能优化放到计划后段**，现有MTP保持显式选择、正确性和状态隔离要求不变。具体完成范围见[本轮验收](docs/AR_PREFIX_CACHE.md)。
+当前集中完善 KV cache。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；计划中的新增能力尚未交付。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
 
 ## 构建与生成
 
@@ -32,11 +32,12 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -
 | Prefill | chunk416、每4层求值、SSD跨块预取 `nextChunk`、1个SSD worker |
 | Attention | `reference` 策略含符合条件的融合 causal attention；`ANERUNNER_FUSED_PREFILL=0` 可关闭它；QSA专用融合另行显式选择 |
 | 调度 | prefill / decode独立接口与单次状态交接；库默认 `wholeStages`，HTTP使用 `cooperative`，decodeBurst保持4；同一推理执行器串行计算 |
-| 有界资源 | HTTP连接、排队、输出和日志有额度；取消、失败与终态清理已实现；逻辑token预留不等于物理内存预算 |
+| 有界资源 | HTTP连接、排队、输出和日志有额度；request/cache/workspace 联合状态预留、取消及终态清理已实现；逻辑额度不等于物理内存硬上限 |
 | 默认关闭的候选 | MTP、expert32/down、融合归约、QSA prefill融合、blocked GDN、async8与额外decode投影融合；各自按配置选择，未因主线整合改成默认 |
-| 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；库默认关闭，显式MTP保持冷prefill |
+| 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；自动复用系统提示词/工具定义；库默认关闭，显式MTP保持冷prefill |
+| SSD 状态缓存 | 显式开启的有界持久化层，完整混合状态归档、异步恢复/写入、校验及重启恢复；与 n-gram SSD 读取分别管理 |
 | 工具调用 | function tools、auto/none、非流式/SSE调用及工具结果续答；客户端执行工具 |
-| 尚未实现 | SSD状态缓存、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
+| 尚未实现 | 完整会话历史自动复用、物理 KV 页共享、系统内存压力联动、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
 
 chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表与作者任意输入全部逐位等价。初期短输入、后续11k与不同候选的验证范围分别保留在各实验文档中。
 
@@ -100,7 +101,7 @@ ANERUNNER_GATEUP_LIBRARY="$PWD/results/local-moe-native/lib/libanemlx_moe_gateup
 
 ## 文档、历史与来源
 
-- [主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)、[精确前缀状态设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)与[缓存实现验收](docs/AR_PREFIX_CACHE.md)：区分已实现范围、历史设计和后续工作。
+- [KV cache关键能力](docs/KV_CACHE_CAPABILITIES.md)、[主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[缓存可靠性验收](docs/KV_CACHE_RELIABILITY.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)：区分当前计划、实际完成与发布门槛。早期[精确前缀设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)及[首轮缓存验收](docs/AR_PREFIX_CACHE.md)保留追溯。
 - [Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)：保留早期局部数值、硬件证据、负结果与命令；完整MLX生成当前不使用ANE，也未实现CoreAI后端。
 - [上游许可](UPSTREAM-LICENSE)与[garnermccloud/mlx-serve固定源码](https://github.com/garnermccloud/mlx-serve/blob/7dbcba04c98e4fd3bcc533c63e645547f13cc3b1/src/qwen4_exp.zig)：复用与移植文件保留来源和许可；vLLM、SGLang、DwarfStar的借鉴范围见吸收计划。
 
