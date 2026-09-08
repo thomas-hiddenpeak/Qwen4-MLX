@@ -1,3 +1,4 @@
+import ANERunnerCore
 import Dispatch
 import Foundation
 import Synchronization
@@ -36,6 +37,9 @@ public struct QwenGenerationRequest: Sendable {
     /// Request-local trunk prefill policy; draft history and decode keep their own kernels.
     public let prefillAttention: GPUAttention.PrefillMode
     public let prefillMoEConfiguration: GPUMoEPrefillConfiguration?
+    /// Trusted reusable prefix of the complete encoded prompt. Nil/zero opts
+    /// out; the runtime rounds down to an original prefill chunk boundary.
+    public let prefixCacheMaxTokens: Int?
 
     public init(tokens: [Int32], maxTokens: Int = 128, contextLimit: Int = 16_384,
                 prefillChunk: Int = 416, mtpDepth: Int = 0,
@@ -43,7 +47,8 @@ public struct QwenGenerationRequest: Sendable {
                 prefillEvaluateEveryLayers: Int = 4, verificationEvaluateEveryLayers: Int = 4,
                 decodeMode: GPUDecodeMode = .reference,
                 prefillAttention: GPUAttention.PrefillMode = .reference,
-                prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil) {
+                prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
+                prefixCacheMaxTokens: Int? = nil) {
         self.tokens = tokens; self.maxTokens = maxTokens
         self.contextLimit = contextLimit; self.prefillChunk = prefillChunk
         self.mtpDepth = mtpDepth; self.verification = verification
@@ -53,6 +58,7 @@ public struct QwenGenerationRequest: Sendable {
         self.decodeMode = decodeMode
         self.prefillAttention = prefillAttention
         self.prefillMoEConfiguration = prefillMoEConfiguration
+        self.prefixCacheMaxTokens = prefixCacheMaxTokens
     }
 
     public func validate(configuration: QwenConfiguration) throws {
@@ -67,6 +73,9 @@ public struct QwenGenerationRequest: Sendable {
             throw QwenGenerationError.invalidRequest("multimodal inputs are unsupported")
         }
         guard maxTokens > 0 else { throw QwenGenerationError.invalidRequest("maxTokens must be positive") }
+        if let prefixCacheMaxTokens, !(0..<tokens.count).contains(prefixCacheMaxTokens) {
+            throw QwenGenerationError.invalidRequest("prefixCacheMaxTokens must be nonnegative and shorter than the prompt")
+        }
         guard contextLimit > 0, contextLimit <= configuration.maximumPositions else {
             throw QwenGenerationError.invalidRequest("contextLimit exceeds the model's supported range")
         }
@@ -206,11 +215,17 @@ public struct QwenPrefillStatistics: Codable, Sendable {
     public var attentionMode: String? = nil
     /// Time outside admitted prefill slices; nil in historical reports.
     public var suspensionSeconds: Double? = nil
+    /// Full prompt usage is unchanged; rates count only tokens actually computed.
+    public var cachedTokenCount: Int? = nil
+    public var computedTokenCount: Int? = nil
+    public var cacheLookupSeconds: Double? = nil
+    public var cacheRestoreSeconds: Double? = nil
+    public var cacheSaveSeconds: Double? = nil
     public var targetTokensPerSecond: Double? {
-        targetSeconds > 0 ? Double(promptTokenCount) / targetSeconds : nil
+        targetSeconds > 0 ? Double(computedTokenCount ?? promptTokenCount) / targetSeconds : nil
     }
     public var readyTokensPerSecond: Double? {
-        totalSeconds > 0 ? Double(promptTokenCount) / totalSeconds : nil
+        totalSeconds > 0 ? Double(computedTokenCount ?? promptTokenCount) / totalSeconds : nil
     }
 }
 
@@ -316,6 +331,9 @@ fileprivate final class QwenPrefillProgress {
     var prefetch: QwenModel.PrefillPrefetch?
     var offset = 0, chunks = 0, ssdBytes = 0
     var ssdWait = 0.0, targetSeconds = 0.0, activeSeconds = 0.0, suspensionSeconds = 0.0
+    var cacheBoundary = 0, cachedTokens = 0
+    var cacheNamespace: String?
+    var cacheLookupSeconds = 0.0, cacheRestoreSeconds = 0.0, cacheSaveSeconds = 0.0
     init(state: QwenModel.State, decoder: QwenMTPDecoder?, preparationSeconds: Double, now: UInt64) {
         self.state = state; self.decoder = decoder; self.preparationSeconds = preparationSeconds
         startedAt = now; lastYieldAt = now
@@ -374,14 +392,27 @@ public final class QwenGenerator {
     public let model: QwenModel
     public let eosTokenIDs: Set<Int32>
     private var mtpHead: QwenMTP?
+    private let prefixCache: QwenPrefixCache?
+    /// Diagnostics only: readback here perturbs execution and is excluded from
+    /// production timing trials. Do not mutate tensors or reenter generation.
+    public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
+    /// Read only on the owning inference executor, like other model statistics.
+    public var prefixCacheStatistics: QwenPrefixCacheStatistics? { prefixCache?.statistics }
+    public func clearPrefixCache(resetStatistics: Bool = false) throws {
+        try model.withExclusiveGeneration { prefixCache?.clear(resetStatistics: resetStatistics) }
+    }
 
-    public init(model: QwenModel) throws {
+    public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil) throws {
         self.model = model
+        prefixCache = try prefixCacheLimits.map { try QwenPrefixCache(limits: $0) }
         let stops = try QwenTokenizer(modelDirectory: model.configuration.modelDirectory).eosTokenIDs
         guard !stops.isEmpty, stops.allSatisfy({ $0 >= 0 && Int($0) < model.configuration.vocabularySize }) else {
             throw QwenGenerationError.unavailable("tokenizer has no valid EOS policy")
         }
         eosTokenIDs = stops
+        if let prefixCache {
+            try model.withExclusiveGeneration { model.registerPrefixCache(prefixCache) }
+        }
     }
     private func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
     private func elapsed(_ start: UInt64) -> Double { Double(now() - start) * 1e-9 }
@@ -405,7 +436,8 @@ public final class QwenGenerator {
         catch { model.failGenerationRecovery(String(describing: error)) }
     }
 
-    /// Begin without executing a prompt chunk. MTP preparation is frozen here.
+    /// Begin without executing a prompt chunk. Cache restoration and MTP
+    /// preparation happen here, on the admitted inference executor.
     /// No cursor is returned on a failed admission/preparation.
     public func beginPrefill(_ request: QwenGenerationRequest,
                              cancellation: QwenCancellation? = nil) throws -> QwenPrefillSession {
@@ -528,9 +560,33 @@ public final class QwenGenerator {
                     verificationEvaluateEveryLayers: request.verificationEvaluateEveryLayers)
             }
             try cancellation?.check()
-            return QwenPrefillSession(model: model, request: request, cancellation: cancellation,
-                progress: QwenPrefillProgress(state: model.makeState(), decoder: decoder,
-                    preparationSeconds: preparationSeconds, now: now()))
+            let p = QwenPrefillProgress(state: model.makeState(), decoder: decoder,
+                preparationSeconds: preparationSeconds, now: now())
+            p.cacheBoundary = model.profiler.isRecording ? 0 : request.prefixCacheBoundary
+            if p.cacheBoundary > 0, let prefixCache {
+                let lookupStart = now()
+                let namespace = request.prefixCacheNamespace(accumulation: model.prefillAccumulation.rawValue,
+                    fusedPrefill: model.fusedPrefillEnabled)
+                p.cacheNamespace = namespace
+                var restoreStart = lookupStart
+                beganDeviceWork = true
+                let restored = try prefixCache.restore(tokens: request.tokens, namespace: namespace,
+                    maximum: p.cacheBoundary, model: model, didLookup: {
+                        p.cacheLookupSeconds = self.elapsed(lookupStart)
+                        restoreStart = self.now()
+                    })
+                if let restored {
+                    p.cacheRestoreSeconds = elapsed(restoreStart)
+                    p.state = restored; p.offset = restored.offset; p.cachedTokens = restored.offset
+                    try prefixStateObserver?("restore", restored)
+                }
+            }
+            try cancellation?.check()
+            p.activeSeconds = elapsed(p.startedAt)
+            p.lastYieldAt = now()
+            let session = QwenPrefillSession(model: model, request: request, cancellation: cancellation, progress: p)
+            session.recordProcessed(p.offset)
+            return session
         } catch {
             if beganDeviceWork { recover() }
             throw error
@@ -548,7 +604,8 @@ public final class QwenGenerator {
         do {
             try checkCancellation(session.cancellation, cancellation)
             if p.prefetch == nil {
-                p.prefetch = try model.makePrefillPrefetch(tokens: request.tokens, chunk: request.prefillChunk, state: p.state)
+                p.prefetch = try model.makePrefillPrefetch(tokens: Array(request.tokens[p.offset...]),
+                    chunk: request.prefillChunk, state: p.state)
             }
             let end = p.offset < request.tokens.count - 1
                 ? min(request.tokens.count - 1, p.offset + request.prefillChunk) : request.tokens.count
@@ -583,6 +640,21 @@ public final class QwenGenerator {
             if end == request.tokens.count {
                 try p.decoder?.finishPrompt(expectedTokenCount: request.tokens.count)
             }
+            if end == p.cacheBoundary {
+                // Complete SSD lookahead before publishing. It belongs to the
+                // active cursor and is never part of the shared snapshot.
+                p.prefetch?.finish()
+                try checkCancellation(session.cancellation, cancellation)
+                try prefixStateObserver?("coldBoundary", p.state)
+                if let prefixCache, let namespace = p.cacheNamespace {
+                    let saveStart = now()
+                    try prefixCache.publish(tokens: Array(request.tokens.prefix(end)), namespace: namespace,
+                        state: p.state, model: model,
+                        checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) },
+                        observer: prefixStateObserver)
+                    p.cacheSaveSeconds += elapsed(saveStart)
+                }
+            }
             try checkCancellation(session.cancellation, cancellation)
             p.activeSeconds += elapsed(start)
             p.lastYieldAt = now()
@@ -593,6 +665,13 @@ public final class QwenGenerator {
                 evaluateEveryLayers: request.prefillEvaluateEveryLayers)
             stats.suspensionSeconds = p.suspensionSeconds
             stats.attentionMode = request.prefillAttention.rawValue
+            if request.prefixCacheMaxTokens != nil {
+                stats.cachedTokenCount = p.cachedTokens
+                stats.computedTokenCount = request.tokens.count - p.cachedTokens
+                stats.cacheLookupSeconds = p.cacheLookupSeconds
+                stats.cacheRestoreSeconds = p.cacheRestoreSeconds
+                stats.cacheSaveSeconds = p.cacheSaveSeconds
+            }
             let result = QwenPrefillResult(model: model, request: request, state: p.state, decoder: p.decoder,
                 firstToken: next, statistics: stats, preparationSeconds: p.preparationSeconds,
                 requestStartedAt: p.startedAt)
@@ -609,6 +688,7 @@ public final class QwenGenerator {
     private func runPrefill(_ request: QwenGenerationRequest,
                             cancellation: QwenCancellation?) throws -> QwenPrefillResult {
         let session = try makePrefillSession(request, cancellation: cancellation)
+        let startupSeconds = session.progress?.activeSeconds ?? 0
         // No gate re-entry. Loop overhead is active service, not a suspension.
         let start = now()
         while true {
@@ -617,9 +697,12 @@ public final class QwenGenerator {
                 // The complete-stage API retains its original wall-time scope.
                 stats = QwenPrefillStatistics(promptTokenCount: stats.promptTokenCount, chunkCount: stats.chunkCount,
                     targetSeconds: stats.targetSeconds, draftHistorySeconds: stats.draftHistorySeconds,
-                    totalSeconds: elapsed(start), ssdWaitSeconds: stats.ssdWaitSeconds,
+                    totalSeconds: startupSeconds + elapsed(start), ssdWaitSeconds: stats.ssdWaitSeconds,
                     ssdLogicalBytes: stats.ssdLogicalBytes, evaluateEveryLayers: stats.evaluateEveryLayers,
-                    attentionMode: stats.attentionMode, suspensionSeconds: 0)
+                    attentionMode: stats.attentionMode, suspensionSeconds: 0,
+                    cachedTokenCount: stats.cachedTokenCount, computedTokenCount: stats.computedTokenCount,
+                    cacheLookupSeconds: stats.cacheLookupSeconds, cacheRestoreSeconds: stats.cacheRestoreSeconds,
+                    cacheSaveSeconds: stats.cacheSaveSeconds)
                 let payload = try result.payload.take()
                 return QwenPrefillResult(model: model, request: request, state: payload.state, decoder: payload.decoder,
                     firstToken: result.firstToken, statistics: stats, preparationSeconds: result.preparationSeconds,

@@ -4,7 +4,7 @@
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
-当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：先推进 AR 服务与完整状态前缀复用、缓存额度/淘汰和 SSD 状态缓存，分别优化 prefill / decode 基础路径；**MTP 性能优化放到计划后段，不再阻塞这些工作**。现有 MTP 保持显式选择，正确性和状态隔离要求不变；计划项不代表已经实现。
+当前[开发顺序](docs/UPSTREAM_ADOPTION_PLAN.md#当前实施顺序2026-09-08调整)：AR工具服务、完整状态前缀复用及缓存额度/淘汰已完成本轮回归；后续推进SSD状态缓存，并分别优化prefill/decode基础路径。**MTP性能优化放到计划后段**，现有MTP保持显式选择、正确性和状态隔离要求不变。具体完成范围见[本轮验收](docs/AR_PREFIX_CACHE.md)。
 
 ## 构建与生成
 
@@ -34,7 +34,9 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -
 | 调度 | prefill / decode独立接口与单次状态交接；库默认 `wholeStages`，HTTP使用 `cooperative`，decodeBurst保持4；同一推理执行器串行计算 |
 | 有界资源 | HTTP连接、排队、输出和日志有额度；取消、失败与终态清理已实现；逻辑token预留不等于物理内存预算 |
 | 默认关闭的候选 | MTP、expert32/down、融合归约、QSA prefill融合、blocked GDN、async8与额外decode投影融合；各自按配置选择，未因主线整合改成默认 |
-| 尚未实现 | 完整工具调用协议、共享前缀缓存、SSD状态缓存、跨进程PD、跨请求GPU连续批处理 |
+| 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；库默认关闭，显式MTP保持冷prefill |
+| 工具调用 | function tools、auto/none、非流式/SSE调用及工具结果续答；客户端执行工具 |
+| 尚未实现 | SSD状态缓存、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
 
 chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表与作者任意输入全部逐位等价。初期短输入、后续11k与不同候选的验证范围分别保留在各实验文档中。
 
@@ -46,9 +48,11 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
   --port 11236
 ```
 
-仅监听 `127.0.0.1`。`GET /health` 提供服务及资源状态，`GET /v1/models` 返回实际模型ID，`POST /v1/chat/completions` 支持流式或非流式纯文本。网络队列与固定推理线程分离；已实测取消恢复、非流式输出超限、真实AR SSE背压，以及日志管道堵塞时的服务活性。
+仅监听 `127.0.0.1`。`GET /health` 提供服务及资源状态，`GET /v1/models` 返回实际模型ID，`POST /v1/chat/completions` 支持流式或非流式文字与工具调用。网络队列与固定推理线程分离；各版本分别实测取消恢复、非流式输出超限、真实AR SSE背压，以及日志管道堵塞时的服务活性。
 
-这是**实验服务及有限API子集**：仅支持字符串内容的 system / user / assistant，使用 no-thinking、无工具模板，temperature只能省略或为0；未知字段会被拒绝。`tools`、`tool_choice`、工具结果角色、多模态与随机采样均未支持，不能作为完整 coding-agent 接入能力。上下文固定16384；AR输出预算1…4096，显式 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。库或CLI的其他实验选项不会自动成为HTTP参数。
+这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文固定16384；AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
+
+系统提示词与工具定义自动参与[完整前缀缓存](docs/AR_PREFIX_CACHE.md)，命中时返回 `usage.prompt_tokens_details.cached_tokens`，`/health`提供容量及命中/淘汰统计。可用 `--prefix-cache-bytes 0` 关闭。实测11k输入复用9984 token后，单窗口TTFT从约21–25秒降至约2.6秒；这表示减少重复prefill，不是基础decode吞吐提升。
 
 各轮验证版本、请求示例、限额与剩余边界见 [HTTP/SSE服务](docs/HTTP_SERVER_EXPERIMENT.md)和[输出边界](docs/HTTP_OUTPUT_BOUNDARIES.md)。发送期限、连接期限及长时间稳定性仍有未覆盖范围，不把有限回归表述为生产验收完成。
 
@@ -96,7 +100,7 @@ ANERUNNER_GATEUP_LIBRARY="$PWD/results/local-moe-native/lib/libanemlx_moe_gateup
 
 ## 文档、历史与来源
 
-- [主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)、[精确前缀状态设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)：设计和待验收项不代表已经支持。
+- [主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)、[精确前缀状态设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)与[缓存实现验收](docs/AR_PREFIX_CACHE.md)：区分已实现范围、历史设计和后续工作。
 - [Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)：保留早期局部数值、硬件证据、负结果与命令；完整MLX生成当前不使用ANE，也未实现CoreAI后端。
 - [上游许可](UPSTREAM-LICENSE)与[garnermccloud/mlx-serve固定源码](https://github.com/garnermccloud/mlx-serve/blob/7dbcba04c98e4fd3bcc533c63e645547f13cc3b1/src/qwen4_exp.zig)：复用与移植文件保留来源和许可；vLLM、SGLang、DwarfStar的借鉴范围见吸收计划。
 

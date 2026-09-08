@@ -18,17 +18,17 @@
 
 - 普通 AR、显式 MTP、真实 11k prompt、分阶段计时、完整 token 对照和独立参考服务。
 - 显式 prefill / decode / verification 阶段；同进程、同份权重、单执行器的 cooperative 调度，有界排队、token 预留、取消和错误清理。
-- GDN / PLE / Attention / QSA / MTP 的事务状态交接。当前 prefill handle 单次消费，尚不具备多请求共享 checkpoint 的生命周期。
+- GDN / PLE / Attention / QSA / MTP 的事务状态交接。prefill handle 仍单次消费；AR 另有不可变完整快照、跨请求私有恢复和有界 radix/LRU 缓存。
 - SSD PLE 预取、专用 MoE / GDN 探针、独立原生库构建和可恢复的实验控制器。
 
-这些基础支持下面的局部实验；新HTTP入口的有限验收单列于下表，跨进程 PD、连续批处理及共享前缀树仍未实现。此前 MoE 组合单层 +5.21%，完整 prefill 828→824 token/s，已保留为可选，并未因此替换默认。
+这些基础支持下面的局部实验；HTTP 工具闭环及前缀树的本轮验收见 [AR 缓存与服务](AR_PREFIX_CACHE.md)，跨进程 PD、连续批处理和 SSD 状态缓存仍未实现。此前 MoE 组合单层 +5.21%，完整 prefill 828→824 token/s，已保留为可选，并未因此替换默认。
 
 ## 当前实施顺序（2026-09-08调整）
 
 | 优先级 | 工作 | 交付与验收重点 |
 | --- | --- | --- |
-| 1，当前主线 | AR 完整状态精确前缀缓存；服务/API 与请求生命周期同步完善 | 同模型不可变 checkpoint、请求私有恢复、10k 公共前缀 A/B/A 无污染；取消/失败清理、真实工具调用闭环和持续运行分别验收。缓存、完整工具协议仍未实现 |
-| 2，精确缓存通过后 | 前缀索引/前缀树、缓存字节额度与淘汰 | 完整混合状态统一管理，命中/失配/淘汰及请求间隔离；逻辑 token 预留与缓存字节预算分别计量 |
+| 1，已实现并完成本轮回归 | AR 完整状态精确前缀缓存；服务/API 与请求生命周期同步完善 | 28 个生成请求、25 组跨状态比较通过；真实非流式/SSE 工具调用及结果续答通过。仍为实验服务，持续运行及完整 agent 协议不因本轮自动验收 |
+| 2，已实现并完成本轮回归 | 前缀索引/前缀树、缓存字节额度与淘汰 | radix 最长完整前缀、LRU、条目/字节/key token 三额度；实测取消隔离、淘汰及 416→832 命中。HTTP 默认512 MiB/8条，库显式启用 |
 | 3，内存缓存通过后 | SSD 状态 offload / 恢复 | 版本、身份、完整性及磁盘额度；损坏/中断写入回退，恢复收益与 PLE 读取争用分别检查 |
 | 4，基础性能优化 | 独立优化 prefill 和 AR decode，减少 KV 追加/复制、状态流量与 kernel 等待 | 使用真实长提示词及缓存命中/未命中负载；分别报告阶段耗时和实际计算 token 数。与前述功能阶段可并行做有明确收益的基础改进 |
 | 5，整体计划后段 | MTP 性能、深度与验证 kernel 调优，以及与已成熟缓存的配合 | 在稳定 AR 与缓存/服务基线上重新评估 decode 有效吞吐和 TPOT；届时按既有 MTP 发布条件验收 |
@@ -73,9 +73,9 @@ ReplaySSM 的机会是少写验证期间每位置的完整 recurrent state，不
 
 身份至少包括精确 token IDs、权重/tokenizer、dtype/布局、kernel 数值配置与固定 prefill chunk 策略。初期只在已有合法 chunk 边界保存，命中后沿原边界继续。recurrent 最终状态不能任意裁剪回早期前缀，不能将可变的单次 prefill handle 交给两个请求共同修改。
 
-先支持一个真实 10k 公共前缀和多个后缀，测试 A/B/A、QSA 阈值、chunk 边界，再加淘汰/前缀树。统一内存预算区分随 token 增长的 KV/QSA、每请求固定 GDN/PLE、MTP history/临时 capture、共享权重，并与 MLX 实际内存一起观察。session ID 只提示复用倾向，不替代 token 校验或无限 pin 内存。
+已完成真实10k公共前缀多后缀A/B/A、QSA及chunk边界、淘汰和前缀树验证。缓存逻辑字节与MLX allocator分别记录；后续物理内存管理继续区分KV/QSA、固定GDN/PLE、MTP history/临时capture及共享权重。session ID 不替代token校验，也不无限pin内存。
 
-[精确前缀设计](EXACT_PREFIX_CHECKPOINT_DESIGN.md)已核对实际所有权与恢复落点，目前只有设计。MTP head 在chunk末尾可依赖第一个后缀token，初始历史起点也依赖完整prompt长度，不能直接跨后缀克隆。首版可先验证AR的完整主干状态与私有恢复，MTP保持冷miss；后续保留原chunk分段的主干hidden tail，按新请求重建head。MLX普通copy共享buffer，也不能充当这里要求的私有副本。
+[精确前缀设计](EXACT_PREFIX_CHECKPOINT_DESIGN.md)保留原始设计推导；AR 主干完整快照和私有恢复现已[实现并验证](AR_PREFIX_CACHE.md)。MTP head 在chunk末尾可依赖第一个后缀token，初始历史起点也依赖完整prompt长度，不能直接跨后缀克隆；当前继续冷miss，MTP缓存适配留到后续。MLX普通copy共享buffer，运行时使用gather建立私有副本。
 
 ## 苹果硬件取舍
 

@@ -1,3 +1,4 @@
+import ANERunnerCore
 import Foundation
 import CoreFoundation
 
@@ -5,8 +6,11 @@ public struct ChatMessage: Codable {
     public let role: String
     public let content: String
     public let reasoningContent: String?
-    public init(role: String, content: String, reasoningContent: String? = nil) {
+    public let toolCalls: [QwenToolCall]?
+    public let toolCallID: String?
+    public init(role: String, content: String, reasoningContent: String? = nil, toolCalls: [QwenToolCall]? = nil, toolCallID: String? = nil) {
         self.role = role; self.content = content; self.reasoningContent = reasoningContent
+        self.toolCalls = toolCalls; self.toolCallID = toolCallID
     }
 }
 
@@ -211,6 +215,28 @@ public final class QwenTokenizer {
         }
         if addGenerationPrompt { rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n" }
         return rendered
+    }
+
+    /// Tools/history use the same XML function arm as chat_template.jinja.
+    /// Empty tools plus ordinary history retain the established text-only arm.
+    public func renderChat(messages: [ChatMessage], tools: [QwenToolDefinition], addGenerationPrompt: Bool = true) throws -> String {
+        if tools.isEmpty && !messages.contains(where: { !($0.toolCalls ?? []).isEmpty || $0.role == "tool" }) {
+            return try renderChat(messages: messages, addGenerationPrompt: addGenerationPrompt)
+        }
+        return try QwenToolChatTemplate.render(messages: messages.map {
+            .init(role: $0.role, content: $0.content, reasoningContent: $0.reasoningContent, calls: $0.toolCalls ?? [])
+        }, tools: tools, addGenerationPrompt: addGenerationPrompt)
+    }
+
+    /// Tokenize the complete request first. Reuse only the exact common token
+    /// prefix with its independently rendered system/tool block; BPE can merge
+    /// across a text boundary, so appending independently encoded suffixes is unsafe.
+    public func systemPrefixTokenCount(messages: [ChatMessage], tools: [QwenToolDefinition], fullTokens: [Int32]) throws -> Int {
+        let system = messages.first?.role == "system" ? messages.first?.content : nil
+        let prefix = QwenToolChatTemplate.systemPrefix(system: system, tools: tools)
+        guard !prefix.isEmpty else { return 0 }
+        let encoded = try encode(prefix)
+        return zip(encoded, fullTokens).prefix(while: { $0.0 == $0.1 }).count
     }
 
     private func encodeOrdinary(_ input: String) throws -> [Int32] {

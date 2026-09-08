@@ -175,12 +175,18 @@ public struct QwenHTTPChatRequest: Sendable {
     public struct Message: Equatable, Sendable {
         public let role: String
         public let content: String
+        public let toolCalls: [QwenToolCall]
+        public let toolCallID: String?
     }
     public let model: String
     public let messages: [Message]
     public let maxTokens: Int
     public let stream: Bool
     public let mtpDepth: Int
+    public let tools: [QwenToolDefinition]
+    public let toolChoice: String
+    public var parsesTools: Bool { !tools.isEmpty || messages.contains { !$0.toolCalls.isEmpty || $0.role == "tool" } }
+    public var activeTools: [QwenToolDefinition] { toolChoice == "none" ? [] : tools }
 
     public static func decode(_ body: Data, expectedModel: String) throws -> Self {
         func invalid(_ message: String) -> QwenHTTPProtocolError {
@@ -197,7 +203,7 @@ public struct QwenHTTPChatRequest: Sendable {
         do { value = try JSONSerialization.jsonObject(with: body) }
         catch { throw invalid("Malformed JSON body") }
         guard let object = value as? [String: Any] else { throw invalid("JSON body must be an object") }
-        let allowed: Set<String> = ["model", "messages", "max_tokens", "stream", "temperature", "mtp_depth"]
+        let allowed: Set<String> = ["model", "messages", "max_tokens", "stream", "temperature", "mtp_depth", "tools", "tool_choice"]
         guard Set(object.keys).isSubset(of: allowed) else { throw invalid("Unsupported chat request field") }
         guard let model = object["model"] as? String, model == expectedModel else {
             throw invalid("model must exactly match the served model")
@@ -205,16 +211,50 @@ public struct QwenHTTPChatRequest: Sendable {
         guard let rawMessages = object["messages"] as? [Any], !rawMessages.isEmpty else {
             throw invalid("messages must be a nonempty array")
         }
-        var messages: [Message] = []
-        for (index, raw) in rawMessages.enumerated() {
-            guard let item = raw as? [String: Any], Set(item.keys) == Set(["role", "content"]),
-                  let role = item["role"] as? String, ["system", "user", "assistant"].contains(role),
-                  let content = item["content"] as? String,
-                  role != "system" || index == 0 else {
-                throw invalid("Each message needs a supported role and plain string content; system may appear only first")
-            }
-            messages.append(Message(role: role, content: content))
+        var tools: [QwenToolDefinition] = []
+        if let raw = object["tools"] {
+            guard let definitions = raw as? [Any], definitions.count <= 64 else { throw invalid("tools must be an array of at most 64 functions") }
+            tools = try definitions.map(QwenToolDefinition.decode)
+            guard Set(tools.map(\.name)).count == tools.count else { throw invalid("Tool names must be unique") }
         }
+        let choice = object["tool_choice"] as? String ?? (object["tool_choice"] == nil ? (tools.isEmpty ? "none" : "auto") : "")
+        guard ["none", "auto"].contains(choice), choice != "auto" || !tools.isEmpty else {
+            throw invalid("tool_choice supports none or auto with tools; required and named choices are unsupported")
+        }
+        var messages: [Message] = []
+        var pending: [String] = [], seen: Set<String> = []
+        for (index, raw) in rawMessages.enumerated() {
+            guard let item = raw as? [String: Any], let role = item["role"] as? String,
+                  ["system", "user", "assistant", "tool"].contains(role), role != "system" || index == 0 else {
+                throw invalid("Unsupported message role; system may appear only first")
+            }
+            let allowedMessage: Set<String> = role == "assistant" ? ["role", "content", "tool_calls"] : role == "tool" ? ["role", "content", "tool_call_id"] : ["role", "content"]
+            guard Set(item.keys).isSubset(of: allowedMessage) else { throw invalid("Unsupported message field") }
+            var calls: [QwenToolCall] = []
+            if let rawCalls = item["tool_calls"] {
+                guard role == "assistant", let list = rawCalls as? [Any], !list.isEmpty, list.count <= 16 else {
+                    throw invalid("assistant tool_calls must contain 1...16 calls")
+                }
+                calls = try list.map(QwenToolCall.decode)
+            }
+            let content: String
+            if let text = item["content"] as? String { content = text }
+            else if !calls.isEmpty && (item["content"] == nil || item["content"] is NSNull) { content = "" }
+            else { throw invalid("Messages require plain string content; tool-call assistants may use null") }
+            let callID = item["tool_call_id"] as? String
+            if role == "tool" {
+                guard let callID, pending.first == callID else { throw invalid("tool_call_id must match pending assistant calls exactly once, in call order") }
+                pending.removeFirst()
+            } else {
+                guard pending.isEmpty else { throw invalid("All pending calls need tool results before the next message") }
+                for call in calls {
+                    guard seen.insert(call.id).inserted else { throw invalid("Tool call ids must be unique in history") }
+                    pending.append(call.id)
+                }
+            }
+            messages.append(Message(role: role, content: content, toolCalls: calls, toolCallID: callID))
+        }
+        guard pending.isEmpty else { throw invalid("History ends with unanswered tool calls") }
         guard messages.contains(where: { $0.role == "user" }) else { throw invalid("messages must include a user message") }
         func number(_ value: Any, field: String) throws -> Double {
             guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
@@ -231,6 +271,9 @@ public struct QwenHTTPChatRequest: Sendable {
         let maxTokens = try object["max_tokens"].map { try integer($0, field: "max_tokens", range: 1...4096) } ?? 128
         let mtpDepth = try object["mtp_depth"].map { try integer($0, field: "mtp_depth", range: 0...2) } ?? 0
         guard mtpDepth == 0 || mtpDepth == 2 else { throw invalid("mtp_depth must be 0 or 2") }
+        guard mtpDepth == 0 || (tools.isEmpty && !messages.contains { !$0.toolCalls.isEmpty || $0.role == "tool" }) else {
+            throw invalid("Tool requests currently require AR mtp_depth=0")
+        }
         // The experimental MTP candidate has only been validated with a 1024
         // token draft history and output budgets up to 256. A larger budget
         // can cross the MTP head's QSA threshold and needs a separate regression.
@@ -247,13 +290,13 @@ public struct QwenHTTPChatRequest: Sendable {
             }
             stream = flag.boolValue
         } else { stream = false }
-        return Self(model: model, messages: messages, maxTokens: maxTokens, stream: stream, mtpDepth: mtpDepth)
+        return Self(model: model, messages: messages, maxTokens: maxTokens, stream: stream, mtpDepth: mtpDepth, tools: tools, toolChoice: choice)
     }
 }
 
 /// A bounded lexical preflight for duplicate (including escaped) object keys.
 /// Full JSON syntax/value decoding remains Foundation's responsibility.
-private enum QwenHTTPJSONKeys {
+enum QwenHTTPJSONKeys {
     private struct Object { var keys: Set<String> = []; var expectsKey = true }
     static func validate(_ data: Data) throws {
         let bytes = Array(data)

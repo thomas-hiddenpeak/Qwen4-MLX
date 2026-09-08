@@ -1,6 +1,8 @@
-# 精确 system-prefix checkpoint：最小设计
+# 精确 system-prefix checkpoint：原始设计与实现入口
 
-2026-09-07 源码审阅，2026-09-08 按用户决定调整实施顺序。**本文只有设计，没有实现缓存、修改推理路径或运行新的 GPU 实验。AR 缓存、服务生命周期与本机调度继续推进，不再以 MTP 性能或整套 MTP 发布验收通过为前提；MTP 性能调优排在计划后期。** 已有 [HTTP/SSE 实验服务](HTTP_SERVER_EXPERIMENT.md) 不因本文获得缓存能力。
+2026-09-08 更新：AR 完整状态缓存、请求私有恢复、radix/LRU 及容量限制已实现，HTTP 默认512 MiB/8条；[实际接口和实模验收](AR_PREFIX_CACHE.md)是当前状态依据。MTP 请求仍冷 prefill，SSD 状态缓存尚未实现，MTP 性能继续排在计划后期。
+
+**以下保留实现前的设计推导。** “单条首版”“建议”“待验收”描述当时的拆分计划；实际版本已在同一轮完成多条前缀索引，不能再据下文认定没有缓存。MTP 补充设计仍未落地。
 
 首版建议只保存一个、同模型实例内的不可变完整 trunk checkpoint，在原有 416-token prefill 边界复用精确系统前缀。命中后为请求恢复私有状态，继续现有 prefill → 单次 handoff → decode。先验收 AR；MTP 仍是显式选项，首版 MTP 请求整体冷 miss，保持原来的完整 prefill 与 MTP decode，不能悄悄降级成 AR，也不能把 AR-only 缓存称为 MTP 缓存支持。后文保留 MTP 的最小补充设计，不作为首版 AR 缓存的实施依赖。
 

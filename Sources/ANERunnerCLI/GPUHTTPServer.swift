@@ -19,7 +19,7 @@ extension RunnerCLI {
         guard sigaction(SIGPIPE, &pipePolicy, nil) == 0 else {
             throw CLIError.usage("Cannot install HTTP SIGPIPE policy")
         }
-        try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes"])
+        try args.validate(["--model-dir", "--port", "--max-connections", "--max-body-bytes", "--output-buffer-bytes", "--prefix-cache-bytes", "--prefix-cache-entries"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
@@ -32,7 +32,9 @@ extension RunnerCLI {
             port: try number("--port", 11236, 1024...65535),
             maxConnections: try number("--max-connections", 8, 1...32),
             maxBodyBytes: try number("--max-body-bytes", 262_144, 1024...1_048_576),
-            outputBytes: try number("--output-buffer-bytes", 65_536, 8192...1_048_576))
+            outputBytes: try number("--output-buffer-bytes", 65_536, 8192...1_048_576),
+            prefixCacheBytes: try number("--prefix-cache-bytes", 536_870_912, 0...8_589_934_592),
+            prefixCacheEntries: try number("--prefix-cache-entries", 8, 1...256))
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
         // general CLI catch's synchronous stderr write after a sink failure.
@@ -42,7 +44,7 @@ extension RunnerCLI {
 
 private struct GPUHTTPConfiguration: Sendable {
     let modelDirectory: URL
-    let port, maxConnections, maxBodyBytes, outputBytes: Int
+    let port, maxConnections, maxBodyBytes, outputBytes, prefixCacheBytes, prefixCacheEntries: Int
     var modelID: String { modelDirectory.lastPathComponent }
 }
 
@@ -87,6 +89,7 @@ private struct GPUHTTPHealth: Sendable {
     var runningJob: String?
     var idle = false, active = 0, jobs = 0
     var prefills = 0, ready = 0, resident = 0, reserved = 0
+    var prefixCacheJSON: Data?
 }
 
 /// Mutable connection state is confined to GPUHTTPServer.network. The only
@@ -117,8 +120,14 @@ private final class GPUHTTPActive {
     var text = ""
     var textBudget: QwenHTTPTextBudget
     var schedulerID: UUID?
+    var toolParser: QwenToolStreamParser?
+    var invalidToolCall = false
     init(_ work: GPUHTTPWork, maxTextBytes: Int) {
         self.work = work; textBudget = QwenHTTPTextBudget(maxBytes: maxTextBytes)
+        if work.chat.parsesTools {
+            toolParser = QwenToolStreamParser(tools: work.chat.activeTools,
+                idPrefix: "call_" + work.id, maxBytes: maxTextBytes)
+        }
     }
 }
 
@@ -287,7 +296,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 "pending_requests": inbox.count, "connections": clients.count,
                 "running_job": h.runningJob as Any? ?? NSNull(),
                 "running_job_known": h.active == 0 || h.runningJob != nil,
-                "detail": h.detail.map { String($0.prefix(512)) } as Any? ?? NSNull()
+                "detail": h.detail.map { String($0.prefix(512)) } as Any? ?? NSNull(),
+                "prefix_cache": h.prefixCacheJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull()
             ])
             simple(client, data: try QwenHTTPFrames.response(status: h.state == "ready" ? 200 : 503,
                 contentType: "application/json", body: body))
@@ -474,20 +484,24 @@ private final class GPUHTTPServer: @unchecked Sendable {
             reservedOutputIDs: tokenizer.reservedOutputTokenIDs) { count, total in
                 if count % 8 == 0 || count == total { self.log("HTTP model loaded \(count)/\(total)") }
             }
-        let generator = try QwenGenerator(model: model)
+        let generator = try QwenGenerator(model: model, prefixCacheLimits: configuration.prefixCacheBytes == 0 ? nil :
+            .init(maxEntries: configuration.prefixCacheEntries, maxBytes: configuration.prefixCacheBytes))
         let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
         var jobs: [UUID: GPUHTTPActive] = [:]
         defer {
             for job in jobs.values { job.work.cancellation.cancel() }
             _ = try? scheduler.discardAll()
             jobs.removeAll()
+            try? generator.clearPrefixCache()
             try? MX.synchronize()
         }
         health.withLock { $0.state = inbox.isStopping ? "stopping" : "ready"; $0.idle = true }
         log("HTTP model state=ready default=AR experimental_mtp_depth=2 context=16384 chunk=416")
         func snapshot(active: Int = 0) {
             let s = scheduler.snapshot()
+            let cacheJSON = generator.prefixCacheStatistics.flatMap { try? JSONEncoder().encode($0) }
             health.withLock {
+                $0.prefixCacheJSON = cacheJSON
                 $0.active = active; $0.jobs = jobs.count; $0.prefills = s.queuedPrefills
                 $0.runningJob = s.runningJob?.uuidString
                 $0.ready = s.readyDecodes; $0.resident = s.residentSequences; $0.reserved = s.reservedTokens
@@ -495,6 +509,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 if !s.acceptingJobs { $0.state = "failed"; $0.detail = s.unavailableReason }
             }
         }
+        snapshot()
         while !inbox.isStopping {
             // Drain transient Foundation/Objective-C objects after each bounded
             // admission + inference slice, rather than only when the service exits.
@@ -504,18 +519,21 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 snapshot(active: 1)
                 do {
                     try work.cancellation.check()
-                    let messages = work.chat.messages.map { ChatMessage(role: $0.role, content: $0.content) }
-                    let tokens = try tokenizer.encode(tokenizer.renderChat(messages: messages))
+                    let messages = work.chat.messages.map { ChatMessage(role: $0.role, content: $0.content,
+                        toolCalls: $0.toolCalls, toolCallID: $0.toolCallID) }
+                    let tokens = try tokenizer.encode(tokenizer.renderChat(messages: messages, tools: work.chat.activeTools))
+                    let prefixTokens = configuration.prefixCacheBytes > 0 && work.chat.mtpDepth == 0 ?
+                        try tokenizer.systemPrefixTokenCount(messages: messages, tools: work.chat.activeTools, fullTokens: tokens) : 0
                     try work.cancellation.check()
                     let request = QwenGenerationRequest(tokens: tokens, maxTokens: work.chat.maxTokens,
                         contextLimit: 16_384, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
                         verification: work.chat.mtpDepth == 2 ? .batchedScalarLinear : .scalar,
-                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil)
+                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCacheMaxTokens: prefixTokens)
                     let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
                         self.health.withLock { $0.runningJob = active.schedulerID?.uuidString }
                         let text = active.utf8.append(try tokenizer.decodeBytes([token], skipSpecialTokens: true))
-                        try self.publish(text, active: active)
+                        try self.acceptDecoded(text, active: active)
                     }
                     active.schedulerID = id; jobs[id] = active
                     admitted(work)
@@ -554,6 +572,38 @@ private final class GPUHTTPServer: @unchecked Sendable {
         }
     }
 
+    private func acceptDecoded(_ text: String, active: GPUHTTPActive, finishing: Bool = false) throws {
+        guard var parser = active.toolParser else { try publish(text, active: active); return }
+        do {
+            var events = try parser.append(text)
+            if finishing { events += try parser.finish() }
+            active.toolParser = parser
+            for event in events {
+                switch event {
+                case .content(let content): try publish(content, active: active)
+                case .call(let call):
+                    if active.work.chat.stream {
+                        let index = parser.calls.firstIndex(where: { $0.id == call.id })!
+                        let frame = try QwenHTTPFrames.toolCall(id: active.work.id, created: active.work.created,
+                            model: active.work.chat.model, call: call, index: index)
+                        let offered = active.work.output.enqueue(frame)
+                        if offered.status == .overflow { logOutput(active.work, reason: "slow_consumer") }
+                        actions(offered.actions, work: active.work)
+                        guard offered.status == .accepted else { active.work.cancellation.cancel(); throw QwenGenerationError.cancelled }
+                    } else {
+                        guard active.textBudget.accept(byteCount: try call.arguments.json().utf8.count + call.name.utf8.count + call.id.utf8.count) else {
+                            throw GPUHTTPOutputError.tooLarge
+                        }
+                    }
+                }
+            }
+        } catch QwenToolStreamParser.Failure.outputLimit {
+            active.textBudget.record(.textLimit); throw GPUHTTPOutputError.tooLarge
+        } catch QwenToolStreamParser.Failure.invalidCall {
+            active.invalidToolCall = true; throw QwenToolStreamParser.Failure.invalidCall
+        }
+    }
+
     private func publish(_ text: String, active: GPUHTTPActive) throws {
         guard !text.isEmpty else { return }
         let work = active.work
@@ -583,6 +633,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
             modelFields["completion_tokens"] = result.tokens.count
             modelFields["prefill_seconds"] = (result.phases?.prefill.targetSeconds).map(finite) ?? NSNull()
             modelFields["decode_seconds"] = finite(result.decodeSeconds)
+            modelFields["cached_prompt_tokens"] = result.phases?.prefill.cachedTokenCount ?? 0
         }
         logLifecycle(.modelTerminal, connectionID: work.connectionID, work: work,
             reason: active.textBudget.failure?.rawValue, fields: modelFields)
@@ -592,15 +643,18 @@ private final class GPUHTTPServer: @unchecked Sendable {
             let frame: Data
             if event.kind == .completed, let result = event.result {
                 log("HTTP request id=\(work.id) mtp_depth=\(work.chat.mtpDepth) finish=\(result.finishReason.rawValue) prompt_tokens=\(result.statistics.promptTokenCount) completion_tokens=\(result.tokens.count) prefill_seconds=\(result.phases?.prefill.targetSeconds ?? 0) decode_seconds=\(result.decodeSeconds) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds) event=model_terminal")
-                try publish(active.utf8.finish(), active: active)
-                let reason = result.finishReason == .eos ? "stop" : "length"
+                try acceptDecoded(active.utf8.finish(), active: active, finishing: true)
+                let calls = active.toolParser?.calls ?? []
+                let reason = calls.isEmpty ? (result.finishReason == .eos ? "stop" : "length") : "tool_calls"
+                let cachedTokens = result.phases?.prefill.cachedTokenCount ?? 0
                 if work.chat.stream {
                     frame = try QwenHTTPFrames.finish(id: work.id, created: work.created, model: work.chat.model,
-                        reason: reason, promptTokens: result.statistics.promptTokenCount, completionTokens: result.tokens.count)
+                        reason: reason, promptTokens: result.statistics.promptTokenCount, completionTokens: result.tokens.count, cachedTokens: cachedTokens)
                         + QwenHTTPFrames.done()
                 } else {
                     let body = try QwenHTTPFrames.completion(id: work.id, created: work.created, model: work.chat.model,
-                        text: active.text, reason: reason, promptTokens: result.statistics.promptTokenCount, completionTokens: result.tokens.count)
+                        text: active.text, reason: reason, promptTokens: result.statistics.promptTokenCount, completionTokens: result.tokens.count,
+                        cachedTokens: cachedTokens, toolCalls: calls)
                     frame = try QwenHTTPFrames.response(status: 200, contentType: "application/json", body: body)
                 }
                 completion = .completed
@@ -608,7 +662,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
             } else {
                 log("HTTP request id=\(work.id) terminal=\(event.kind.rawValue) stage=\(event.stage.rawValue) scheduler_elapsed_seconds=\(event.timing.elapsedSeconds) event=model_terminal")
                 completion = event.kind == .cancelled ? .cancelled : .failed
-                let failure = active.textBudget.errorResponse(cancelled: event.kind == .cancelled)
+                let failure = active.invalidToolCall ? (code: "invalid_tool_call", message: "Model emitted an invalid or incomplete tool call") : active.textBudget.errorResponse(cancelled: event.kind == .cancelled)
                 frame = try failureFrame(work, message: failure.message, code: failure.code)
                 outputReason = active.textBudget.failure?.rawValue ?? failure.code
             }
@@ -622,8 +676,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
         } catch {
             work.cancellation.cancel()
             let cancelled = (error as? QwenGenerationError) == .cancelled
-            if !cancelled && active.textBudget.failure == nil { active.textBudget.record(.encodingFailed) }
-            let failure = active.textBudget.errorResponse(cancelled: cancelled)
+            if !cancelled && !active.invalidToolCall && active.textBudget.failure == nil { active.textBudget.record(.encodingFailed) }
+            let failure = active.invalidToolCall ? (code: "invalid_tool_call", message: "Model emitted an invalid or incomplete tool call") : active.textBudget.errorResponse(cancelled: cancelled)
             if let frame = try? failureFrame(work, message: failure.message, code: failure.code) {
                 let finished = work.output.finish(cancelled ? .cancelled : .failed, frame: frame)
                 if finished.status == .accepted {

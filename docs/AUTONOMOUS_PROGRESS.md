@@ -1,12 +1,20 @@
 # 自主研究与开发接续
 
-## 2026-09-08 最新方向：MTP 性能后置
+## 2026-09-08 当前完成：AR 服务与前缀缓存
+
+用户要求先处理计划前两项。本轮已完成完整混合状态快照/私有恢复、radix 最长前缀、LRU 和条目/字节/key token 额度，以及 HTTP function tools、调用历史、工具结果续答。HTTP 默认缓存512 MiB/8条，库需显式开启；MTP仍冷prefill。完整范围与原始结果见 [本轮验收](AR_PREFIX_CACHE.md)，尚未开始 SSD 状态卸载或 MTP 性能调优。
+
+133项Swift CPU、6项Python解析测试通过；23个带状态诊断请求、5个独立计时请求共1419生成IDs通过，25组/2785项跨状态tensor比较通过。新HTTP套件40检查/9次推理通过；旧HTTP回归第一次在启动前遇端口占用，保留失败，独立空闲端口重跑19项通过。二进制为 `2941a0dd…5a9a54`。索引阶段提交 `e53480e` 已推送，其余运行时/工具/文档随本轮提交；不重复运行已完成套件。
+
+最新参考恢复 ledger：`results/ar-prefix-cache-v1/http-regression/run-ledger.json`，本次核对PID10167、MTP/drafter未加载且idle。238文件与102模型payload stat核对后已解除冻结。此PID仅为当前快照，接续先验证实际命令/服务；此前74990及下文旧PID均已过期。heartbeat保持暂停，未改供电设置。下一项是后续授权下的SSD状态缓存，不自动恢复旧MTP实验计划。
+
+## 2026-09-08 优先级调整记录：MTP 性能后置
 
 用户明确要求将 MTP 性能优化放到整体计划靠后。此要求覆盖下文旧记录中的“MTP 先行”“缓存等待 MTP 门槛”和“不提前实现共享前缀或 SSD 状态缓存”等接续约定；旧实验结果、失败与性能门槛保持原样，不重新解释为通过。
 
 后续先推进 AR 服务与完整混合状态缓存，再做前缀树、淘汰、SSD 状态卸载及普通 prefill/decode 基础 kernel 优化，最后评估 MTP 的增量收益。AR 缓存仍需验证 Attention KV、QSA、GDN、PLE/n-gram 的完整状态、独立恢复、取消清理与容量限制，但不依赖 MTP 性能验收；MTP 专属状态与缓存兼容性单独验证。AR 缓存不适用于 MTP 时沿用原有 MTP 冷 prefill，只有无法安全执行的显式组合才拒绝，不静默改为 AR。现有 MTP 保持可选，涉及其路径的改动仍维护正确性回归。
 
-本次只调整计划，未实现缓存或修改默认运行配置；既有 heartbeat 保持暂停，不因本页历史接续建议自动启动实验。当前方向见 [综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)，缓存实施范围见 [完整前缀 checkpoint 设计](EXACT_PREFIX_CHECKPOINT_DESIGN.md)。以下保留历次进展及当时约定，优先级冲突以本节为准，运行状态以最新 controller ledger 为准。
+此段记录最初的优先级调整，实际缓存实现已在顶部更新；既有 heartbeat 保持暂停。当前方向见 [综合吸收计划](UPSTREAM_ADOPTION_PLAN.md)。以下保留历次进展及当时约定，优先级冲突以用户最新决定为准，运行状态以顶部最新 controller ledger 为准。
 
 用户在2026-09-07凌晨授权至少八小时自行推进，研究vLLM、SGLang和Redis作者的runner，吸收合适特性，并阶段性commit、推送GitHub。首轮工作窗口截至北京时间2026-09-07 13:30（UTC05:30）；到期完成在途实验的收尾、恢复参考服务并整理成果，不再自动启动新实验。
 

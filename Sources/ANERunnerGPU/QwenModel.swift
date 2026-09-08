@@ -94,6 +94,7 @@ public final class QwenModel {
     public private(set) var prefillMoEGateUpCalls = 0
     public private(set) var prefillMoEGroupedDownCalls = 0
     public let prefillAccumulation: GPUMoE.PrefillAccumulation
+    public let fusedPrefillEnabled: Bool
     private let embedding: Tensor
     private let layers: [Layer]
     private let mixer: GPUHyperConnection?
@@ -102,6 +103,11 @@ public final class QwenModel {
     private let identity = UUID()
     private let generationGate = QwenGenerationGate()
     private var generationFailure: String?
+    private final class WeakPrefixCache {
+        weak var value: QwenPrefixCache?
+        init(_ value: QwenPrefixCache) { self.value = value }
+    }
+    private var prefixCaches: [WeakPrefixCache] = []
     private var verificationLinearKernel: GPUVerificationLinear?
     private let preparedFusedProjections: Bool
     private let preparedSharedElementwise: Bool
@@ -122,7 +128,14 @@ public final class QwenModel {
     }
     // Called only while the generation gate is held. All generators sharing
     // this model observe the failure; constructing another wrapper cannot hide it.
-    func failGenerationRecovery(_ reason: String) { generationFailure = reason }
+    func failGenerationRecovery(_ reason: String) {
+        generationFailure = reason
+        prefixCaches.forEach { $0.value?.clear() }
+    }
+    func registerPrefixCache(_ cache: QwenPrefixCache) {
+        prefixCaches.removeAll { $0.value == nil }
+        prefixCaches.append(WeakPrefixCache(cache))
+    }
 
     public init(modelDirectory: URL, layerLimit: Int? = nil, profiler: GPUProfiler? = nil,
                 reservedOutputIDs: Set<Int32>? = nil, ssdWorkers: Int = 1,
@@ -141,6 +154,7 @@ public final class QwenModel {
         configuration = c; layerCount = count
         self.profiler = try profiler ?? GPUProfiler()
         self.prefillAccumulation = prefillAccumulation
+        fusedPrefillEnabled = GPUAttention.fusedPrefillEnabled
         let prepareProjections = decodeModes.contains { $0.fusesProjections }
         let prepareSharedElementwise = decodeModes.contains { $0.fusesSharedElementwise }
         preparedFusedProjections = prepareProjections
@@ -187,15 +201,25 @@ public final class QwenModel {
         return state
     }
 
-    /// Isolated diagnostics only. checkpoint()/State assignment retain shallow
-    /// immutable handles; this method instead gathers every persistent tensor
-    /// into new storage and evaluates the copies before returning. Never used
-    /// by ordinary generation, MTP rollback or the experimental forward itself.
+    /// Diagnostics use the same compact, independent copy as prefix reuse.
     public func diagnosticPrivateStateCopy(_ source: State) throws -> State {
+        try privatePrefixStateCopy(source)
+    }
+
+    /// Copies all persistent state and creates a fresh session identity. The
+    /// caller owns the inference gate. This is deliberately not State assignment
+    /// or MX.copy, both of which can retain the source's backing allocations.
+    func privatePrefixStateCopy(_ source: State) throws -> State {
         guard source.owner == identity, source.valid,
               source.gdn.allSatisfy({ $0.verificationCapture == nil }),
               source.ple.allSatisfy({ $0.verificationCapture == nil }) else {
-            throw GPUError.invalid("Diagnostic copy requires this model's valid AR state without captures")
+            throw GPUError.invalid("Prefix copy requires this model's valid AR state without captures")
+        }
+        for i in layers.indices {
+            guard (layers[i].gdn == nil || source.gdn[i].offset == source.offset),
+                  (layers[i].attention == nil || source.attention[i].offset == source.offset) else {
+                throw GPUError.invalid("Prefix state layers have inconsistent offsets")
+            }
         }
         var ready = source
         _ = try checkpoint(state: &ready)
@@ -218,6 +242,19 @@ public final class QwenModel {
         }
         try evaluate([], state: &result)
         return result
+    }
+
+    /// Logical compact snapshot payload, including the host n-gram history.
+    /// Temporary copies, token keys and the MLX allocator pool are separate.
+    func prefixStatePayloadBytes(_ state: State) throws -> Int {
+        guard state.owner == identity, state.valid else { throw GPUError.invalid("Invalid prefix state") }
+        var total = 0
+        for bytes in state.tensors.map(\.nbytes) + state.ple.map({ $0.history.count * MemoryLayout<UInt32>.stride }) {
+            let (sum, overflow) = total.addingReportingOverflow(bytes)
+            guard bytes >= 0, !overflow else { throw GPUError.invalid("Prefix state size overflow") }
+            total = sum
+        }
+        return total
     }
 
     public func restore(_ checkpoint: State, state: inout State) throws {

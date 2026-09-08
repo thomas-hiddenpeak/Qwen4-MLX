@@ -1,5 +1,7 @@
 # 本机文字 HTTP/SSE 实验服务
 
+2026-09-08 新增并完成 [AR 前缀缓存验收](AR_PREFIX_CACHE.md)及 [function tools 闭环](HTTP_TOOL_CALLING.md)：同一 `2941a0dd…5a9a54` 二进制通过新功能40项检查、9次推理及另一个服务进程的19项旧HTTP回归。HTTP默认512 MiB/8条快照；MTP保持冷prefill。下文旧版soak/背压数据仍绑定各自版本，不表示本轮已重跑这些较长套件。
+
 此入口复用已有 Swift/MLX generator 和 cooperative PD scheduler，已通过真实本机 HTTP/SSE、补充网络边界及固定12轮短测。2026-09-07的c930版本还修复了非流式文本超限归因，并实测到HTTP500 / output_limit及后续恢复；各版本证据分列如下。当前b039版本已接入有界异步诊断日志，43项Swift CPU、11项Python控制及五组真实服务回归（19/15/46/6/3项）全部通过，包括真实未读满stderr管道下的健康检查、AR/MTP及退出。同一b039二进制随后单独完成一次真实AR SSE缓冲溢出与恢复，4项检查通过；各版本和运行窗口分列，不累计成同一批。它仍是实验功能，不表示已经达到上线标准，也不提供完整 coding-agent API。
 
 ```bash
@@ -15,6 +17,8 @@
 | `--max-connections` | 8 | 1…32 |
 | `--max-body-bytes` | 262144 | 1024…1048576 |
 | `--output-buffer-bytes` | 65536 | 8192…1048576 |
+| `--prefix-cache-bytes` | 536870912 | 0…8589934592；0关闭 |
+| `--prefix-cache-entries` | 8 | 1…256 |
 
 固定 header 上限 16 KiB、待提交邮箱 8 请求、SSE 输出 256 条目（含一个最多 4 KiB 终态条目）。推理调度沿用 8 prefill / 2 ready、32768 逻辑预留 token、2 resident sequences、decodeBurst 4。请求接收期限 15 秒，单次发送无进展期限 15 秒，整个连接期限 300 秒。连接数满时直接关闭新连接，邮箱/推理队列满时返回 429；模型尚未 ready 或不可用返回 503。
 
@@ -39,11 +43,13 @@
 }
 ```
 
-model 必须精确匹配。messages 仅允许 role/content，两者是字符串；角色为 system/user/assistant，system 只能在第一条，至少有一条 user。使用当前 no-thinking、无工具的原始 chat template。max_tokens 默认 128，AR 范围 1…4096；stream 默认 false；temperature 只能省略或为数字 0；mtp_depth 只能为 0（默认 AR）或显式实验 2（batchedScalarLinear、draft history 1024）。**mtp_depth=2 时 max_tokens 仅允许 1…256**，超过即返回 400：当前候选只回归过此输出预算范围，更长输出可能越过 MTP head 的 QSA 阈值，尚未验证。context 16384、prefill chunk 416，prompt 加 max_tokens 超预算仍由 worker 校验并拒绝。
+model 必须精确匹配。基本 messages 使用字符串 role/content；角色为 system/user/assistant/tool，system 只能在第一条，至少有一条 user。携带 tool_calls 的 assistant 可用 null content，tool 需按顺序提供匹配的 tool_call_id。使用 no-thinking 模板；function tools 与调用历史的详细合同见[工具协议](HTTP_TOOL_CALLING.md)。max_tokens 默认128，AR范围1…4096；stream默认false；temperature只能省略或为数字0；mtp_depth只能为0（默认AR）或显式实验2（batchedScalarLinear、draft history1024）。**工具请求必须mtp_depth=0；纯文本mtp_depth=2的max_tokens仅允许1…256**，更长输出尚未验证。context16384、prefill chunk416，prompt加max_tokens仍按完整逻辑长度验证，不因缓存命中缩小预算。
 
-任何其他字段都返回 400，包括 tools、tool_choice、stop、top_p、多 choice、随机采样、图片/数组 content、reasoning 字段；不静默丢弃。布尔值不能充当整数参数。因而可供文字客户端试用，但不能宣称兼容需要 tool calling 的完整 agent 流程。
+tools支持function定义，tool_choice支持auto/none。required、指定函数及strict=true明确拒绝。stop、top_p、多choice、随机采样、图片/数组content、reasoning等其他字段仍返回400，不静默丢弃；布尔值不能充当整数。已支持工具闭环不等于完整agent协议兼容。
 
 流式成功响应依次发出 assistant role、零到多个 content、带 finish_reason 和 usage 的最终 chunk、`data: [DONE]`。EOS 映射为 stop，输出预算停止映射为 length。usage 来自 result 的实际 prompt/output token 计数，output 包括生成的 EOS，与本项目原始报告一致。字节经过每请求独立的 IncrementalUTF8Decoder，token 边界不会额外引入 Unicode 替换字符。非流式返回一个 JSON completion；文本与最终编码仍受 output-byte 限制，超限返回明确错误。
+
+工具请求还可产生结构化tool_calls；每个调用完整解析验证后才发送，成功终态为tool_calls。缓存命中时usage新增prompt_tokens_details.cached_tokens，完整prompt_tokens不变。health新增prefix_cache统计，缓存payload额度不包含请求私有副本及MLX allocator；详情见[缓存合同](AR_PREFIX_CACHE.md)。
 
 ## 慢读、取消与关闭
 

@@ -11,21 +11,36 @@ public enum QwenHTTPFrames {
     }
     /// One final completion chunk. Append done() to build a terminal payload.
     public static func finish(id: String, created: Int, model: String, reason: String,
-                              promptTokens: Int, completionTokens: Int) throws -> Data {
+                              promptTokens: Int, completionTokens: Int, cachedTokens: Int = 0) throws -> Data {
         try validateReason(reason)
         var result = chunk(id: id, created: created, model: model, delta: [:], reason: reason)
-        result["usage"] = try usage(promptTokens: promptTokens, completionTokens: completionTokens)
+        result["usage"] = try usage(promptTokens: promptTokens, completionTokens: completionTokens, cachedTokens: cachedTokens)
         return try event(result)
     }
     public static func done() -> Data { Data("data: [DONE]\n\n".utf8) }
 
     public static func completion(id: String, created: Int, model: String, text: String, reason: String,
-                                  promptTokens: Int, completionTokens: Int) throws -> Data {
+                                  promptTokens: Int, completionTokens: Int, cachedTokens: Int = 0, toolCalls: [QwenToolCall] = []) throws -> Data {
         try validateReason(reason)
+        guard toolCalls.isEmpty == (reason != "tool_calls") else {
+            throw QwenHTTPProtocolError(statusCode: 500, message: "Tool calls and completion finish reason disagree")
+        }
+        var message: [String: Any] = ["role": "assistant", "content": text]
+        if !toolCalls.isEmpty {
+            message["tool_calls"] = try toolCalls.map { try $0.wire() }
+            if text.isEmpty { message["content"] = NSNull() }
+        }
         let result: [String: Any] = ["id": id, "object": "chat.completion", "created": created, "model": model,
-            "choices": [["index": 0, "message": ["role": "assistant", "content": text], "finish_reason": reason]],
-            "usage": try usage(promptTokens: promptTokens, completionTokens: completionTokens)]
+            "choices": [["index": 0, "message": message, "finish_reason": reason]],
+            "usage": try usage(promptTokens: promptTokens, completionTokens: completionTokens, cachedTokens: cachedTokens)]
         return try json(result)
+    }
+    /// Emits one validated complete call. It still uses the same bounded SSE
+    /// queue and event budget as a content event.
+    public static func toolCall(id: String, created: Int, model: String, call: QwenToolCall, index: Int) throws -> Data {
+        guard index >= 0 && index < 16 else { throw QwenHTTPProtocolError(statusCode: 500, message: "Invalid tool call index") }
+        return try event(chunk(id: id, created: created, model: model,
+            delta: ["tool_calls": [try call.wire(index: index)]], reason: NSNull()))
     }
     public static func error(message: String, code: String, type: String = "invalid_request_error") throws -> Data {
         try json(errorObject(message: message, code: code, type: type))
@@ -56,22 +71,24 @@ public enum QwenHTTPFrames {
         Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8)
     }
 
-    private static func chunk(id: String, created: Int, model: String, delta: [String: String], reason: Any) -> [String: Any] {
+    private static func chunk(id: String, created: Int, model: String, delta: [String: Any], reason: Any) -> [String: Any] {
         ["id": id, "object": "chat.completion.chunk", "created": created, "model": model,
          "choices": [["index": 0, "delta": delta, "finish_reason": reason]]]
     }
     private static func errorObject(message: String, code: String, type: String) -> [String: Any] {
         ["error": ["message": message, "type": type, "param": NSNull(), "code": code]]
     }
-    private static func usage(promptTokens: Int, completionTokens: Int) throws -> [String: Int] {
+    private static func usage(promptTokens: Int, completionTokens: Int, cachedTokens: Int) throws -> [String: Any] {
         let (total, overflow) = promptTokens.addingReportingOverflow(completionTokens)
-        guard promptTokens >= 0, completionTokens >= 0, !overflow else {
+        guard promptTokens >= 0, completionTokens >= 0, cachedTokens >= 0, cachedTokens <= promptTokens, !overflow else {
             throw QwenHTTPProtocolError(statusCode: 500, message: "Invalid actual token usage")
         }
-        return ["prompt_tokens": promptTokens, "completion_tokens": completionTokens, "total_tokens": total]
+        var result: [String: Any] = ["prompt_tokens": promptTokens, "completion_tokens": completionTokens, "total_tokens": total]
+        if cachedTokens > 0 { result["prompt_tokens_details"] = ["cached_tokens": cachedTokens] }
+        return result
     }
     private static func validateReason(_ reason: String) throws {
-        guard ["stop", "length"].contains(reason) else {
+        guard ["stop", "length", "tool_calls"].contains(reason) else {
             throw QwenHTTPProtocolError(statusCode: 500, message: "Unsupported finish reason")
         }
     }

@@ -116,7 +116,7 @@ def main():
         status,_,raw,_=request('GET','/v1/models');models=json.loads(raw)
         check('model_identity',status==200 and [x['id'] for x in models['data']]==[model])
         base=chat([{'role':'user','content':'Reply with OK.'}])
-        for field,value in [('model','unknown-model'),('temperature',.7),('tools',[]),('max_tokens',True),('stream','true')]:
+        for field,value in [('model','unknown-model'),('temperature',.7),('tool_choice','required'),('max_tokens',True),('stream','true')]:
             bad=dict(base);bad[field]=value;status,_,raw,_=request('POST','/v1/chat/completions',bad)
             check('reject_'+field,400<=status<500,status=status,error=json.loads(raw))
         ar=decode_response(request('POST','/v1/chat/completions',chat(messages,True)),True)

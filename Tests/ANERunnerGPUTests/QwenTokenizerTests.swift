@@ -1,3 +1,4 @@
+import ANERunnerCore
 import Foundation
 import XCTest
 @testable import ANERunnerGPU
@@ -45,4 +46,23 @@ final class QwenTokenizerTests: XCTestCase {
         XCTAssertEqual(try compatible.decode([248045, 248068, 248046], skipSpecialTokens: true), "<think>")
         XCTAssertThrowsError(try compatible.decode([Int32.max]))
     }
+    func testToolTemplateAndSystemPrefixUseExactCompleteTokenPrefix() throws {
+        let tokenizer = try QwenTokenizer(modelDirectory: GPUFixtureLocation.model())
+        let tool = try QwenToolDefinition.decode(["type": "function", "function": ["name": "weather",
+            "parameters": ["type": "object", "properties": ["city": ["type": "string"]], "required": ["city"]]]])
+        let history = [ChatMessage(role: "system", content: String(repeating: "相同系统规则。", count: 180)),
+                       ChatMessage(role: "user", content: "北京天气")]
+        let rendered = try tokenizer.renderChat(messages: history, tools: [tool])
+        let tokens = try tokenizer.encode(rendered)
+        let count = try tokenizer.systemPrefixTokenCount(messages: history, tools: [tool], fullTokens: tokens)
+        XCTAssertGreaterThan(count, 416); XCTAssertLessThan(count, tokens.count)
+        XCTAssertEqual(Array(tokens.prefix(count)), Array(try tokenizer.encode(
+            QwenToolChatTemplate.systemPrefix(system: history[0].content, tools: [tool])).prefix(count)))
+        XCTAssertEqual(try tokenizer.renderChat(messages: history, tools: []), try tokenizer.renderChat(messages: history))
+        XCTAssertEqual(try tokenizer.systemPrefixTokenCount(messages: [.init(role: "user", content: "x")],
+            tools: [], fullTokens: tokens), 0)
+        let altered = try tokenizer.encode("different " + rendered)
+        XCTAssertEqual(try tokenizer.systemPrefixTokenCount(messages: history, tools: [tool], fullTokens: altered), 0)
+    }
+
 }
