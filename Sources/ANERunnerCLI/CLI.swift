@@ -84,6 +84,10 @@ struct RunnerCLI {
                 try probeGPUModel(arguments)
             case "probe-gpu-kv-capacity":
                 try probeGPUKVCapacityMechanism(arguments)
+            case "probe-gpu-kv-capacity-model":
+                try probeGPUKVCapacityModel(arguments)
+            case "benchmark-gpu-kv-capacity":
+                try benchmarkGPUKVCapacity(arguments)
             case "generate-gpu":
                 try generateGPU(arguments)
             case "probe-gpu-phase-handoff":
@@ -343,6 +347,11 @@ struct RunnerCLI {
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
     probe-gpu-kv-capacity --diagnostics-library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
         Model-free Swift capacity allocation/ARC diagnostic; default eval sync. Run in an exclusive GPU window.
+    probe-gpu-kv-capacity-model --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        Actual generator correctness, RAM restore, workspace fallback and callback cancellation; diagnostic timing only.
+    benchmark-gpu-kv-capacity --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--max-tokens 16] [--context 16384] [--order abba|baab] [--warmup true|false]
+        Four generator trials with observers disabled; capacity remains an explicit experimental request policy.
     probe-gpu-session --model-dir PATH [--tokens-file PATH] --output NEW_REPORT_JSON
         Exercise typed generation API: invalid input, cancellation, callback failure, busy rejection, fresh-request recovery and scalar MTP.
     probe-gpu-mtp-state --model-dir PATH --output NEW_REPORT_JSON [--verification POLICY]

@@ -21,6 +21,7 @@
 
 import Foundation
 import CMLX
+import Darwin
 
 public enum GPUAttentionError: Error, CustomStringConvertible {
     case invalid(String)
@@ -34,6 +35,11 @@ public enum GPUAttentionError: Error, CustomStringConvertible {
 /// KV storage remains complete; sparse visibility does not imply that stock
 /// MLX SDPA physically avoids reading every unselected KV block.
 public final class GPUAttention {
+    /// Experimental ordinary-AR storage policy; reference remains the default.
+    public enum KVAppendMode: String, Codable, CaseIterable, Sendable {
+        case reference
+        case capacity256
+    }
     public enum PrefillMode: String, Codable, CaseIterable, Sendable {
         /// Existing causal-fused / QSA-unfused routing.
         case reference
@@ -48,33 +54,126 @@ public final class GPUAttention {
         }
     }
     public struct State {
-        public var keys: Tensor?
-        public var values: Tensor?
+        // Public setters invalidate a private capacity owner immediately when
+        // a caller replaces either logical Tensor. Pointer/shape similarity
+        // is insufficient: only the exact wrapper identities are our views.
+        private var storedKeys: Tensor?
+        private var storedValues: Tensor?
+        public var keys: Tensor? {
+            get { storedKeys }
+            set { storedKeys = newValue; discardStaleCapacity() }
+        }
+        public var values: Tensor? {
+            get { storedValues }
+            set { storedValues = newValue; discardStaleCapacity() }
+        }
         public var rawIndexerKeys: Tensor?
         public var pooledIndexerKeys: Tensor?
         public var offset: Int
         // Extents of runner-owned allocations, not only current view shapes.
         // Caller-supplied aliases may already retain storage beyond these sizes.
         fileprivate var retainedRowCount: Int
+        fileprivate var retainedKVRowCount: Int
         fileprivate var retainedPooledBlockCount: Int
+        private var kvCapacity: GPUKVCapacityStorage?
+        private var kvKeyIdentity: ObjectIdentifier?
+        private var kvValueIdentity: ObjectIdentifier?
         /// Diagnostic allocation bookkeeping; values, not buffer identities.
+        /// Preserve the existing host-oracle schema: raw extent, pooled extent.
+        /// Capacity padding is private and never becomes archive payload.
         public var diagnosticRetainedStorage: [Int] { [retainedRowCount, retainedPooledBlockCount] }
 
         public init(keys: Tensor? = nil, values: Tensor? = nil,
                     rawIndexerKeys: Tensor? = nil, pooledIndexerKeys: Tensor? = nil,
                     offset: Int = 0) {
-            self.keys = keys
-            self.values = values
+            storedKeys = keys
+            storedValues = values
             self.rawIndexerKeys = rawIndexerKeys
             self.pooledIndexerKeys = pooledIndexerKeys
             self.offset = offset
             retainedRowCount = offset
+            retainedKVRowCount = offset
             retainedPooledBlockCount = pooledIndexerKeys.map { $0.shape.count > 1 ? $0.shape[1] : 0 } ?? 0
         }
 
         public mutating func reset() { self = State() }
         public var tensors: [Tensor] {
             [keys,values,rawIndexerKeys,pooledIndexerKeys].compactMap { $0 }
+        }
+
+        private var capacityViewsMatch: Bool {
+            guard let kvCapacity, let storedKeys, let storedValues else { return false }
+            return ObjectIdentifier(storedKeys) == kvKeyIdentity &&
+                ObjectIdentifier(storedValues) == kvValueIdentity &&
+                kvCapacity.logicalRows == offset
+        }
+        private mutating func discardStaleCapacity() {
+            guard kvCapacity != nil, !capacityViewsMatch else { return }
+            kvCapacity = nil; kvKeyIdentity = nil; kvValueIdentity = nil
+            // Keep the conservative old extent. The other unchanged logical
+            // view may still retain the capacity allocation; a later concat or
+            // prefix copy establishes fresh known extents.
+        }
+        /// Complete the existing forward bookkeeping after QSA updated raw
+        /// history. Internal so the same state transition is exercised without
+        /// model weights; this performs no tensor operation or public callback.
+        mutating func finishForward(offset: Int) {
+            self.offset = offset
+            retainedRowCount = self.offset
+        }
+
+        private static let capacityPageBytes: Int = Int(getpagesize())
+
+        /// Host-only workspace estimate before the next S1 graph is built.
+        /// Two temporary K/V versions beyond the separately admitted persistent
+        /// state. Each buffer includes page rounding and two pages of allocator
+        /// allowance. This is a conservative logical permit, never an RSS cap.
+        func kvCapacityWorkspaceBytesForNextRow(rowLimit: Int) throws -> Int {
+            guard offset >= 0, offset < rowLimit, rowLimit <= GPUKVCapacityStorage.maximumRows else {
+                throw GPUAttentionError.invalid("KV capacity workspace exceeds the admitted row limit")
+            }
+            if capacityViewsMatch, let kvCapacity, kvCapacity.rowLimit == rowLimit,
+               kvCapacity.capacityRows >= offset + 1 { return 0 }
+            let capacity = try GPUKVCapacityStorage.capacity(requiredRows: offset + 1, rowLimit: rowLimit)
+            let page = Self.capacityPageBytes
+            guard page > 0 else { throw GPUAttentionError.invalid("Invalid host page size for KV workspace") }
+            let (bytes, byteOverflow) = capacity.multipliedReportingOverflow(by: 2 * 256 * 2)
+            let (roundedNumerator, roundOverflow) = bytes.addingReportingOverflow(page - 1)
+            guard !byteOverflow, !roundOverflow else { throw GPUAttentionError.invalid("KV workspace byte overflow") }
+            let (rounded, pageOverflow) = (roundedNumerator / page).multipliedReportingOverflow(by: page)
+            let (allowance, allowanceOverflow) = page.multipliedReportingOverflow(by: 2)
+            let (oneBuffer, bufferOverflow) = rounded.addingReportingOverflow(allowance)
+            // 2 temporary versions × (one K + one V).
+            let (workspace, workspaceOverflow) = oneBuffer.multipliedReportingOverflow(by: 4)
+            guard !pageOverflow, !allowanceOverflow, !bufferOverflow, !workspaceOverflow else {
+                throw GPUAttentionError.invalid("KV workspace allocation allowance overflow")
+            }
+            return workspace
+        }
+
+        /// All old local views/owners leave this method before the profiler
+        /// may evaluate its result. External copies remain live and force COW.
+        mutating func appendCapacity(keys newKeys: Tensor, values newValues: Tensor,
+                                                  rowLimit: Int) throws -> (keys: Tensor, values: Tensor) {
+            var storage: GPUKVCapacityStorage
+            if capacityViewsMatch, let current = kvCapacity, current.rowLimit == rowLimit {
+                storage = current
+            } else if offset == 0 {
+                storage = try GPUKVCapacityStorage(rowLimit: rowLimit)
+            } else {
+                guard let storedKeys, let storedValues else {
+                    throw GPUAttentionError.invalid("Missing compact state for capacity conversion")
+                }
+                storage = try GPUKVCapacityStorage(compactKeys: storedKeys, compactValues: storedValues,
+                    rowLimit: rowLimit)
+            }
+            let visible = try storage.append(keys: newKeys, values: newValues)
+            // Install through private fields as one operation. Public setters
+            // intentionally reject mixed old/new view identities.
+            storedKeys = visible.keys; storedValues = visible.values
+            kvKeyIdentity = ObjectIdentifier(visible.keys); kvValueIdentity = ObjectIdentifier(visible.values)
+            kvCapacity = storage; retainedKVRowCount = storage.capacityRows
+            return (visible.keys, visible.values)
         }
     }
 
@@ -129,7 +228,8 @@ public final class GPUAttention {
     public func forward(_ x: Tensor, state: inout State, positionBase: Int = 0,
                         verificationLinear: GPUVerificationLinear? = nil,
                         prefillMode: PrefillMode = .reference,
-                        profiler: GPUProfiler? = nil) throws -> Tensor {
+                        profiler: GPUProfiler? = nil,
+                        kvCapacityRowLimit: Int? = nil) throws -> Tensor {
         guard x.shape.count == 3, x.shape[0] == 1, x.shape[1] > 0,
               x.shape[2] == 2560, x.dtype == MLX_BFLOAT16,
               state.offset >= 0, state.offset <= 262144 - x.shape[1],
@@ -139,7 +239,22 @@ public final class GPUAttention {
         guard prefillMode == .reference || verificationLinear == nil else {
             throw GPUAttentionError.invalid("QSA prefill fusion cannot select verification kernels")
         }
-        try validate(state)
+        if let rowLimit = kvCapacityRowLimit {
+            guard x.shape[1] == 1, positionBase == 0, verificationLinear == nil,
+                  prefillMode == .reference, rowLimit > state.offset,
+                  rowLimit <= GPUKVCapacityStorage.maximumRows else {
+                throw GPUAttentionError.invalid("Capacity KV requires admitted ordinary S1 AR rows without verification")
+            }
+        }
+        try Self.validate(state)
+        var capacityAppended = false, completed = false
+        defer {
+            // Capacity handoff must release the old views before evaluation,
+            // so it cannot promise rollback after a later stage fails. A direct
+            // caller must restart the sequence; QwenModel invalidates its session
+            // and synchronizes through the existing recovery path.
+            if capacityAppended && !completed { state.reset() }
+        }
         let sequence = x.shape[1], offset = state.offset
         let ropeOffset = positionBase + offset
         let qkv: (queries: Tensor,gate: Tensor,newKeys: Tensor,newValues: Tensor) = try measure(
@@ -160,11 +275,18 @@ public final class GPUAttention {
         let queries = qkv.queries, gate = qkv.gate
         let kv: (keys: Tensor,values: Tensor) = try measure("attention.kv_append",profiler: profiler,sequence: sequence,
                              outputs: { [$0.keys,$0.values] }) {
+            if let rowLimit = kvCapacityRowLimit {
+                let result = try state.appendCapacity(keys: qkv.newKeys, values: qkv.newValues, rowLimit: rowLimit)
+                capacityAppended = true
+                return result
+            }
             let keys = try state.keys.map { try MX.concat([$0,qkv.newKeys],axis: 2) } ?? qkv.newKeys
             let values = try state.values.map { try MX.concat([$0,qkv.newValues],axis: 2) } ?? qkv.newValues
             return (keys: keys,values: values)
         }
         let keys = kv.keys, values = kv.values
+        // In capacity mode state already owns the new complete backing and
+        // logical views. This copy cannot retain an old request-owned KV root.
         var next = state
         let projectedIndex = try measure("attention.index_projection",profiler: profiler,sequence: sequence,
                                         outputs: { [$0] }) {
@@ -209,11 +331,14 @@ public final class GPUAttention {
             let gated = try MX.mul(heads,MX.sigmoid(gate))
             return try MX.linear(MX.reshape(gated,[1,sequence,6144]),outWeight, verification: verificationLinear)
         }
-        next.keys = keys
-        next.values = values
-        next.offset = offset + sequence
-        next.retainedRowCount = next.offset // KV and raw indexer concat allocate anew.
+        if kvCapacityRowLimit == nil {
+            next.keys = keys
+            next.values = values
+            next.retainedKVRowCount = offset + sequence
+        }
+        next.finishForward(offset: offset + sequence)
         state = next
+        completed = true
         return result
     }
 
@@ -230,17 +355,23 @@ public final class GPUAttention {
     /// Joint evaluation detaches old graph inputs in ordinary non-traced MLX
     /// execution; the view retains its one backing buffer, not the entire graph.
     public func prefixState(_ state: State, count: Int) throws -> State {
+        try Self.retainedState(state, count: count)
+    }
+
+    /// Pure state-storage operation; no weights, layer instance or QSA math.
+    static func retainedState(_ state: State, count: Int) throws -> State {
         guard count >= 0, count <= state.offset else {
             throw GPUAttentionError.invalid("Attention prefix count is outside the existing cache")
         }
-        try validate(state)
-        if count == state.offset { return state }
+        try Self.validate(state)
+        if count == state.offset, state.retainedKVRowCount - count <= 4,
+           state.retainedRowCount - count <= 4 { return state }
         if count == 0 { return State() }
         guard let keys = state.keys, let values = state.values, let raw = state.rawIndexerKeys else {
             throw GPUAttentionError.invalid("Missing attention state for prefix commit")
         }
-        let prefixKeys = try Self.retainedPrefix(keys, axis: 2, count: count, extent: state.retainedRowCount, maximumTail: 4)
-        let prefixValues = try Self.retainedPrefix(values, axis: 2, count: count, extent: state.retainedRowCount, maximumTail: 4)
+        let prefixKeys = try Self.retainedPrefix(keys, axis: 2, count: count, extent: state.retainedKVRowCount, maximumTail: 4)
+        let prefixValues = try Self.retainedPrefix(values, axis: 2, count: count, extent: state.retainedKVRowCount, maximumTail: 4)
         let prefixRaw = try Self.retainedPrefix(raw, axis: 1, count: count, extent: state.retainedRowCount, maximumTail: 4)
         var prefixPooled: Tensor?
         var retainedBlocks = 0
@@ -256,7 +387,8 @@ public final class GPUAttention {
         }
         var result = State(keys: prefixKeys.tensor, values: prefixValues.tensor, rawIndexerKeys: prefixRaw.tensor,
                            pooledIndexerKeys: prefixPooled, offset: count)
-        result.retainedRowCount = prefixKeys.extent
+        result.retainedKVRowCount = prefixKeys.extent
+        result.retainedRowCount = prefixRaw.extent
         result.retainedPooledBlockCount = retainedBlocks
         return result
     }
@@ -275,7 +407,7 @@ public final class GPUAttention {
         return (try GPUVerificationCopy.tensor(view), count)
     }
 
-    private func validate(_ state: State) throws {
+    private static func validate(_ state: State) throws {
         if state.offset == 0 {
             guard state.keys == nil, state.values == nil, state.rawIndexerKeys == nil,
                   state.pooledIndexerKeys == nil else {

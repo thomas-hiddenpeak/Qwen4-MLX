@@ -481,6 +481,36 @@ public final class QwenModel {
                 + (layer.gdn?.additionalProjectionBufferBytes ?? 0)
         } + (mixer?.additionalProjectionBufferBytes ?? 0)
     }
+    /// Reserve only the extra lazy K/V growth buffers, before constructing any
+    /// tensor. The admitted request already owns its old/new logical states.
+    /// This optional optimization never evicts a prefix or waits for capacity.
+    func reserveKVCapacityAppend(state: State, rowLimit: Int) throws -> QwenKVCapacityAppendPermit? {
+        guard state.owner == identity, state.valid, state.offset >= 0,
+              rowLimit > state.offset, rowLimit <= configuration.maximumPositions,
+              state.attention.count == layerCount,
+              state.gdn.allSatisfy({ $0.verificationCapture == nil }),
+              state.ple.allSatisfy({ $0.verificationCapture == nil }) else {
+            throw GPUError.invalid("KV capacity requires this model's valid ordinary AR state and admitted row limit")
+        }
+        var bytes = 0
+        for i in layers.indices where layers[i].attention != nil {
+            guard state.attention[i].offset == state.offset else {
+                throw GPUError.invalid("KV capacity state layers have inconsistent offsets")
+            }
+            let required = try state.attention[i].kvCapacityWorkspaceBytesForNextRow(rowLimit: rowLimit)
+            let (sum, overflow) = bytes.addingReportingOverflow(required)
+            guard required >= 0, !overflow else { throw GPUError.invalid("KV capacity workspace size overflow") }
+            bytes = sum
+        }
+        let lease: QwenStateBudget.Lease?
+        if bytes > 0 {
+            guard let reserved = stateBudget.reserve(bytes: bytes, kind: .workspace) else { return nil }
+            lease = reserved
+        } else { lease = nil }
+        return QwenKVCapacityAppendPermit(modelOwner: identity, sessionIdentity: state.sessionIdentity,
+            offset: state.offset, rowLimit: rowLimit, workspaceBytes: bytes, lease: lease)
+    }
+
     /// Device failures can happen after a lazy graph was successfully built.
     /// Invalidate the session in that case; reset is required before reuse.
     public func evaluate(_ outputs: [Tensor], state: inout State) throws {
@@ -518,7 +548,8 @@ public final class QwenModel {
                         allowExperimentalDecodeAsync: Bool = true,
                         prefillAttention: GPUAttention.PrefillMode = .reference,
                         profileLogits: Bool = true,
-                        prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil) throws -> Output {
+                        prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
+                        kvCapacityPermit: QwenKVCapacityAppendPermit? = nil) throws -> Output {
         guard state.owner == identity, state.valid, state.gdn.count == layerCount, !tokens.isEmpty, evaluateEveryLayers > 0,
               !captureVerification || tokens.count <= 5,
               !verifyScalarLinear || (tokens.count <= 5 && decodeMode == .reference),
@@ -535,6 +566,17 @@ public final class QwenModel {
                 throw GPUError.invalid("Prefill MoE configuration cannot select decode or verification kernels")
             }
         }
+        let kvCapacityRowLimit: Int?
+        if let kvCapacityPermit {
+            guard phase == .decode, tokens.count == 1, !captureTrace, !captureVerification,
+                  !verifyScalarBoundaries, !verifyScalarMoE, !verifyScalarLinear, !verifyTokenMoE,
+                  prefillPrefetch == nil, prefillMoEConfiguration == nil else {
+                throw GPUError.invalid("KV capacity permit requires explicit single-token AR decode without captures or verification")
+            }
+            kvCapacityRowLimit = try kvCapacityPermit.consume(modelOwner: identity,
+                sessionIdentity: state.sessionIdentity, offset: state.offset,
+                maximumRowLimit: configuration.maximumPositions)
+        } else { kvCapacityRowLimit = nil }
         if profiler.isRecording { try profiler.setForwardContext(phase: executionPhase, position: state.offset) }
         defer { profiler.clearForwardContext() }
         // This prototype accepts text tokens. Vision/audio feature insertion is
@@ -601,11 +643,13 @@ public final class QwenModel {
                         // Flat child stages replace the inclusive parent; never
                         // double-count attention or nest synchronized measures.
                         attnOut = try attention.forward(pre.mixed, state: &state.attention[i],
-                            verificationLinear: linear, prefillMode: prefillAttention, profiler: profiler)
+                            verificationLinear: linear, prefillMode: prefillAttention, profiler: profiler,
+                            kvCapacityRowLimit: kvCapacityRowLimit)
                     } else {
                         attnOut = try profiler.measure("attention", layer: i, tokenCount: n, outputs: { [$0.0] + $0.1 }) {
                             let y = try attention.forward(pre.mixed, state: &state.attention[i],
-                                verificationLinear: linear, prefillMode: prefillAttention); return (y, state.attention[i].tensors)
+                                verificationLinear: linear, prefillMode: prefillAttention,
+                                kvCapacityRowLimit: kvCapacityRowLimit); return (y, state.attention[i].tensors)
                         }.0
                     }
                 }

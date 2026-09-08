@@ -45,6 +45,8 @@ public struct QwenGenerationRequest: Sendable {
     /// Complete-conversation lookup with bounded original-grid checkpoints.
     /// Mutually exclusive with the legacy prefixCacheMaxTokens hint.
     public let prefixCachePlan: QwenConversationPrefixPlan?
+    /// Experimental ordinary AR K/V append policy; prefill remains unchanged.
+    public let kvAppendMode: GPUAttention.KVAppendMode
 
     public init(tokens: [Int32], maxTokens: Int = 128, contextLimit: Int = 16_384,
                 prefillChunk: Int = 416, mtpDepth: Int = 0,
@@ -54,7 +56,8 @@ public struct QwenGenerationRequest: Sendable {
                 prefillAttention: GPUAttention.PrefillMode = .reference,
                 prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
                 prefixCacheMaxTokens: Int? = nil,
-                prefixCachePlan: QwenConversationPrefixPlan? = nil) {
+                prefixCachePlan: QwenConversationPrefixPlan? = nil,
+                kvAppendMode: GPUAttention.KVAppendMode = .reference) {
         self.tokens = tokens; self.maxTokens = maxTokens
         self.contextLimit = contextLimit; self.prefillChunk = prefillChunk
         self.mtpDepth = mtpDepth; self.verification = verification
@@ -66,6 +69,7 @@ public struct QwenGenerationRequest: Sendable {
         self.prefillMoEConfiguration = prefillMoEConfiguration
         self.prefixCacheMaxTokens = prefixCacheMaxTokens
         self.prefixCachePlan = prefixCachePlan
+        self.kvAppendMode = kvAppendMode
     }
 
     public func validate(configuration: QwenConfiguration) throws {
@@ -89,6 +93,9 @@ public struct QwenGenerationRequest: Sendable {
         }
         guard (0...4).contains(mtpDepth) else {
             throw QwenGenerationError.invalidRequest("mtpDepth must be between 0 and 4")
+        }
+        guard mtpDepth == 0 || kvAppendMode == .reference else {
+            throw QwenGenerationError.invalidRequest("KV capacity append and MTP cannot be enabled together")
         }
         guard mtpDepth == 0 || !verification.usesScalarLinear || decodeMode == .reference else {
             throw QwenGenerationError.invalidRequest("\(verification.rawValue) verification requires reference decode kernels")
@@ -255,6 +262,14 @@ public struct QwenGenerationPhases: Codable, Sendable {
     public let decodeKernelMode: String
     /// Time outside admitted decode slices; nil in historical reports.
     public var decodeSuspensionSeconds: Double? = nil
+    /// Requested AR append policy and successfully evaluated capacity steps.
+    /// Nil when decoding historical reports; these are not allocation counters.
+    public var kvAppendMode: String? = nil
+    public var kvCapacityTokenSteps: Int? = nil
+    public var kvCapacityWorkspaceFallbacks: Int? = nil
+    /// Largest extra K/V workspace reservation held for one successful step.
+    /// Logical admission allowance, not observed MLX/RSS peak memory.
+    public var kvCapacityWorkspacePeakBytes: Int? = nil
 }
 
 /// A single-use payload, confined to the model's inference executor. An invalid
@@ -398,6 +413,8 @@ fileprivate final class QwenDecodeProgress {
     var firstTokenReadySeconds: Double?
     var callbackSeconds = 0.0, decodeSeconds = 0.0, activeSeconds = 0.0, suspensionSeconds = 0.0
     var decodeRounds = 0, ssdBytes = 0
+    var kvCapacityTokenSteps = 0, kvCapacityWorkspaceFallbacks = 0
+    var kvCapacityWorkspacePeakBytes = 0
     var ssdWait = 0.0
     init(payload: QwenPrefillPayload, prepared: QwenPrefillResult,
          handoffWaitSeconds: Double, handoffConsumeSeconds: Double, now: UInt64) {
@@ -421,6 +438,11 @@ public final class QwenGenerator {
     /// Diagnostics only: readback here perturbs execution and is excluded from
     /// production timing trials. Do not mutate tensors or reenter generation.
     public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
+    /// Ordinary AR diagnostics only: firstToken before publication, then decode
+    /// after each synchronous selected-token/state evaluation. Readback perturbs
+    /// timings. Do not mutate tensors, reenter generation or retain unbudgeted
+    /// state aliases. MTP never invokes this observer.
+    public var decodeStateObserver: ((String, QwenModel.State) throws -> Void)?
     /// Read only on the owning inference executor, like other model statistics.
     public var prefixCacheStatistics: QwenPrefixCacheStatistics? { prefixCache?.statistics }
     public var prefixDiskStatistics: QwenPrefixDiskStatistics? { prefixCache?.disk?.statistics }
@@ -829,6 +851,10 @@ public final class QwenGenerator {
         defer { session.isActive = false }
         if accountSuspension { p.suspensionSeconds += Double(start - p.lastYieldAt) * 1e-9 }
         var beganDeviceWork = false
+        // Keep ownership outside the AR branch and its catch: a lazy graph may
+        // still retain intermediate K/V buffers until final eval or recovery.
+        var kvCapacityPermit: QwenKVCapacityAppendPermit?
+        defer { kvCapacityPermit?.releaseAfterCompletion() }
         do {
             try checkCancellation(session.cancellation, cancellation)
             func publish(_ token: Int32) throws {
@@ -843,6 +869,7 @@ public final class QwenGenerator {
             }
             if p.generated.isEmpty {
                 p.firstTokenReadySeconds = Double(now() - p.prepared.requestStartedAt) * 1e-9
+                if p.decoder == nil { try decodeStateObserver?("firstToken", p.state) }
                 try publish(p.next)
             } else {
                 let roundStart = now()
@@ -855,11 +882,23 @@ public final class QwenGenerator {
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
                     tokens = round.tokens; p.ssdWait += round.ssdWaitSeconds; p.ssdBytes += round.ssdLogicalBytes
                 } else {
+                    if request.kvAppendMode == .capacity256 {
+                        kvCapacityPermit = try model.reserveKVCapacityAppend(state: p.state,
+                            rowLimit: request.tokens.count + request.maxTokens)
+                        if kvCapacityPermit == nil { p.kvCapacityWorkspaceFallbacks += 1 }
+                    }
                     let out = try model.forward(tokens: [p.next], state: &p.state,
-                        decodeMode: request.decodeMode, phase: .decode)
+                        decodeMode: request.decodeMode, phase: .decode,
+                        kvCapacityPermit: kvCapacityPermit)
                     guard let logits = out.logits else { throw QwenGenerationError.unavailable("missing target logits") }
                     let selected = try model.greedyToken(logits)
                     try model.evaluate([selected], state: &p.state)
+                    if let kvCapacityPermit {
+                        p.kvCapacityTokenSteps += 1
+                        p.kvCapacityWorkspacePeakBytes = max(p.kvCapacityWorkspacePeakBytes,
+                            kvCapacityPermit.workspaceBytes)
+                    }
+                    try decodeStateObserver?("decode", p.state)
                     tokens = [try selected.uint32TokenID()]
                     p.ssdWait += out.ssdWaitSeconds; p.ssdBytes += out.ssdLogicalBytes
                 }
@@ -883,6 +922,10 @@ public final class QwenGenerator {
                 verificationEvaluateEveryLayers: request.verificationEvaluateEveryLayers,
                 decodeKernelMode: request.decodeMode.rawValue)
             phases.decodeSuspensionSeconds = p.suspensionSeconds
+            phases.kvAppendMode = request.kvAppendMode.rawValue
+            phases.kvCapacityTokenSteps = p.kvCapacityTokenSteps
+            phases.kvCapacityWorkspaceFallbacks = p.kvCapacityWorkspaceFallbacks
+            phases.kvCapacityWorkspacePeakBytes = p.kvCapacityWorkspacePeakBytes
             let result = QwenGenerationResult(tokens: p.generated,
                 finishReason: eosTokenIDs.contains(p.next) ? .eos : .length,
                 preparationSeconds: p.prepared.preparationSeconds,
@@ -918,7 +961,10 @@ public final class QwenGenerator {
                     decodeServiceSeconds: elapsed(start), decodeSSDWaitSeconds: phases.decodeSSDWaitSeconds,
                     decodeSSDLogicalBytes: phases.decodeSSDLogicalBytes,
                     verificationEvaluateEveryLayers: phases.verificationEvaluateEveryLayers,
-                    decodeKernelMode: phases.decodeKernelMode, decodeSuspensionSeconds: 0)
+                    decodeKernelMode: phases.decodeKernelMode, decodeSuspensionSeconds: 0,
+                    kvAppendMode: phases.kvAppendMode, kvCapacityTokenSteps: phases.kvCapacityTokenSteps,
+                    kvCapacityWorkspaceFallbacks: phases.kvCapacityWorkspaceFallbacks,
+                    kvCapacityWorkspacePeakBytes: phases.kvCapacityWorkspacePeakBytes)
                 return QwenGenerationResult(tokens: result.tokens, finishReason: result.finishReason,
                     preparationSeconds: result.preparationSeconds,
                     timeToFirstTokenSeconds: result.timeToFirstTokenSeconds,
