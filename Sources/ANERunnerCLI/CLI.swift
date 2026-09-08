@@ -82,6 +82,8 @@ struct RunnerCLI {
                 try probeGPUSequence(arguments)
             case "probe-gpu-model":
                 try probeGPUModel(arguments)
+            case "probe-gpu-kv-capacity":
+                try probeGPUKVCapacityMechanism(arguments)
             case "generate-gpu":
                 try generateGPU(arguments)
             case "probe-gpu-phase-handoff":
@@ -339,6 +341,8 @@ struct RunnerCLI {
         Routing diagnostic: --capture-verification-routing true (D2 scalar-linear, one request, at most 128 output tokens; profiling disabled)
         System telemetry: --telemetry-dir NEW_PATH [--telemetry-interval-ms 200]
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
+    probe-gpu-kv-capacity --diagnostics-library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
+        Model-free Swift capacity allocation/ARC diagnostic; default eval sync. Run in an exclusive GPU window.
     probe-gpu-session --model-dir PATH [--tokens-file PATH] --output NEW_REPORT_JSON
         Exercise typed generation API: invalid input, cancellation, callback failure, busy rejection, fresh-request recovery and scalar MTP.
     probe-gpu-mtp-state --model-dir PATH --output NEW_REPORT_JSON [--verification POLICY]

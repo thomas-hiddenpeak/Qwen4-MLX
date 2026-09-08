@@ -2,6 +2,8 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+07:27 更新：2h结果已推送`3fab1b5`并核对远程SHA。Swift机制7文件/单CLI入口已集成，release60.79秒，binary=`d1b418cd5972bf424aaa5cf438c6e27d716ce23534efc9cf19db46870f426c48`；sync/async分别286checks、21append通过。原Attention/Model/Generation未变，额外原模型O512 golden确为512完整IDs/length/offset11568。controller/session52114已exit0；391文件/102stat postflight及参考74988原argv/idle/MTPdrafter关闭通过，最新ledger=`results/kv-capacity-swift-v1/run-ledger.json`，冻结解除。root将提交机制增量，再安装完整Model/Generation/permit/State overlay及测试/probe/benchmark，暂不安装HTTP开关；候选仍reference默认。必须先CPU6、真实GPU5、完整模型probe，再真实性能，不能沿用C3两小时标签。
+
 07:19 更新：2h controller/session16782已exit0，实际7205.783秒工作段，677工作成功/68取消+10oracle=755唯一JSON终态；原完整与新phase分析均passed/无issues，24个300秒窗口全部持续SSD读写淘汰。根侧postflight240hash/102stat、参考74180精确argv/idle/MTPdrafter关闭通过；当前最新ledger=`results/kv-night-churn-2h/run-ledger.json`。final-root-verification.json另绑定14最终输入并显式核对read intent/liveFlight/有限close。sidecar/session97893也exit0，165有效点82.048分钟partial footprint，目标退出后不可用一点排除；不能称全程footprint。源码冻结已解除，无GPU实验正在运行。root先提交2h证据，然后按integration-prep清单集成Swift机制7文件/CLI，统一build并受控sync/async，再额外原模型O512 golden；之后才安装完整Model/Generation/State overlay/CPU6/GPU5/probe/bench。默认reference不变，HTTP容量候选仍ignored且未运行。截止09:56:04不变。
 
 06:32 更新：纯docs增量`e74ac1d`已推送，远程SHA一致；运行源码和binary仍冻结C3。第一段闭区间独立审计`results/kv-night-churn-2h/first-hour-review.json`已通过：只到第11次drain、soak3378.418秒，310工作成功+31取消，另10oracle；root重核events/server闭前缀SHA及351条唯一JSON终态。11次drain资源条件成立；不能把第一小时剩余221.58秒或第二小时算进该区间通过。3600.154秒进入uninterrupted模式，观察至4442.173秒没有追加forced drain。完整2h仍进行，后续保持原controller/最终postflight和双分析器流程。partial-footprint-0623.json为31.018分钟/63点只读观测，footprint中位80.511GB、首末四分位中位差6.05MB，只是局部稳定证据。
