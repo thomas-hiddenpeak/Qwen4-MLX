@@ -37,7 +37,7 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -
 | 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；自动复用完整会话/工具历史，有限保留共享系统与会话尾部检查点；库默认关闭，显式MTP保持冷prefill |
 | SSD 状态缓存 | 显式开启的有界持久化层，完整混合状态归档、异步恢复/写入、校验及重启恢复、可用空间水位、请求等待期限及有界关闭等待；与 n-gram SSD 读取分别管理 |
 | 工具调用 | function tools、auto/none、非流式/SSE调用及工具结果续答；客户端执行工具 |
-| 尚未实现 | 完整会话历史自动复用、物理 KV 页共享、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
+| 尚未实现 | 物理 KV 页共享、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
 
 chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表与作者任意输入全部逐位等价。初期短输入、后续11k与不同候选的验证范围分别保留在各实验文档中。
 
@@ -56,6 +56,8 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 完整请求经模板渲染后一次分词，系统、工具定义与 user/assistant/tool 历史均参与[准确前缀复用](docs/research/KV_CONVERSATION_VALIDATION.md)。检查点沿用416-token计算网格，每个请求最多发布系统与尾部两个检查点；编辑历史或分叉只恢复实际一致的完整状态。默认512 MiB放不下两份长状态时保留共享系统锚点，尾部可写入显式开启的SSD层。命中返回 `usage.prompt_tokens_details.cached_tokens`；`/health`提供详细统计，`GET /metrics`提供无请求标签的Prometheus文本指标。
 
 可用 `--prefix-cache-bytes 0` 关闭缓存，`--prefix-cache-directory` 启用持久化SSD，`--state-budget-bytes` 配置request/cache/workspace联合逻辑额度，`--prefix-cache-shutdown-timeout-seconds` 设置SSD关闭等待期限（默认30秒）。该期限约束SSD队列与回调排空，不能保证挂起的GPU或系统调用立即终止。实际范围和验证见[使用合同](docs/KV_CACHE_RELIABILITY.md)。缓存收益来自减少重复prefill；不代表基础decode吞吐提升。
+
+启动、诊断、停服与重启见[KV cache运维](docs/KV_CACHE_OPERATIONS.md)。
 
 各轮验证版本、请求示例、限额与剩余边界见 [HTTP/SSE服务](docs/HTTP_SERVER_EXPERIMENT.md)和[输出边界](docs/HTTP_OUTPUT_BOUNDARIES.md)。发送期限、连接期限及长时间稳定性仍有未覆盖范围，不把有限回归表述为生产验收完成。
 

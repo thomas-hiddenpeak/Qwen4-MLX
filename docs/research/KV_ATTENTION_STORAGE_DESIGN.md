@@ -111,4 +111,4 @@ QSA raw/pooled 是后续收益较小的增量。raw 可复用相同容量机制�
 
 真实Q24/KV2、GQA12、D256的SDPA布局对照，在同步与async两模式各通过14个长度、49组case。逻辑K/V view的head stride保留容量间隙；unmasked、alltrue、last-row-only及代表性512完整块加尾部bool mask输出与独立紧凑输入逐位相同。last-row-only还独立验证Q head到KV head映射。代表性mask没有运行真实learned indexer/argpartition，也不证明SDPA内部没有其他临时复制。
 
-262个冻结文件/102模型stat postflight通过，参考62443按原参数恢复、idle及MTP/drafter关闭独立核对。探针的allocation身份有实证；其peak字段为0，没有形成有效的生产峰值观测，不能解释成零内存占用。无模型加载、无实际吞吐/带宽测量、无Swift ARC/profiler集成。因此第一关通过，下一关仍是Swift所有权与增长峰值及完整模型数值/资源回归；生产默认concat保持不变。
+262个冻结文件/102模型stat postflight通过，参考62443按原参数恢复、idle及MTP/drafter关闭独立核对。探针的allocation身份有实证；每种模式13次复用步骤的raw peak为0，增长/COW的4次非零。实际MLX的reset_peak_memory先置0，后续malloc才更新，所以无新分配步骤不能把0解释为零驻留；区间tracked-active高水位应同时看active_before、raw peak和active_after的最大值。这些值仍包含探针oracle/alias，不能代替生产请求或进程物理峰值。无模型加载、无实际吞吐/带宽测量、无Swift ARC/profiler集成。因此第一关通过，下一关仍是Swift所有权与增长峰值及完整模型数值/资源回归；生产默认concat保持不变。

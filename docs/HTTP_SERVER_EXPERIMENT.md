@@ -25,6 +25,9 @@
 | `--prefix-cache-disk-bytes` | 8589934592 | 正整数，包含文件/分配块额度 |
 | `--prefix-cache-disk-entries` | 32 | 1…4096 |
 | `--prefix-cache-ttl-seconds` | 86400 | 正整数，RAM/SSD 条目有效期 |
+| `--prefix-cache-min-free-bytes` | 1073741824 | 非负整数；0关闭水位保护，需SSD目录 |
+| `--prefix-cache-restore-timeout-seconds` | 5 | 1…300；请求等待期限，需SSD目录 |
+| `--prefix-cache-shutdown-timeout-seconds` | 30 | 1…300；SSD关闭等待期限，需SSD目录 |
 | `--state-budget-bytes` | 4294967296 | request/cache/workspace 联合逻辑额度 |
 
 固定 header 上限 16 KiB、待提交邮箱 8 请求、SSE 输出 256 条目（含一个最多 4 KiB 终态条目）。推理调度沿用 8 prefill / 2 ready、32768 逻辑预留 token、2 resident sequences、decodeBurst 4。请求接收期限 15 秒，单次发送无进展期限 15 秒，整个连接期限 300 秒。连接数满时直接关闭新连接，邮箱/推理队列满时返回 429；模型尚未 ready 或不可用返回 503。
@@ -64,7 +67,7 @@ onToken常规路径做有限的CPU解码/编码与入队，不等待网络发送
 
 HTTP 请求后 TCP write half-close 仍可能是合法的读响应客户端，所以 EOF 本身不当作“对方已死”。真正断连通过 NW failed、发送错误或期限处理；非流式计算途中若无法及时区分 half-close/full-close，取消可能延后。暂停客户端读取的一次测试也不保证触发应用缓冲 overflow：OS 可能容纳全部短输出，必须把“其他请求继续运行”与“应用额度超限”分别记录。
 
-SIGINT/SIGTERM 停止监听，关闭连接并请求取消，唤醒邮箱，等待当前 tokenization / GPU / SSD 操作返回后清理 scheduler 与 MLX 状态。模型加载中也需要等待当前同步加载结束；没有从另一线程释放 GPU handle 或强行中断 kernel。日志器停止接收并丢弃排队记录，退出不join可能阻塞的写线程；最多一条in-flight记录继续保留至写入返回或进程退出。因此退出时的诊断日志可能不完整，也不承诺刷盘或可靠投递。已运行服务的失败保持非零退出，避免再进入通用CLI的同步stderr错误输出；服务初始化之前的通用错误路径仍不在满pipe运行期活性合同内。
+SIGINT/SIGTERM停止监听、关闭连接并请求取消，唤醒邮箱；固定推理线程在当前同步操作返回后清理scheduler与MLX状态。模型载入和GPU同步不会被信号强行中断。随后SSD store通过唯一关闭路径，在`--prefix-cache-shutdown-timeout-seconds`规定的同一默认30秒期限内等待已接收IO、描述符关闭和callback排空；超期只停止等待，实际工作仍持有Data/lease/FD至完成。退出码0本身不能证明SSD排空，应结合关闭结果字段；也不从另一线程释放GPU handle或强行终止系统调用。详见[缓存关闭合同](KV_CACHE_RELIABILITY.md#使用合同)。日志器停止接收并丢弃排队记录，退出不join可能阻塞的写线程；最多一条in-flight记录继续保留至写入返回或进程退出。因此退出时的诊断日志可能不完整，也不承诺刷盘或可靠投递。已运行服务的失败保持非零退出，避免再进入通用CLI的同步stderr错误输出；服务初始化之前的通用错误路径仍不在满pipe运行期活性合同内。
 
 c930增加`qwen-http-lifecycle-v1`结构化日志，将model_terminal、output_terminal和connection_close分开；按PID、请求ID、连接ID关联，不记录提示词、正文或token内容。旧`HTTP request id=...`仍保留为同一模型终态的兼容表示，不能与新model_terminal相加计数。output_terminal只代表缓冲首次选定结果；断连或准入前拒绝不保证出现这个事件，模型完成也不保证最终编码/发送成功。prefill、decode与scheduler elapsed分别记录，不把网络确认当客户端实际读取或TTFT。
 
@@ -227,4 +230,4 @@ pipe项的自有stderr读端直到进程退出前保持打开且不读取，stdo
 
 [postflight](../results/http-sse-overflow-public-v1/postflight-and-release.json)核对141份冻结文件、102模型payload及同一二进制；[ledger](../results/http-sse-overflow-public-v1/run-ledger.json)确认自有进程组清空，参考服务按原完整argv恢复为PID35281，11235监听归属和idle已核对。本次没有send_deadline、connection_deadline或closed_send_released记录；15/300秒期限及晚到确认仍未覆盖。更细口径见[输出边界](HTTP_OUTPUT_BOUNDARIES.md#b039独立ar-sse溢出实测)。
 
-当前可作为本机文字客户端的实验入口；缓存、前缀复用、认证与远程部署尚未纳入此服务。这些HTTP结果不替代MTP双窗口性能门槛，也不是性能对比或生产发布通过。
+以上历史HTTP结果仍绑定各自二进制，不替代MTP性能门槛或后续缓存验收。当前服务已接入完整会话前缀复用和可选SSD缓存；运行维护见[KV cache运维](KV_CACHE_OPERATIONS.md)，分版本证据见[缓存可靠性](KV_CACHE_RELIABILITY.md)。认证和远程部署仍未纳入此服务。

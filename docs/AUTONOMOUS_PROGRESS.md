@@ -2,7 +2,17 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
-用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `0290767`已推送并核对远程SHA，根代理唯一 build/GPU/Git owner，MTP 性能后置。
+用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。运行代码基线 `1ca481b`已推送并核对远程SHA，后续纯文档提交不改变该冻结版本；根代理唯一 build/GPU/Git owner，MTP 性能后置。
+
+06:08 更新：本轮只提升运维入口并修正README/HTTP旧能力矛盾、缺少的三个SSD参数及关闭合同；独立审查后明确较浅RAM回退、已启动SSE的错误事件、目录权限/路径规范化及压力降级语义。另修正原native结果的MLX raw_peak解释。纯docs文件不在plan冻结集合中；根侧06:05只读重核240文件hash/102模型stat均未变，结果`docs-midrun-verification.json`。运行基线仍为C3 `1ca481b`及78036ae4…cfac23二进制，不把文档提交SHA当长测二进制版本。长测仍未完成，运维与能力页保留运行中状态；候选源、build/GPU冻结和原controller均继续。
+
+06:00 更新：两小时唯一controller仍运行，exec session16782，服务PID64089；截至本次只读采样240次工作成功/24次主动断连/0客户端或health错误，8个完整300秒窗口均持续读写淘汰，尚未做最终终态对账。冻结继续，预计07:16完成。补充只读sidecar自05:53:14开始：exec session97893、sampler PID67634，30秒/最多180次，目标启动身份变化或退出会自动结束；`results/kv-night-churn-2h/telemetry-provenance.json`绑定已存在二进制SHA，`telemetry.ndjson`仅代表部分窗口。首点footprint80.85GB、RSS28.90GB，必须分开报告，不能只用RSS替代Metal相关占用或倒算物理带宽。不得因参考63602当前暂停而另起服务。
+
+候选均已交叉静态审查，但**全部未编译/GPU验证**，只在ignored目录：①`results/kv-capacity-swift-candidate/PROBE.md`和`probe-sha256.json`，4 GPU+1 CLI+2 native文件，先单独接`probe-gpu-kv-capacity`，实际逻辑view roots的sync/async各21次append必须通过；不先接模型。②`results/kv-capacity-model-candidate/`内attention/model/benchmark manifests、`MODEL_INTEGRATION.md`、`ROOT_REVIEW.md`和`PROBE_DESIGN.md`；ordinary AR request默认reference，capacity256通过单次model/session/offset permit申请额外workspace，不足则concat；QwenGeneration真实路径持lease到同步完成/错误recover之后。6项新CPU permit测试；完整模型probe6完整生成+1取消（16逐步121状态、128完整IDs、RAM恢复、逻辑额度fallback）。③`results/kv-capacity-state-tests-candidate/PROPOSAL.md`是Attention独立overlay，原manifest不变，internal静态state seam仅18加/6删、5小GPU测试覆盖public替换和KV/raw混合extent；须`ANERUNNER_TEST_KV_CAPACITY_GPU=1`独占执行。④运维候选`results/kv-operations-candidate/`含66行入口和三处现有README/HTTP文档矛盾的精确修正建议，待最终2h结果后统一提升。
+
+后续严格顺序：controller完成→`python3 -B results/kv-night-churn-prep/postflight.py results/kv-night-churn-2h`→原`analyze-churn.py`完整对账→新增`analyze-churn-phases.py`按相同events/server与analysis绑定复核；两者支持`--help`，后者不接受缺新字段的旧smoke。最后采样独立核对footprint/磁盘口径。更新2h实际证据、运维与旧文档后先commit/push。再解除冻结集成Swift小机制、唯一controlled sync/async，通过后才集成完整模型+State overlay/测试。原`generate-gpu`手写forward不走新permit，性能必须用新`benchmark-gpu-kv-capacity`（真实generator、nil observers、prefixCacheMaxTokens:0显式冷统计）跑16/128/512 ABBA并独立比较；reference仍是库/HTTP默认，不以机制成功替代吞吐和端到端验证。真实fixtureP11057，O16/O128首次容量clamp，O512只有输出足够长才跨两次后续边界。每轮使用**刚完成控制器的新restoration ledger**，不能复用历史PID。
+
+05:14 更新：C3已推送`1ca481b`。唯一controller已启动`results/kv-night-churn-2h/plan.json`，7200秒工作段+oracle/加载/排空，端口11256、case deadline8100秒；240文件/102模型stat冻结。预计北京时间07:16左右完成（看实际soak_start），此期间禁止修改Sources/Tests/scripts/native/binary/原wrapper，不build或启动第二GPU任务。继续原wrapper客户端30k：40k虽然4GiB内存可容纳，但旧长RST尚未终态时可能超过独立scheduler32768-token额度；不把4个client worker宣称4长并发。结果必须同时由旧完整分析器和新增phase分析器独立对账。控制器结束前参考服务正常处于暂停；后续只用本轮新restoration ledger。Swift容量helper/bridge仅ignored准备，不能抢跑GPU。到期前仍需收尾并暂停heartbeat。
 
 05:10 更新：C3三case全部通过，187相关CPU/70准入/51accepted-IO timeout；8+6完整生成128 IDs和12组独立状态一致，HTTP36成功288tokens+3取消=39唯一终态、阶段字段对账。R7暂停5.054100375秒的enqueue自主过期正确。239文件/102stat postflight、参考63602精确argv/idle/MTPdrafter关闭已复核，最新ledger=`results/kv-night-c3/run-ledger.json`，冻结解除。root正commit C3；下一步7200秒churn，拟把wrapper客户端在途prompt额度从30k增至40k容纳至少2长前缀，server4GiB/RAM160MiB/SSD1GiB不变，tiered在核对峰值后启动。不要另启GPU；Swift helper仅ignored准备。
 
