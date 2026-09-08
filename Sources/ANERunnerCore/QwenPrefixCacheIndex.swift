@@ -13,6 +13,15 @@ public struct QwenPrefixCacheStatistics: Codable, Equatable, Sendable {
     public var published: Int = 0
     public var skippedOversize: Int = 0
     public var restoreFailures: Int = 0
+    public var restoredHits: Int = 0
+    public var diskHits: Int = 0
+    public var diskFallbacks: Int = 0
+    public var pressureEvictions: Int = 0
+    public var budgetSkipped: Int = 0
+    public var duplicateSkipped: Int = 0
+    public var flightWaits: Int = 0
+    public var liveFlights: Int = 0
+    public var expired: Int = 0
 }
 
 /// A strong reference to a saved value at an exact, complete token boundary.
@@ -93,6 +102,15 @@ public final class QwenPrefixCacheIndex<Value> {
         .init(hits: hits, misses: misses, evictions: evictions,
               entries: entryCount, logicalPayloadBytes: payloadBytes,
               keyTokens: tokenCount)
+    }
+
+    /// Release one retained value before the caller allocates a replacement or
+    /// request workspace. Outside strong matches may still retain the value.
+    @discardableResult
+    public func evictLeastRecentlyUsed() -> Bool {
+        guard let entry = oldest else { return false }
+        removeEntry(entry); evictions += 1
+        return true
     }
 
     /// Inserts/replaces one complete snapshot and makes it most recently used.
