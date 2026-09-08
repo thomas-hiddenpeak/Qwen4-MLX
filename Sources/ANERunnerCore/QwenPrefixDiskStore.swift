@@ -79,6 +79,41 @@ public struct QwenPrefixDiskStatistics: Codable, Equatable, Sendable {
     /// An owned file could not be removed, so new SSD work is disabled rather
     /// than allowing unaccounted files to accumulate. Successful clear resets it.
     public var storageUnavailable = false
+    /// Metadata-only foreground ownership, not admitted IO or payload bytes.
+    /// Optional for compatibility with earlier diagnostic reports.
+    public var foregroundReadIntents: Int? = nil
+    public var foregroundReadIntentAcquisitions: Int? = nil
+    public var optionalWritePriorityRejections: Int? = nil
+}
+
+public enum QwenPrefixDiskReadAdmissionState: Equatable, Sendable {
+    case ready, busy, closed, unavailable, invalidated
+}
+
+public enum QwenPrefixDiskReadSubmission: Equatable, Sendable {
+    case accepted, busy, closed, unavailable, invalidated
+}
+
+public enum QwenPrefixDiskReadIntentAdmission: Sendable {
+    case acquired(QwenPrefixDiskReadIntent)
+    case busy, closed, unavailable
+}
+
+/// One bounded, revocable priority intention. It owns no FD, result Data,
+/// pending IO charge or callback. Only lookupAsync accepting IO transfers
+/// archive ownership. Dropping an old handle cannot release a newer epoch.
+public final class QwenPrefixDiskReadIntent: @unchecked Sendable {
+    fileprivate weak var store: QwenPrefixDiskStore?
+    fileprivate let identity = UUID()
+    fileprivate let epoch: UInt64
+    fileprivate init(store: QwenPrefixDiskStore, epoch: UInt64) {
+        self.store = store; self.epoch = epoch
+    }
+    public var state: QwenPrefixDiskReadAdmissionState {
+        store?.readAdmissionState(self) ?? .closed
+    }
+    public func release() { store?.releaseReadIntent(self) }
+    deinit { release() }
 }
 
 public struct QwenPrefixDiskSummary: Sendable {
@@ -151,6 +186,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     private let callbackCloseGroup = DispatchGroup()
     private var epoch: UInt64 = 0
     private var closed = false
+    private var foregroundReadIntent: (identity: UUID, epoch: UInt64)?
     private var stats = QwenPrefixDiskStatistics()
     private var summaries: [String: SummaryRecord] = [:]
     private struct SummaryRecord {
@@ -275,7 +311,50 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
 
     public var statistics: QwenPrefixDiskStatistics {
         admission.lock(); defer { admission.unlock() }
-        return stats
+        var value = stats
+        value.foregroundReadIntents = foregroundReadIntent == nil ? 0 : 1
+        value.foregroundReadIntentAcquisitions = stats.foregroundReadIntentAcquisitions ?? 0
+        value.optionalWritePriorityRejections = stats.optionalWritePriorityRejections ?? 0
+        return value
+    }
+
+    /// This is metadata admission only. A cooperative caller may wait without
+    /// allocating workspace while an old write/read releases its real charge.
+    public func acquireReadIntent() -> QwenPrefixDiskReadIntentAdmission {
+        admission.lock(); defer { admission.unlock() }
+        guard !closed else { return .closed }
+        guard !stats.storageUnavailable else { return .unavailable }
+        guard foregroundReadIntent == nil else { return .busy }
+        let intent = QwenPrefixDiskReadIntent(store: self, epoch: epoch)
+        foregroundReadIntent = (intent.identity, epoch)
+        stats.foregroundReadIntentAcquisitions = (stats.foregroundReadIntentAcquisitions ?? 0) + 1
+        return .acquired(intent)
+    }
+
+    fileprivate func releaseReadIntent(_ intent: QwenPrefixDiskReadIntent) {
+        admission.lock(); defer { admission.unlock() }
+        if ownsReadIntentLocked(intent) { foregroundReadIntent = nil }
+    }
+
+    private func ownsReadIntentLocked(_ intent: QwenPrefixDiskReadIntent) -> Bool {
+        intent.store === self && intent.epoch == epoch &&
+            foregroundReadIntent?.identity == intent.identity && foregroundReadIntent?.epoch == intent.epoch
+    }
+
+    fileprivate func readAdmissionState(_ intent: QwenPrefixDiskReadIntent) -> QwenPrefixDiskReadAdmissionState {
+        admission.lock(); defer { admission.unlock() }
+        return readAdmissionStateLocked(intent)
+    }
+
+    private func readAdmissionStateLocked(_ intent: QwenPrefixDiskReadIntent?) -> QwenPrefixDiskReadAdmissionState {
+        guard !closed else { return .closed }
+        guard !stats.storageUnavailable else { return .unavailable }
+        if let intent {
+            guard ownsReadIntentLocked(intent) else { return .invalidated }
+        } else if foregroundReadIntent != nil { return .busy }
+        // A read still charges the FULL configured maximum. No charge is
+        // borrowed from an unfinished write, callback or another result.
+        return stats.pendingJobs < limits.maxPendingJobs && stats.pendingBytes == 0 ? .ready : .busy
     }
 
     @discardableResult
@@ -289,6 +368,11 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
               payload.count > 0, charge <= limits.maxPendingBytes,
               charge < limits.maxBytes else { reject(); return false }
         admission.lock()
+        guard foregroundReadIntent == nil else {
+            stats.rejected += 1
+            stats.optionalWritePriorityRejections = (stats.optionalWritePriorityRejections ?? 0) + 1
+            admission.unlock(); return false
+        }
         guard admitLocked(bytes: charge) else { admission.unlock(); return false }
         let submittedEpoch = epoch
         queue.async { [self] in
@@ -380,9 +464,39 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
     public func lookupAsync(tokens: [Int32], namespace: String,
                             maxPrefixTokens: Int? = nil,
                             completion: @escaping @Sendable (QwenPrefixDiskMatch?) -> Void) -> Bool {
+        submitLookup(tokens: tokens, namespace: namespace, maxPrefixTokens: maxPrefixTokens,
+            intent: nil, completion: completion) == .accepted
+    }
+
+    /// A ready hint can race clear/close/control admission. Only `.accepted`
+    /// transfers the callback and pending byte ownership; other results do not
+    /// invoke completion and the caller must release untransferred workspace.
+    @discardableResult
+    public func lookupAsync(tokens: [Int32], namespace: String, maxPrefixTokens: Int? = nil,
+                            readIntent: QwenPrefixDiskReadIntent,
+                            completion: @escaping @Sendable (QwenPrefixDiskMatch?) -> Void) -> QwenPrefixDiskReadSubmission {
+        submitLookup(tokens: tokens, namespace: namespace, maxPrefixTokens: maxPrefixTokens,
+            intent: readIntent, completion: completion)
+    }
+
+    private func submitLookup(tokens: [Int32], namespace: String, maxPrefixTokens: Int?,
+                              intent: QwenPrefixDiskReadIntent?,
+                              completion: @escaping @Sendable (QwenPrefixDiskMatch?) -> Void) -> QwenPrefixDiskReadSubmission {
         admission.lock()
+        let state = readAdmissionStateLocked(intent)
+        guard state == .ready else {
+            stats.rejected += 1; admission.unlock()
+            switch state {
+            case .busy: return .busy
+            case .closed: return .closed
+            case .unavailable: return .unavailable
+            case .invalidated: return .invalidated
+            case .ready: preconditionFailure("ready admission entered rejection")
+            }
+        }
         let charge = limits.maxPendingBytes
-        guard admitLocked(bytes: charge) else { admission.unlock(); return false }
+        guard admitLocked(bytes: charge) else { admission.unlock(); return .busy }
+        if intent != nil { foregroundReadIntent = nil }
         let submittedEpoch = epoch
         queue.async { [self] in
             let result = lookupOnQueue(tokens: tokens, namespace: namespace,
@@ -394,7 +508,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
             }
         }
         admission.unlock()
-        return true
+        return .accepted
     }
 
     /// Waits for previously submitted IO, without closing or invalidating it.
@@ -412,6 +526,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         admission.lock()
         guard !closed else { admission.unlock(); return }
         epoch &+= 1
+        foregroundReadIntent = nil
         let submittedEpoch = epoch
         summaries.removeAll(keepingCapacity: false)
         let semaphore = DispatchSemaphore(value: 0)
@@ -484,6 +599,7 @@ public final class QwenPrefixDiskStore: @unchecked Sendable {
         admission.lock()
         if !closed {
             closed = true
+            foregroundReadIntent = nil
             closeGroup.enter()
             callbackCloseGroup.enter()
             if !drain { epoch &+= 1 }

@@ -452,15 +452,18 @@ private final class GPUHTTPServer: @unchecked Sendable {
             ("entries", "prefix_ram_entries", "gauge", "Retained complete RAM prefix snapshots."),
             ("evictions", "prefix_ram_evictions_total", "counter", "RAM index evictions."),
             ("liveFlights", "prefix_live_flights", "gauge", "Live prefix producer and transfer coordination records."),
-            ("diskReadTimeouts", "prefix_read_timeouts_total", "counter", "Requests detached from unfinished SSD reads after their deadline."),
+            ("diskReadTimeouts", "prefix_read_timeouts_total", "counter", "Requests detached from unfinished SSD admission, read or shared-read waits after their deadline."),
             ("diskPublicationTimeouts", "prefix_publication_timeouts_total", "counter", "Requests detached from pending SSD publication waits."),
             ("restoreFailures", "prefix_restore_failures_total", "counter", "Optional state restoration failures."),
             ("retainedSystemAnchorSkips", "prefix_system_anchor_preservation_skips_total", "counter", "RAM candidates skipped to retain a shared system checkpoint.")])
         counters(h.prefixDiskJSON, [
-            ("diskBytes", "ssd_archive_bytes", "gauge", "Accounted published cache file bytes; excludes model n-gram storage."),
+            ("diskBytes", "ssd_archive_bytes", "gauge", "Accounted cache file bytes; excludes model n-gram storage."),
             ("entries", "ssd_archive_entries", "gauge", "Accounted cache archives."),
             ("pendingJobs", "ssd_pending_jobs", "gauge", "Admitted unfinished SSD cache jobs."),
             ("pendingBytes", "ssd_pending_bytes", "gauge", "Admitted SSD job byte reservations."),
+            ("foregroundReadIntents", "ssd_foreground_read_intents", "gauge", "Metadata-only read priority ownership; not admitted IO or payload bytes."),
+            ("foregroundReadIntentAcquisitions", "ssd_foreground_read_intent_acquisitions_total", "counter", "Read priority intentions acquired; not successful restorations."),
+            ("optionalWritePriorityRejections", "ssd_optional_write_priority_rejections_total", "counter", "Submitted optional writes rejected to preserve foreground read priority."),
             ("bytesRead", "ssd_archive_read_bytes_total", "counter", "Cache archive file bytes read; not physical device IO."),
             ("bytesWritten", "ssd_archive_written_bytes_total", "counter", "Successfully published archive bytes; not physical device IO."),
             ("evictions", "ssd_archive_evictions_total", "counter", "SSD cache archive evictions."),
@@ -840,6 +843,14 @@ private final class GPUHTTPServer: @unchecked Sendable {
             modelFields["completion_tokens"] = result.tokens.count
             modelFields["prefill_seconds"] = (result.phases?.prefill.targetSeconds).map(finite) ?? NSNull()
             modelFields["decode_seconds"] = finite(result.decodeSeconds)
+            modelFields["decoded_tokens"] = result.statistics.decodedTokenCount
+            modelFields["model_first_token_ready_seconds"] = finite(result.timeToFirstTokenSeconds)
+            if let phases = result.phases {
+                modelFields["decode_service_seconds"] = finite(phases.decodeServiceSeconds)
+                modelFields["decode_suspension_seconds"] = phases.decodeSuspensionSeconds.map(finite) ?? NSNull()
+                modelFields["handoff_wait_seconds"] = finite(phases.handoffWaitSeconds)
+                modelFields["handoff_consume_seconds"] = finite(phases.handoffConsumeSeconds)
+            }
             modelFields["cached_prompt_tokens"] = result.phases?.prefill.cachedTokenCount ?? 0
             if let prefill = result.phases?.prefill {
                 modelFields["computed_prompt_tokens"] = prefill.computedTokenCount

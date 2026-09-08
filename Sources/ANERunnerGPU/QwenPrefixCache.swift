@@ -39,7 +39,13 @@ final class QwenPrefixDiskRead: @unchecked Sendable {
         // A completion that arrived while the executor was busy remains usable.
         // Uptime never decreases; accepting an earlier value in a CPU test must
         // not underflow and manufacture an expired transfer.
-        return !ready && now >= startedAt && Double(now - startedAt) * 1e-9 >= seconds
+        return !ready && Self.waitHasTimedOut(startedAt: startedAt, after: seconds, now: now)
+    }
+    /// One timestamp spans metadata admission, an identical read's fence and
+    /// accepted IO. A ready result is handled separately and remains usable.
+    static func waitHasTimedOut(startedAt: UInt64, after seconds: TimeInterval,
+                                now: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Bool {
+        now >= startedAt && Double(now - startedAt) * 1e-9 >= seconds
     }
     func take() -> QwenPrefixDiskMatch? {
         lock.lock(); defer { lock.unlock() }
@@ -112,6 +118,7 @@ final class QwenPrefixCacheFlight {
     var read: QwenPrefixDiskRead?
     var readCheckpoint: QwenPrefixCheckpoint?
     var readFence: QwenPrefixDiskReadFence?
+    var readAdmissionIntent: QwenPrefixDiskReadIntent?
     var readWaitStartedAt: UInt64?
     var waitedForRead = false
     var skipDisk = false
@@ -134,6 +141,8 @@ final class QwenPrefixCacheFlight {
         readFence = nil; read = nil; readCheckpoint = nil
     }
     deinit {
+        readAdmissionIntent?.release()
+        cache?.releaseReadAdmission(identity: identity)
         // The callback still owns read Data/workspace after an abandonment.
         detachRead()
         if let ownedProducer { cache?.releaseFlight(key: ownedProducer.key, identity: identity) }
@@ -163,6 +172,9 @@ final class QwenPrefixCache {
     private let flights = QwenPrefixProducerRegistry()
     private var publications: [String: QwenPrefixDiskPublication] = [:]
     private var reads: [String: QwenPrefixDiskReadFence] = [:]
+    // Strong metadata handles let RAM-only clear revoke this cache's intents
+    // even if their paused request cursors remain alive elsewhere.
+    private var readAdmissionIntents: [UUID: QwenPrefixDiskReadIntent] = [:]
     private var epoch: UInt64 = 0
 
     init(limits: QwenPrefixCacheLimits, disk: QwenPrefixDiskStore?, model: QwenModel,
@@ -177,6 +189,7 @@ final class QwenPrefixCache {
         diskRestoreTimeoutSeconds = limits.diskRestoreTimeoutSeconds; self.memoryPressure = memoryPressure
         diskIdentity = try disk == nil ? "memory" : QwenPrefixCacheIdentity.fingerprint(modelDirectory: model.configuration.modelDirectory)
     }
+    deinit { for intent in readAdmissionIntents.values { intent.release() } }
     var statistics: QwenPrefixCacheStatistics {
         var r = index.statistics
         r.published = published; r.skippedOversize = skippedOversize; r.restoreFailures = restoreFailures
@@ -189,6 +202,8 @@ final class QwenPrefixCache {
         return r
     }
     func clear(resetStatistics: Bool = false, includingDisk: Bool = false) {
+        for intent in readAdmissionIntents.values { intent.release() }
+        readAdmissionIntents.removeAll()
         epoch &+= 1; flights.removeAll(); publications.removeAll(); reads.removeAll()
         index.clear(resetStatistics: resetStatistics)
         if includingDisk { disk?.clear(resetStatistics: resetStatistics) }
@@ -233,6 +248,13 @@ final class QwenPrefixCache {
     }
     func releaseFlight(key: String, identity: UUID) {
         flights.release(key: key, identity: identity)
+    }
+    func releaseReadAdmission(identity: UUID) {
+        readAdmissionIntents.removeValue(forKey: identity)?.release()
+    }
+    private func releaseReadAdmission(_ f: QwenPrefixCacheFlight) {
+        f.readAdmissionIntent?.release(); f.readAdmissionIntent = nil
+        releaseReadAdmission(identity: f.identity)
     }
     private func current(_ f: QwenPrefixCacheFlight) -> Bool { f.epoch == epoch }
     private func releaseProducer(_ f: QwenPrefixCacheFlight, at boundary: Int? = nil) {
@@ -321,6 +343,7 @@ final class QwenPrefixCache {
             return try body()
         }
         func resolved(_ state: QwenModel.State?, source: String) -> Resolution {
+            releaseReadAdmission(f)
             f.resolved = true
             return .init(state: state, source: source,
                 lookupSeconds: f.lookupSeconds + max(0, elapsed(started) - restoreWork),
@@ -375,6 +398,14 @@ final class QwenPrefixCache {
         // replan, after releasing its future producer, from the actual fallback.
         while true {
             try checkCancellation()
+            // A normal compute producer may run much longer than five seconds.
+            // This timestamp exists only after producer permission allowed an
+            // actual SSD attempt; polling and eventual submission never reset it.
+            if !f.skipDisk, let readStarted = f.readWaitStartedAt,
+               QwenPrefixDiskRead.waitHasTimedOut(startedAt: readStarted, after: diskRestoreTimeoutSeconds) {
+                releaseReadAdmission(f); releaseProducer(f); f.skipDisk = true
+                diskReadTimeouts += 1; diskFallbacks += 1
+            }
             let memoryDepth = memoryCandidate(f)?.prefixTokenCount ?? 0
             let summary = f.skipDisk ? nil : disk?.peek(tokens: f.tokens, namespace: f.namespace)
             let useDisk = summary.map {
@@ -382,15 +413,20 @@ final class QwenPrefixCache {
                 $0.prefixTokenCount % f.prefillChunk == 0
             } ?? false
             let depth = useDisk ? summary!.prefixTokenCount : memoryDepth
-            guard prepareProducer(f, after: depth, mayWait: f.allowWaitingForLeader) else { return nil }
+            if !useDisk { releaseReadAdmission(f) }
+            guard prepareProducer(f, after: depth, mayWait: f.allowWaitingForLeader) else {
+                releaseReadAdmission(f); return nil
+            }
 
             if useDisk, let summary, let disk {
+                if f.readWaitStartedAt == nil { f.readWaitStartedAt = DispatchTime.now().uptimeNanoseconds }
                 let checkpoint = QwenPrefixCheckpoint(tokens: f.tokens, namespace: f.namespace, boundary: depth)
                 if let pending = reads[checkpoint.key] {
                     if pending.isComplete { reads.removeValue(forKey: checkpoint.key) }
                     else {
-                        if f.readWaitStartedAt == nil { f.readWaitStartedAt = DispatchTime.now().uptimeNanoseconds }
-                        if f.allowWaitingForLeader, elapsed(f.readWaitStartedAt!) < diskRestoreTimeoutSeconds {
+                        releaseReadAdmission(f)
+                        if f.allowWaitingForLeader,
+                           !QwenPrefixDiskRead.waitHasTimedOut(startedAt: f.readWaitStartedAt!, after: diskRestoreTimeoutSeconds) {
                             if !f.waitedForRead { restoreWaits += 1; f.waitedForRead = true }
                             markWaiting(f); return nil
                         }
@@ -399,21 +435,66 @@ final class QwenPrefixCache {
                         continue
                     }
                 }
+                if f.readAdmissionIntent == nil {
+                    switch disk.acquireReadIntent() {
+                    case .acquired(let intent):
+                        f.readAdmissionIntent = intent; readAdmissionIntents[f.identity] = intent
+                    case .busy:
+                        if f.allowWaitingForLeader { markWaiting(f); return nil }
+                        f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
+                    case .closed, .unavailable:
+                        f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
+                    }
+                }
+                guard let intent = f.readAdmissionIntent else {
+                    throw QwenGenerationError.unavailable("Missing SSD read admission intent")
+                }
+                switch intent.state {
+                case .ready: break
+                case .busy:
+                    // Whole-stage generation cannot wait for another paused
+                    // request to advance while it holds the model admission.
+                    if f.allowWaitingForLeader { markWaiting(f); return nil }
+                    releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
+                case .closed, .unavailable, .invalidated:
+                    releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1; continue
+                }
+                // A write admitted BEFORE this intent may have replaced the
+                // file between the first peek and the transition to ready.
+                // Replan from fresh sizes before reserving any host workspace.
+                guard let currentSummary = disk.peek(tokens: f.tokens, namespace: f.namespace),
+                      currentSummary.prefixTokenCount == summary.prefixTokenCount,
+                      currentSummary.metadataBytes == summary.metadataBytes,
+                      currentSummary.payloadBytes == summary.payloadBytes,
+                      currentSummary.diskBytes == summary.diskBytes else {
+                    releaseProducer(f); continue
+                }
                 guard summary.metadataBytes >= 0, summary.payloadBytes >= 0,
                       summary.payloadBytes <= (Int.max - summary.metadataBytes) / 2,
                       let lease = reserve(bytes: summary.payloadBytes * 2 + summary.metadataBytes,
                                           kind: .workspace, model: model) else {
-                    f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
+                    // Core readiness is not a promise that the joint model
+                    // ledger has room. Keep the existing safe cold fallback.
+                    releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
                     continue
                 }
-                let read = QwenPrefixDiskRead(lease: lease), fence = QwenPrefixDiskReadFence()
+                if QwenPrefixDiskRead.waitHasTimedOut(startedAt: f.readWaitStartedAt!, after: diskRestoreTimeoutSeconds) {
+                    lease.release(); releaseReadAdmission(f); releaseProducer(f); f.skipDisk = true
+                    diskReadTimeouts += 1; diskFallbacks += 1; continue
+                }
+                do { try checkCancellation() }
+                catch { lease.release(); throw error }
+                let read = QwenPrefixDiskRead(lease: lease, startedAt: f.readWaitStartedAt!), fence = QwenPrefixDiskReadFence()
                 // Restrict the actual read to the depth whose workspace was
                 // reserved, even if a deeper archive publishes after peek.
-                if disk.lookupAsync(tokens: f.tokens, namespace: f.namespace, maxPrefixTokens: depth,
+                let submitted = disk.lookupAsync(tokens: f.tokens, namespace: f.namespace, maxPrefixTokens: depth,
+                    readIntent: intent,
                     completion: { [read, fence] result in
                         defer { fence.finishIO(); withExtendedLifetime(read) {} }
                         read.complete(result)
-                    }) {
+                    })
+                if submitted == .accepted {
+                    releaseReadAdmission(f) // Core consumed it atomically at IO admission.
                     reads = reads.filter { !$0.value.isComplete }
                     reads[checkpoint.key] = fence
                     f.read = read; f.readCheckpoint = checkpoint; f.readFence = fence
@@ -421,7 +502,12 @@ final class QwenPrefixCache {
                     return nil
                 }
                 lease.release() // No job/host archive was accepted.
-                f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
+                if submitted == .busy, f.allowWaitingForLeader {
+                    // No fence was installed and no callback accepted. Keep
+                    // only the metadata intent, bounded by the same deadline.
+                    markWaiting(f); return nil
+                }
+                releaseReadAdmission(f); f.skipDisk = true; releaseProducer(f); diskFallbacks += 1
                 continue
             }
             if let match = memoryCandidate(f) {
@@ -516,6 +602,10 @@ final class QwenPrefixCache {
         // write is still in progress. Retain its ownership; never enqueue a
         // second full archive or replace the pending publication record.
         if let pending = publications[key], !pending.isComplete { duplicateSkipped += 1; return }
+        // Avoid a known-low-value full host export while a foreground request
+        // waits for SSD admission. This hint owns nothing; enqueue still makes
+        // the atomic decision if a reader arrives after this check.
+        guard (disk.statistics.foregroundReadIntents ?? 0) == 0 else { return }
         let bytes = try model.prefixStatePayloadBytes(state)
         guard bytes <= disk.limits.maxPendingBytes, bytes <= (Int.max - QwenPrefixStateArchiveDescriptor.maximumMetadataBytes) / 2,
               let lease = reserve(bytes: bytes * 2 + QwenPrefixStateArchiveDescriptor.maximumMetadataBytes, kind: .workspace, model: model) else { return }

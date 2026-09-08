@@ -1,16 +1,24 @@
 # 自主研究与开发接续
 
-## 2026-09-09 八小时自主窗口：KV 管理批次 B 已验证，准备持续淘汰
+## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
-用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `d449ad0`，根代理唯一 build/GPU/Git owner，MTP 性能后置。
+用户重新授权八小时开发与阶段推送，窗口北京时间 **01:56:04–09:56:04**（UTC 截止 `2026-09-09T01:56:04Z`）。已更新并恢复本线程 `qwen4-mlx` heartbeat，每20分钟接续；最后20分钟收尾，到期暂停，不自动进入下一窗口。当前主线 `0290767`已推送并核对远程SHA，根代理唯一 build/GPU/Git owner，MTP 性能后置。
 
-K02 tokenizer计划接口已提交推送 `30c847b`（7项CPU通过），完整会话运行时尚未接线。批次A的最终54项相关CPU检查和release61.96秒构建通过，`results/kv-night-a2/` pressure89checks、timeouts50checks、44成功HTTP+4日志确认取消均通过。实模20请求/229IDs、独立跨状态23组/2567张量及host状态；HTTP21次SSD恢复/7.70GB归档读回，无残留request/workspace/pending。二进制`fc02358d...38502e`，215文件/102模型stat postflight通过。详见可靠性记录，勿把注入pressure或70秒HTTP窗口说成真实物理压力/小时长稳。
+04:54 更新：C2全部五case通过，admission58、accepted-IO-timeout51、conversation71及HTTP45成功/3取消、48唯一终态对账；177项相关CPU与release47.05秒，binary `4d728eb5...d7bf4`。新计数/计时字段和44/45 metrics series对账通过。236文件/102模型stat postflight、参考PID61971精确argv/idle/MTPdrafter关闭已独立复核，最新ledger=`results/kv-night-c2/run-ledger.json`，源冻结已解除。现阶段先commit/push K04。只读审查确认库调用方长期暂停waiting cursor会一直占读优先权；vllm agent在ignored `results/kv-read-intent-expiry-candidate/`准备metadata绝对期限补丁，不改已接收IO合同。native capacity/GQA与Swift helper均只准备在ignored目录，无GPU结果；root后续串行验证，2h窗口仍待启动，不得宣称已通过。
 
-最新参考恢复ledger为 `results/kv-night-a2/run-ledger.json`，PID52289、精确argv、idle、MTP/drafter关闭已独立复核；无GPU实验，冻结解除。a1失败因短fixture合法3-token EOS被错误的maxTokens==16假设拒绝，保留原始失败报告，a2已修正并通过。
+04:44 更新：K04 单个 metadata read intent 已集成，177 项 Swift CPU 通过；C1 首个实模探针在 R3 计时断言失败，原因是探针只算 suspended wait，漏计同步 lookup，实际合计 5.001298 秒。原始失败保留，不能补报超时计数通过。参考服务 PID60211 已恢复并独立核对，236 文件/102 模型 stat postflight 通过。探针已改为断言前保存前后计数/额度/IO owner，再分别检查超时增量、无读回和总解析时间；无 runtime 回退。C2 release 已完成，`results/kv-night-c2/plan.json` 冻结同批源码及新端口11253/54/55，依次重跑 admission、已接收 IO 超时、完整会话、HTTP 会话和混合请求。以 C2 controller 为唯一 GPU owner，期间不改 Sources/Tests/scripts/binary。完成后提交 K04，再跑独立 capacity 机制微测和 7200 秒 churn；尚无两小时通过结果。
+
+批次A历史：K02 tokenizer计划接口先提交推送 `30c847b`（7项CPU通过），当时完整会话运行时未接线；批次B已完成接线。批次A的最终54项相关CPU检查和release61.96秒构建通过，`results/kv-night-a2/` pressure89checks、timeouts50checks、44成功HTTP+4日志确认取消均通过。实模20请求/229IDs、独立跨状态23组/2567张量及host状态；HTTP21次SSD恢复/7.70GB归档读回，无残留request/workspace/pending。二进制`fc02358d...38502e`，215文件/102模型stat postflight通过。详见可靠性记录，勿把注入pressure或70秒HTTP窗口说成真实物理压力/小时长稳。
+
+批次A当时的参考恢复ledger为 `results/kv-night-a2/run-ledger.json`，PID52289已被后续controller替代。a1失败因短fixture合法3-token EOS被错误的maxTokens==16假设拒绝，保留原始失败报告，a2已修正并通过。
 
 批次A已提交并推送 `d449ad0`。批次B已验证：K02完整lookup/系统producer/双checkpoint、默认512MiB保留共享system策略及actualForward/recomputed统计；有限close/drain包括callback同一deadline，HTTP唯一关闭入口默认30秒；HTTP完整conversation接线与Prometheus /metrics。165项相关Swift CPU检查、release70.58秒通过，二进制`8b694fcd...57dc2`。B1原生conversation71checks/12对照生成/6冷参考/33状态事件全部通过，pressure89、timeouts50复测通过。B1 HTTP第二进程创建前端口bind失败，保留报告；B2仅将harness改为独立端口，全部9次会话/重启/低空间及36次mixed成功，4次metrics对账、45次完整usage/实际token守恒与3次RST唯一cancelled终态对账通过。B1的219、B2的222文件及各102payload postflight通过，冻结解除。最新参考56391、精确argv、idle、MTP/drafter关闭已复核，ledger为 `results/kv-night-b2/run-ledger.json`。root正阶段提交推送；后续先600秒churn预检，再7200秒窗口，1GiB SSD/160MiB RAM/8长前缀/2短前缀。wrapper仍由tiered agent在ignored目录修复，不要提前启动。
 
 新churn脚本9项根侧CPU控制测试通过，尚无真实长窗。macOS `memory_pressure -S`不执行：为系统级purge/通知，异常退出不能保证复位；真实压力验收仍保留，依据已入research文档。不要重复开发已准备接口、另启GPU控制器或重用旧PID。
+
+北京时间03:58启动唯一controller：`results/kv-night-churn-smoke/plan.json`，600秒工作段（另加oracle/加载/排空），端口11248；223文件与102payload已冻结，禁止修改Sources/Tests/scripts、wrapper或binary，也不运行第二个GPU任务。修后wrapper在`results/kv-night-churn-prep/run-churn.py`，采样/退出CPU检查通过。结束后以本目录新restoration ledger为准。临时idle-sleep assertion PID56748记录于`results/kv-night-churn-prep/caffeinate.json`，自动在09:56:04授权截止前到期；不修改系统供电设置。下一批先看实际churn及K04读admission设计：现有异步读按maxPendingBytes整额预留，任何在途写都可能使读被拒绝，不能只加FIFO优先级解决。K07 capacity-backed append仅在只读设计阶段，没有改kernel。
+
+04:12更新：上述600秒预检已完成，实际603.888秒工作段、10 oracle+45工作成功+4取消，59条唯一JSON终态全部独立对账；2完整churn窗口、SSD读4.49GB/写8.80GB/29淘汰，工作集为1GiB容量的2.904倍。25次RSS/FD和376健康采样有效，末态request/workspace/pending归零，保留93,523,976B合法RAM lease；短窗未见持续增长。aggregate admission rejected=0，本轮未自然触发下一候选要处理的忙写拒读。分析入口`results/kv-night-churn-prep/analyze-churn.py`（14项CPU fake通过）与`analysis.json`仅为ignored运行材料。root已223文件/102payload postflight并独立核对参考58191，最新ledger为`results/kv-night-churn-smoke/run-ledger.json`，冻结解除，无GPU实验。下一批K04在`results/kv-read-admission-candidate/`隔离准备：单个有界metadata read intent阻止新可选写抢占，cooperative以统一5秒等待旧IO释放后再真实预留workspace；预算不足仍保守冷退。vllm实现、sglang做新实模probe及review，tiered准备独立无模型capacity机制probe；均不得build/GPU/Git，root唯一集成者。之后再启动7200秒组合窗口。
 
 ## 2026-09-09 当前方向：KV cache 关键能力与开源设计吸收
 

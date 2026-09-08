@@ -37,6 +37,8 @@ HTTP对完整canonical会话一次分词，查找至prompt倒数第二个token�
 
 cooperative 调度中，同一 namespace 和完整 token 前缀只允许一个冷 producer；其他请求暂停 prefill，等待可用状态。producer 取消/失败后释放资格，下一个请求接管。RAM 无法保留且 SSD 尚在发布时，等待该次写入完成或失败；后台发布与读回分别受默认 5 秒的请求等待期限约束。超期后请求继续冷算，已有 I/O 和 workspace 由完成回调保留，不能提前归还额度。同 key 的未完成归档不会因超期重算而重复入队。等待期间不提交 GPU 工作；存在可运行 decode 时优先照常推进。
 
+SSD 前台读恢复新增一个 store 级、可撤销的 metadata intent。旧的已接收 IO 继续执行，新可选写入暂停准入；等待 intent 不持有归档 Data、FD、IO job 或恢复 workspace。旧 IO 释放后重新查验归档摘要与大小，再申请实际 workspace 和原有读额度，避免使用过时摘要低估内存。统一读取期限覆盖同 key 读等待、IO 准入等待及已接收读取，不因切换阶段重置；超时、取消和 clear 释放本请求意图，迟到 owner 不影响新请求。联合 workspace 不足时保守冷退，不能预支旧回调尚未归还的额度。whole-stages 同步调用遇忙立即冷退。当前仍是一个串行 IO 队列，没有抢占已接收写入、分块传输或读写速率控制，详见[队列设计](research/KV_SSD_QUEUE_DESIGN.md)。
+
 完整阶段的同步库调用持有模型 gate，无法等待一个由调用方暂停的外部 producer。这种混合使用场景安全回退到冷计算，可能重复 prefill；HTTP 使用 cooperative 模式。压缩 radix 只能恢复真实完整快照边界，不从中间树节点推导 GDN 状态。
 
 服务接入 macOS Dispatch 内存压力通知。warning 暂停可选缓存保存/提升，并在推理执行器安全点每次回收一条 RAM 快照；critical 还会在 HTTP 入队和首次状态分配前拒绝新请求，已拥有私有状态的请求继续执行。收到较低级别后需稳定 5 秒再恢复准入。回调只修改小型策略状态，不访问 Tensor。首次事件前明确报告 unknown，不能视作已观察到系统正常；这一策略与逻辑字节账本共同工作，仍不构成进程物理内存硬上限。
@@ -57,11 +59,23 @@ SSD 默认保留 1 GiB 文件系统可用空间，可通过 `--prefix-cache-min-
 
 prefill报告`cacheSource`、cached/computed tokens、lookup/restore/save/wait，以及`actualForwardTokenCount`和`recomputedTokenCount`。成功HTTP终态JSON记录`prompt_tokens = cached_prompt_tokens + computed_prompt_tokens`，并单列`actual_prefill_tokens = computed_prompt_tokens + recomputed_prefill_tokens`。来源只记录最终实际采用的前缀，SSD读后提升RAM不重复计费；`restoreWaits`仅表示读fence等待，不证明节省了第二次SSD读取。日志分别保留prefill计算、执行器active/suspension及decode耗时。
 
-`GET /metrics`提供[Prometheus文本格式0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/)；固定指标名，无prompt/token/request标签，包括真实有效恢复、SSD归档读写、等待超时、空间拒绝、联合额度、压力通知及MLX统计。尚未观察的值省略，压力unknown显示为-1。当前每次约41–42条series，普通请求身份仅在既有生命周期日志中出现。指标counter按进程/显式统计reset生命周期理解；不提供请求延迟直方图，分位数需从有界终态记录计算。
+HTTP 成功终态还记录实际 `decoded_tokens`、`decode_service_seconds`、`decode_suspension_seconds`、handoff 等待/消费时间与 `model_first_token_ready_seconds`。`decode_seconds` 是实际 decode round 计算时间，属于 service active 时间的一部分；suspension 单列，不能把三者直接相加为同一口径。首 token 来自 prefill，因此普通 AR 的 decoded count 为 completion count 减一；模型首 token ready 时间也不等于包含 HTTP 入队和网络发送的端到端 TTFT。
+
+`GET /metrics`提供[Prometheus文本格式0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/)；固定指标名，无prompt/token/request标签，包括真实有效恢复、SSD归档读写、等待超时、空间拒绝、联合额度、压力通知及MLX统计。尚未观察的值省略，压力unknown显示为-1。B 版为41–42条series，新增前台读意图、获得意图累计和可选写优先级拒绝后为44–45条；普通请求身份仅在既有生命周期日志中出现。指标counter按进程/显式统计reset生命周期理解；不提供请求延迟直方图，分位数需从有界终态记录计算。`qwen_ssd_archive_bytes` 是计费文件字节（含预留），不能解释为只有已发布有效归档。
 
 SSD归档是状态缓存，与PLE的n-gram读取分别管理。应用层成功archive字节计数不是物理SSD流量或DRAM带宽；诊断全状态读回会影响时间，不作为吞吐结论。
 
 工业发布门槛要求：完整输出与混合状态正确；并发、取消、清理及预算耗尽后恢复；跨进程重启与损坏回退；长期压力下额度不越界、请求/临时 lease 不残留、资源不持续增长；有明确的长提示词尾延迟和恢复成本。短窗口验证只是这些门槛的一部分，不自动意味着可生产部署。Paged KV、跨请求 GPU batching、跨机器 PD 和 MTP 缓存尚未交付。
+
+## 2026-09-09 批次C：忙写后的读恢复
+
+177项相关Swift CPU通过，新增10项Core read-intent与2项deadline CPU检查。C2 release47.05秒，实际二进制`4d728eb5d3bb7efdf6d35df11799da76bd02aa5a347297b273bcf92fb02d7bf4`，原始结果在`results/kv-night-c2/`。
+
+新的`probe-gpu-cache-read-admission`通过58项检查：7次完整生成均输出4 IDs后合法EOS，6组相对独立冷参考的完整121张量与host状态一致。不同namespace的两字节CPU写被受控gate暂停时，恢复只持metadata意图、无workspace和前向工作；放行后真实SSD恢复2080/2081 tokens。超时场景总解析5.001235秒，timeout增加1，SSD hit/read字节无增加；原写仍持有其pending charge。取消后接管、RAM-only clear后的新owner保护、whole-stages忙时冷退、最终IO/callback关闭均通过。另有两个未完成的等待游标分别用于显式取消及clear后丢弃，不能称为两次完整生成。
+
+已接收IO超时探针51项通过：本轮5ms等待期限之后，确有342,798,336-byte归档读取完成，旧IO/lease没有提前归还；6次生成/96 IDs、5组独立状态605张量及host比较通过。原生完整会话71项检查、12组对照192 IDs和33组独立状态事件全部通过。HTTP会话9次及mixed36次成功，432 completion tokens；3次RST均匹配唯一cancelled终态，共48条唯一模型终态。45个成功结果usage、实际前向守恒及新增decode/first-ready/handoff字段独立对账；4次指标抓取44/45 series与idle health相符。mixed工作段57.999秒、229次health采样、17次SSD恢复/6,229,626,880归档字节读回；无自然优先级拒绝，不把受控小写试验当作物理慢盘或自然收益证明。
+
+C1失败记录保留：原探针只以cacheWait检查五秒，漏算同步lookup，实际总和5.001298秒；拆开前后计数/计时断言后C2重跑通过。236个冻结文件及102个模型payload stat postflight通过，参考61971按原argv恢复、idle及MTP/drafter关闭独立核对。此批未包含长期暂停库游标的意图自然过期，补丁另行验证；两小时churn尚未完成。
 
 ## 2026-09-09 批次B：完整会话、有限关闭和监控
 
@@ -76,6 +90,16 @@ B2 HTTP会话9次成功：多轮/分支/工具历史输出与独立CLI参考一�
 B1先前7个HTTP会话/两次metrics检查成功，但第二进程启动前测试socket bind报端口占用；前一服务已close完成并exit0。失败原始记录保留，B2仅修改harness使用三个独立端口，源码和二进制未变。B1的219文件与B2的222文件、各102模型payload stat均通过postflight；B2参考服务56391按原argv恢复、idle与MTP/drafter关闭已独立核对。后续操作必须读取最新ledger，不能直接使用本文历史PID。
 
 本批仍未完成小时级持续淘汰、真实系统压力、发布配置24小时及稳定性能护栏；后续用1 GiB SSD、160 MiB RAM和多个不同10k+前缀进行持续读写/淘汰测试。
+
+### 两小时测试前的持续淘汰预检
+
+同一B1/B2二进制于`results/kv-night-churn-smoke/`完成603.888秒工作段（不含约122秒冷oracle预热）：8个不同10k+长前缀和2个短前缀，独立归档实测3,118,656,053 bytes，为1 GiB SSD额度的2.904倍，RAM160 MiB。10个串行oracle+45个工作请求成功，4个RST均以唯一服务端`model_terminal=cancelled`确认；共59个模型终态无漏项/重复，输出、finish和usage/实际前向守恒均独立对账。
+
+两个完整300秒窗口均持续发生读、写、淘汰和冷/热成功请求：工作段SSD成功归档读回4,490,936,320 bytes、写入8,802,424,738 bytes、29次淘汰；拒绝、损坏及写失败均为0。这里没有自然触发忙写期间的恢复准入拒绝，不能当作该路径的故障覆盖。600秒预检的前半段只有300秒，到点已进入后半段，因此没有周期性强制排空；7200秒窗口仍待完成。
+
+25次RSS/FD采样和376次健康采样有效。RSS范围约31.88–32.92 GB，首末四分位中位数下降约62.9 MB；FD11–15，首末中位数相同。最终request/workspace和SSD pending jobs/bytes归零，剩一个93,523,976-byte有效RAM缓存lease，联合额度峰值1,954,684,884 bytes。服务/client均exit0、IO/callback关闭完成。只证明这段短窗未见持续增长，尚非小时/天级容量验收。
+
+后处理按profile和最终cache source分别提供端到端、prefill及decode总耗时的精确nearest-rank p50/p95，不混用不同prompt来源计算加速倍数，也未从completion count推导未经定义的TPOT。root的223文件/102payload postflight及参考58191精确argv/idle复核通过；本页PID均只代表当时的恢复记录。
 
 验证命令：`probe-gpu-cache-reliability --mode populate|restore|corrupt|lifecycle|pressure`；每次需新 output，restore/corrupt 需要对应 populate oracle。HTTP `scripts/probe_http_cache_reliability.py` 在已受控启动的服务上运行 100 次并发混合请求并持续采样。客户端 RST 的记录还应与服务器终态日志按请求 ID 对照。
 

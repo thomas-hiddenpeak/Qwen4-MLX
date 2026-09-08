@@ -96,6 +96,8 @@ struct RunnerCLI {
                 try probeGPUCacheReliability(arguments)
             case "probe-gpu-cache-timeouts":
                 try probeGPUCacheTimeouts(arguments)
+            case "probe-gpu-cache-read-admission":
+                try probeGPUCacheReadAdmission(arguments)
             case "probe-gpu-conversation-cache":
                 try probeGPUConversationCache(arguments)
             case "capture-gpu-moe-prefill":
@@ -367,6 +369,8 @@ struct RunnerCLI {
         --cache-directory PRIVATE_DIRECTORY --output NEW.json --mode populate|restore|corrupt|lifecycle|pressure
         [--oracle-report POPULATE_REPORT.json] (required for restore/corrupt)
     probe-gpu-cache-timeouts --model-dir PATH --tokens-file AGENT_11K.json
+        --cache-directory PRIVATE_DIRECTORY --output NEW.json
+    probe-gpu-cache-read-admission --model-dir PATH --tokens-file AGENT_11K.json
         --cache-directory PRIVATE_DIRECTORY --output NEW.json
     probe-gpu-conversation-cache --model-dir PATH --system-file AGENT_11K.txt
         --cache-directory PRIVATE_DIRECTORY --output NEW.json

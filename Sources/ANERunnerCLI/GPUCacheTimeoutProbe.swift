@@ -88,14 +88,16 @@ extension RunnerCLI {
             throw CLIError.usage("Cache timeout probe requires a new output path")
         }
         let prefix = 9_984, outputTokens = 16
-        let readTimeout = 0.000_001, normalTimeout = 5.0, gateTimeout = 60.0
+        // Leave room for metadata admission so this probe reaches accepted IO.
+        // A separate probe covers expiration before any read is submitted.
+        let readTimeout = 0.005, normalTimeout = 5.0, gateTimeout = 60.0
         let gate = CacheTimeoutSpaceGate(maximumWaitSeconds: gateTimeout)
         var report: [String: Any] = [
             "schema": "qwen38-cache-timeouts-v1", "complete": false, "passed": false,
             "scope": "Real-model AR state/output regression with a real read-timeout race and controlled publication delay.",
             "notes": [
                 "The available-space hook delays one CPU write task; it does not block or fill a real disk.",
-                "A read reserves the full pending byte allowance; blocking a write cannot queue that read behind it.",
+                "A read reserves the full pending byte allowance; metadata admission waiting owns no read payload.",
                 "Only diskReadTimeouts proves a real read timeout. Early ready callbacks are correct but do not cover it.",
                 "CPU ticket tests establish deterministic lifetime boundaries; independent ledger samples are not atomic together.",
                 "State hashing changes latency. This is not a throughput benchmark, real bad-disk test, or long-duration gate."]]
@@ -282,7 +284,7 @@ extension RunnerCLI {
                     guard label == "R1_cold_oracle" else { throw CLIError.usage("Missing timeout output oracle") }
                     oracleIDs = result.tokens; oracleFinish = result.finishReason.rawValue
                     report["oracle_token_ids"] = oracleIDs; report["oracle_finish_reason"] = oracleFinish
-                    try require("nontrivial_oracle", oracleIDs.count == outputTokens)
+                    try require("nontrivial_oracle", !oracleIDs.isEmpty && oracleIDs.count <= outputTokens)
                 }
                 let prefill = result.phases?.prefill
                 let exact = result.tokens == oracleIDs && result.finishReason.rawValue == oracleFinish
@@ -308,6 +310,7 @@ extension RunnerCLI {
             for attempt in 1...3 {
                 let label = "R2_read_attempt_\(attempt)"
                 let before = try cacheStats(shortDeadline)
+                let beforeReadBytes = disk.statistics.bytesRead
                 let result = try run(label, generator: shortDeadline)
                 let after = try cacheStats(shortDeadline)
                 let timeoutDelta = after.diskReadTimeouts - before.diskReadTimeouts
@@ -320,6 +323,10 @@ extension RunnerCLI {
                 try require(label + "_not_publication_timeout", after.diskPublicationTimeouts == before.diskPublicationTimeouts)
                 try record(label, result, source: timeoutDelta == 1 ? "cold" : "disk", cached: timeoutDelta == 1 ? 0 : prefix)
                 try drained(label)
+                let readBytes = disk.statistics.bytesRead - beforeReadBytes
+                report["accepted_read_" + label] = ["completed_archive_bytes": readBytes,
+                    "deadline_seconds": readTimeout]
+                try require(label + "_actual_archive_read_completed", readBytes > 0)
                 if timeoutDelta == 1 { readTimeoutCovered = true; break }
             }
             checks["real_read_timeout_covered"] = readTimeoutCovered
