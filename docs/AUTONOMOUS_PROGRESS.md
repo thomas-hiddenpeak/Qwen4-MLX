@@ -2,6 +2,12 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+08:43 验收边界补充：root直接统计C3与当前capacity两轮最初10个oracle事件，两轮都只有1个distinct文本SHA，全部输出16tokens。输入前缀/归档工作集确实不同，但此短输出不能充分识别跨前缀误恢复。因此保留原冻结输出/资源gate结果，明确这些soak不独立证明任意会话隔离；数值正确性仍依赖原完整混合张量对照。可靠性/公开复跑文档及最终容量结果草案已写明，发布状态正确性门槛补充“可区分预期输出或恢复状态对照”。本轮不改fixture、不追加GPU实验；后续长测应先补这一识别能力再做24小时，不仅延长现有同输出负载。
+
+08:40 更新：同一controller与版本仍在运行。独立`closed-prefix-0833-review.json`覆盖第6次周期排空为止的实际soak1840.349202秒：175工作成功+17取消+10oracle=202唯一JSON终态；全部成功输出/usage/token守恒与14项数值阶段字段通过，capacity2775步骤（含oracle）/fallback0，6次排空所有在途owner归零。root另按events/server封闭前缀bytes/SHA重算202个ID集合、步骤和drain，保存`closed-prefix-0833-root-verification.json`；原报告明确full_run_complete=false。不要把后续在途请求计入这段通过。
+
+公开telemetry摘要`partial-telemetry-0834.json`只覆盖本机libproc实际32.019分钟/65点，footprint中位80,495,272,312B、范围79,864,848,352–80,897,433,856B、首末+134,693,176B；wrapper另有67点FD范围11–15，不强行跨时钟对齐。不以端点差证明无泄漏。08:35重核409冻结SHA不变。最终结果的待填草案在`results/kv-capacity-http-105m/RESULT_DRAFT.md`，所有PENDING仅在完整对账后替换，公开目标可用`docs/research/KV_CAPACITY_HTTP_RESULTS.md`；公开wrapper三文件仍等postflight解冻。已观察heartbeat在08:13、08:33触发，不依赖旧文档推测的09:42；09:33那轮应保留turn等待约09:49收尾，给09:56:04截止留余量，不仅结束等待下一轮。
+
 08:21 更新：现有105分钟controller继续运行，未新增模型进程或重建。08:19观察工作段901.314秒、83成功/8取消、客户端errors0，两次周期drain；SSD实际已有25次restore/61次eviction（含初始填充），writeFailure/corruption/logdrop均0，logical peak1,954,740,180B/4GiB，OS通知仍0。全部是中途观测，不是最终验收。独立`results/kv-capacity-accounting-review/REVIEW.md`核对容量追加→紧凑RAM保存/恢复→SSD逻辑payload及异步lease，11源码/测试SHA由root重核；未发现运行时拥有链路的新漏计，不是RSS证明，没有源码修复候选。root另逐段读公开base/phase及capacity terminal validator，最终仍按原对账顺序执行，不以配置可见替代实际步骤。存储/计费边界已补入完整模型结果文档；所有409冻结文件保持不变，截止与收尾约定不变。
 
 08:10 接续：`4b2b45e`公开churn、`18b136df431c5051f1e497f00376ff928dc46d77` HTTP显式容量开关均已推送且remote SHA一致。controller真实PID77783/session22551，wrapper PGID77821，server77822/11260；只读sidecar PID77997/session54107。10个oracle通过，soak从wrapper客户端elapsed120.134秒开始；首个周期drain已发生，当前仍运行，不能提前验收。阶段commit后重新核对409个冻结SHA无变化。禁止新controller/build/冻结文件编辑；下轮继续已有会话。最后一次约09:42的heartbeat应保持当前turn观察到收尾或截止，不提前结束等待可能已超出UNTIL的下一轮；需要中断只能TERM已验证的自有controller77783并等finally恢复，不能kill controller或其他服务。

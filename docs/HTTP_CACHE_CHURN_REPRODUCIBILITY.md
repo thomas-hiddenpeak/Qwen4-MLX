@@ -2,6 +2,8 @@
 
 这是已验证C3配置的运行与离线审计入口：160 MiB RAM缓存、1 GiB SSD归档、4 GiB联合状态额度，8个长前缀、2个短前缀、4个客户端worker；AR、416-token checkpoint网格，客户端token额度30000。它不能证明4个长请求并行驻留，也不包含24小时模式。已有7205.783秒结果及剩余门槛见[缓存可靠性](KV_CACHE_RELIABILITY.md)。
 
+当前固定fixture的10个冷oracle虽然输入不同，16-token输出文本SHA却相同。这个复跑入口主要验证持续生命周期、资源与既定文本一致性，对跨前缀误恢复的辨识有限；需结合完整混合状态对照，不能独立称为隔离正确性验收。下一版发布长测应加入可区分输出或状态检查；这项变化需单独验证，不追溯改变已冻结版本的通过口径。
+
 所有命令从仓库根目录执行。需要已构建的`.build/release/ane-runner`、现有`scripts/probe_http_cache_churn.py`及其reliability helper，模型位于仓库的`../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream`。wrapper保留这一已测布局，尚无`--model-dir`参数；不要将它当作任意目录的通用安装器。
 
 ## 由既有controller运行
