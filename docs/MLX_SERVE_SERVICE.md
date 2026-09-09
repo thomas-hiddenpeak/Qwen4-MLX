@@ -71,7 +71,20 @@ env DEVELOPER_DIR=/Library/Developer/CommandLineTools \
 
 三次请求各产生 7 个输出 token，返回预期的两个不同标记；SSE、usage 和独占期间的指标增量相符，缓存 token 与实算 token 之和等于 prompt token。这是有限业务 smoke，每种情况一个样本，不是生产分位数或性能 SLO。
 
-满上下文边界验证仍在运行，结果写入 `results/mlx-business-long-v1/`；未结束前不能用 API 报告的最大长度代替实测成功。
+满上下文边界实测通过：合成 prompt 经本服务 tokenize → detokenize → tokenize 往返，准确为 **262143 tokens**，两次请求均生成 1 token，usage 总数均为 **262144**，无输入截断。
+
+| 请求 | 输入 / 缓存 / 实算 token | 首段输出 | 完整耗时 |
+| --- | --- | ---: | ---: |
+| 满长度冷请求 | 262143 / 0 / 262143 | 671.364 s | 671.364 s |
+| 满长度重复 | 262143 / 262112 / 31 | 0.600 s | 0.601 s |
+
+满长度两次输出一致，但这只是合成容量 smoke 的观察，不构成模型逐位正确性或长文理解质量证明。原始 completion usage 没有缓存字段，表中缓存和实算 token 来自独占期间 `/metrics.json` 增量；每次严格只有一个成功请求，计数与 API usage 对齐。冷 prefill 约 11.2 分钟，实际客户端需要容纳这一首响应等待；本配置及验证客户端使用 1800 秒期限。
+
+服务日志显示满长度冷请求后缓存 8840.99 MiB，重复后 9857.27 MiB，均低于 10240 MiB 配额；跨请求继承的检查点也计入该上限。两份旧、新状态都可读不等于未发生物理复制，本轮未建立复制字节或峰值的冷/热独立对照。127 次观测样本及 MLX 记录未发现 OOM，采样最少系统可用内存为 11.12 GiB，MLX 记录峰值约 90.01 GiB；这些不等同于真实外部内存压力验收。
+
+超上限 262147-token 请求返回明确 HTTP 400，未截断或启动推理。最终核对 9 个文件哈希与 102 个模型 payload stat 未变，服务 PID 19347、精确 argv、health、262144-token 模型元数据及 idle 均通过，MTP/drafter 未加载。服务保持运行且保留热缓存。
+
+满长度证据位于 `results/mlx-business-long-v1/`；部署、溢出检查及最终状态位于 `results/mlx-business-service-v1/`。
 
 证据：`results/mlx-business-prep/`、`results/mlx-business-service-v1/`、`results/mlx-business-short-v1/`。运行数据留本机，发布源码保留命令、补丁与验证边界。复跑脚本为 [`verify_mlx_business_service.py`](../scripts/verify_mlx_business_service.py)：
 
@@ -81,3 +94,5 @@ python3 -B scripts/verify_mlx_business_service.py --phase long --output NEW_LONG
 ```
 
 满长度使用合成文本，容量成功不证明该长度上的问答质量。上游已记录 hybrid 冷/热分块带来的数值差异，本轮不承诺完整模型逐位相等。尚未进行多小时业务压力或 SSD 重启恢复验收；SSD 本轮关闭是因为该版本的持久化写出预算与空闲排空能力需另行验证，不能仅打开开关就承诺所有长前缀已耐久保存。
+
+业务可执行文件 SHA256：`36c6ba03bc61fc6ded73158d92a0068ab12bf904a6bb2a120940f458d4bd9860`。短请求报告 SHA256：`9852a342c7b72977a08b6d71f1cecaf6e4ee4f1221f1e1b0d22d019b563fae9e`；满长度报告：`00b85b65b55f7e431543943cfa13f85adab54909aef447c560da418ce989abf8`。
