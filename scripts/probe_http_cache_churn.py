@@ -29,6 +29,7 @@ import uuid
 sys.dont_write_bytecode = True
 from probe_http_cache_reliability import (MAX_RESPONSE_BYTES, digest, events, fixture_text,
                                           fully_idle, health_contract, parse_completion)
+from cache_churn_oracles import FIXTURE_MODES, audit_oracle_discrimination, counter_witness_start
 
 MAX_FRAME_BYTES = 65_536
 MAX_RECORD_BYTES = 131_072
@@ -263,7 +264,9 @@ class Client:
                 sock.close()
 
 
-def make_profiles(system, model, seed, namespace, long_count, short_count):
+def make_profiles(system, model, seed, namespace, long_count, short_count, mode="legacy"):
+    if mode not in FIXTURE_MODES:
+        raise ValueError("Unknown cache churn fixture mode")
     profiles = {}
     short = "Use the supplied reference records.\n" + "".join(
         f"Reference record {i}: preserve the exact ordered input history and measured result.\n" for i in range(72))
@@ -273,9 +276,16 @@ def make_profiles(system, model, seed, namespace, long_count, short_count):
             # Diverge near the first tokens, so the long tails cannot masquerade
             # as multiple fixtures sharing a single 10k cached system prefix.
             marker = hashlib.sha256(f"{namespace}:{seed}:{name}".encode()).hexdigest()
+            header = f"Fixture {marker}.\n"
+            user = "请按顺序输出 1 到 100 的整数，用空格分隔，不解释。"
+            if mode == "counter-witness":
+                # The witness occurs only in the first system header, before
+                # the first 416-token checkpoint. Every user message is equal.
+                header = f"CACHE_COUNTER_START: {counter_witness_start(name)}\n" + header
+                user = "请读取系统消息最开头 CACHE_COUNTER_START 指定的整数，从该整数开始按顺序连续输出100个整数，每个整数之间只放一个空格，不解释。"
             profiles[name] = {"model": model, "temperature": 0, "mtp_depth": 0, "max_tokens": 16,
-                "messages": [{"role": "system", "content": f"Fixture {marker}.\n" + source},
-                             {"role": "user", "content": "请按顺序输出 1 到 100 的整数，用空格分隔，不解释。"}]}
+                "messages": [{"role": "system", "content": header + source},
+                             {"role": "user", "content": user}]}
     return profiles
 
 
@@ -332,6 +342,8 @@ def main(argv=None):
     parser.add_argument("--health-interval-seconds", type=float, default=2)
     parser.add_argument("--tokens-file", type=Path)
     parser.add_argument("--fixture-namespace", help="Optional replay namespace; default isolates this run with its run ID")
+    parser.add_argument("--fixture-mode", choices=FIXTURE_MODES, default="legacy",
+                        help="counter-witness requires distinct header-dependent cold outputs before the workload")
     args = parser.parse_args(argv)
     try:
         origin(args.base_url)
@@ -362,6 +374,7 @@ def main(argv=None):
     client = Client(args.base_url, args.request_timeout_seconds)
     report = {"schema": "qwen-http-cache-churn-v1", "run_id": run_id, "complete": False, "passed": False,
         "base_url": args.base_url, "seed": args.seed, "planned_soak_seconds": args.duration_seconds,
+        "fixture_mode": args.fixture_mode,
         "concurrency": args.concurrency, "max_inflight_prompt_tokens": args.max_inflight_prompt_tokens,
         "script_sha256": digest(Path(__file__).read_bytes()), "events_path": str(detail), "fixtures_path": str(fixture_path),
         "request_timeout_seconds": args.request_timeout_seconds, "drain_timeout_seconds": args.drain_timeout_seconds,
@@ -495,9 +508,10 @@ def main(argv=None):
         if len(system.encode("utf-8")) > 512 * 1024:
             raise ValueError("Base system fixture exceeds 512 KiB bound")
         namespace = args.fixture_namespace or run_id
-        profiles = make_profiles(system, initial["model"], args.seed, namespace, args.long_prefixes, args.short_prefixes)
+        profiles = make_profiles(system, initial["model"], args.seed, namespace, args.long_prefixes, args.short_prefixes,
+                                 mode=args.fixture_mode)
         fixture_bytes = json.dumps({"namespace": namespace, "seed": args.seed, "source": provenance,
-                                   "profiles": profiles}, ensure_ascii=False, indent=2).encode()
+                                   "fixture_mode": args.fixture_mode, "profiles": profiles}, ensure_ascii=False, indent=2).encode()
         with fixture_path.open("xb") as file:
             file.write(fixture_bytes)
         report["fixture_sha256"] = digest(fixture_bytes)
@@ -521,11 +535,20 @@ def main(argv=None):
                   effective_cached_tokens=result["cached_tokens"], disk_delta=delta)
             published_fixture_count += 1; measured_archive_bytes += delta["bytesWritten"]
             report["profiles"][name] = {"prompt_tokens": count, "completion_tokens": result["usage"]["completion_tokens"],
+                "expected_start": counter_witness_start(name) if args.fixture_mode == "counter-witness" else None,
                 "content_sha256": result["content_sha256"], "finish_reason": result["finish_reason"],
                 "system_sha256": digest(body["messages"][0]["content"].encode()), "new_archive_bytes": delta["bytesWritten"]}
             previous = after
             if fault.is_set():
                 raise RuntimeError(first_health_error[0] if first_health_error else "Health fault during oracle population")
+        discrimination = audit_oracle_discrimination(args.fixture_mode,
+            {name: value["content"] for name, value in oracles.items()}, expected_profiles=profiles,
+            reported_hashes={name: value["content_sha256"] for name, value in oracles.items()})
+        report["oracle_discrimination"] = discrimination
+        log.append("oracle_discrimination", **discrimination)
+        check("oracle_discrimination", discrimination["passed"],
+              required=discrimination["required"], discriminating=discrimination["discriminating"],
+              unique_content_hashes=discrimination["unique_content_hashes"], issues=discrimination["issues"])
         seeded = drain("oracles_complete")
         report["seeded_health"] = seeded
         report["working_set"] = {"distinct_fixture_prefixes": published_fixture_count,

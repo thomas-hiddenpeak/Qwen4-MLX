@@ -9,6 +9,8 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
+from cache_churn_oracles import audit_oracle_discrimination
+
 METRICS = ('wall_seconds', 'first_content_wall_seconds', 'scheduler_elapsed_seconds',
            'prefill_seconds', 'prefill_active_seconds', 'prefill_suspension_seconds',
            'decode_seconds', 'cache_lookup_seconds', 'cache_restore_seconds',
@@ -16,6 +18,64 @@ METRICS = ('wall_seconds', 'first_content_wall_seconds', 'scheduler_elapsed_seco
 RESOURCE = ('rss_bytes', 'numeric_fds', 'request_bytes', 'cache_bytes', 'workspace_bytes',
             'total_bytes', 'leases', 'mlx_active_bytes', 'mlx_cache_bytes', 'disk_bytes',
             'pending_jobs', 'pending_bytes')
+
+
+def audit_saved_oracles(summary, oracles, declarations, *, complete, issue):
+    """Recompute the bounded oracle contract from saved content, not claims.
+
+    Historical C3 reports have neither fixture_mode nor a declaration. They
+    retain their legacy consistency audit, without gaining witness evidence.
+    Duplicate profile/ID errors remain owned by the caller's complete join.
+    """
+    mode = summary.get('fixture_mode', 'legacy')
+    profiles = summary.get('profiles')
+    if not isinstance(profiles, dict):
+        issue('invalid_summary_oracle_profiles', type(profiles).__name__)
+        profiles = {}
+    try:
+        actual = audit_oracle_discrimination(mode,
+            {name: row.get('content') for name, row in oracles.items()},
+            expected_profiles=profiles.keys(),
+            reported_hashes={name: row.get('content_sha256') for name, row in oracles.items()})
+    except (ValueError, TypeError) as error:
+        issue('invalid_oracle_discrimination_contract', str(error))
+        return {'fixture_mode': mode, 'required': mode != 'legacy', 'passed': False,
+                'discriminating': False, 'error': str(error)[:500]}
+
+    # A live preview can precede the end of serial population. It must never
+    # pass final acceptance, but absence of a not-yet-produced declaration is
+    # not an error until population or the workload has actually completed.
+    ready = (complete or bool(declarations) or 'oracle_discrimination' in summary
+             or summary.get('soak_started_elapsed_seconds') is not None)
+    if not ready:
+        return {**actual, 'validation_pending': True}
+    if actual.get('passed') is not True:
+        issue('oracle_discrimination_failed', actual.get('issues'))
+
+    def same_json(left, right):
+        # JSON type equality matters: Python otherwise equates True with 1.
+        try:
+            return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(right, sort_keys=True, allow_nan=False)
+        except (ValueError, TypeError):
+            return False
+
+    declared_summary = summary.get('oracle_discrimination')
+    if mode == 'counter-witness' or declared_summary is not None:
+        if not same_json(declared_summary, actual):
+            issue('summary_oracle_discrimination_mismatch', 'Saved claim differs from actual oracle content/profile/hash')
+    if mode == 'counter-witness' or declarations:
+        if len(declarations) != 1:
+            issue('oracle_discrimination_event_count', len(declarations))
+        elif not same_json(declarations[0], actual):
+            issue('event_oracle_discrimination_mismatch', 'Saved aggregate differs from actual oracle content/profile/hash')
+    for name, observation in actual.get('profiles', {}).items():
+        saved = profiles.get(name)
+        if not isinstance(saved, dict) or saved.get('content_sha256') != observation.get('content_sha256'):
+            issue('summary_oracle_hash_mismatch', name)
+        if isinstance(saved, dict) and 'expected_start' in saved:
+            if not same_json(saved['expected_start'], observation.get('expected_start')):
+                issue('summary_oracle_start_mismatch', name)
+    return actual
 
 
 def analyze(events_path, server_path, process_path, summary_path, lifecycle_path=None):
@@ -27,6 +87,7 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
               'notes': [
                   'Only JSON schema qwen-http-lifecycle-v1 model_terminal rows count; legacy text duplicates do not.',
                   'Client content hashes/finish/usage are independently compared to each profile oracle; raw token IDs are unavailable.',
+                  'Counter-witness discrimination is recomputed from all saved cold-oracle content; legacy evidence does not establish cross-profile discrimination.',
                   'Percentiles use exact nearest rank over matched requests; prefill and decode total durations remain separate.',
                   'No TPOT is inferred from completion token count, and no physical SSD byte claim is made.',
                   'RSS/FD use the sampler elapsed clock; health uses the churn elapsed clock. They are not assumed to share an epoch.',
@@ -77,7 +138,7 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
         db.execute('CREATE TABLE terminals(id TEXT PRIMARY KEY, row TEXT, occurrences INTEGER DEFAULT 1)')
         db.execute('CREATE TABLE metrics(phase TEXT, profile TEXT, cache_source TEXT, name TEXT, value REAL)')
         db.execute('CREATE TABLE resources(source TEXT, elapsed REAL, idle INTEGER, name TEXT, value REAL)')
-        counts = Counter(); oracles = {}; pressure = Counter(); process_errors = 0
+        counts = Counter(); oracles = {}; oracle_declarations = []; pressure = Counter(); process_errors = 0
         soak_started = summary.get('soak_started_elapsed_seconds')
 
         def resource(row, source, elapsed, health=None):
@@ -127,15 +188,25 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
                 identity = event.get('request_id')
                 if not isinstance(identity, str) or not 0 < len(identity) <= 256:
                     issue('client_missing_request_id', (kind, event.get('sequence'))); continue
+                profile = event.get('profile')
+                if not isinstance(profile, str) or not 0 < len(profile) <= 128:
+                    issue('invalid_client_profile', identity); continue
                 db.execute('INSERT INTO clients(id,kind,profile,row) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET occurrences=occurrences+1',
-                           (identity, kind, event.get('profile'), json.dumps(event, separators=(',', ':'))))
+                           (identity, kind, profile, json.dumps(event, separators=(',', ':'))))
                 if event.get('passed') is not True: issue('client_request_failed', (identity, event.get('error')))
                 if kind == 'oracle':
-                    profile = event.get('profile')
                     if profile in oracles: issue('duplicate_profile_oracle', profile)
-                    oracles[profile] = event
+                    if profile in oracles or len(oracles) < 40:
+                        oracles[profile] = event
+                    else:
+                        issue('oracle_profile_bound_exceeded', profile)
                     if not isinstance(event.get('content'), str) or hashlib.sha256(event['content'].encode()).hexdigest() != event.get('content_sha256'):
                         issue('oracle_content_hash_mismatch', identity)
+            elif kind == 'oracle_discrimination':
+                if len(oracle_declarations) < 2:
+                    oracle_declarations.append({key: value for key, value in event.items() if key != 'event'})
+                else:
+                    issue('oracle_discrimination_event_count', 'More than two aggregate events')
             elif kind == 'health':
                 resource(event.get('health') or {}, 'health', event.get('elapsed_seconds'))
             elif kind == 'soak_started': soak_started = event.get('elapsed_seconds')
@@ -143,6 +214,9 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
                 if len(report['coverage_windows']) < 128: report['coverage_windows'].append(event)
                 else: issue('coverage_window_bound', 128)
             elif kind in ('health_error', 'run_error'): issue(kind, event.get('error'))
+
+        report['oracle_discrimination'] = audit_saved_oracles(summary, oracles, oracle_declarations,
+            complete=complete, issue=issue)
 
         for terminal in rows(server_path, mixed=True):
             if terminal.get('schema') != 'qwen-http-lifecycle-v1' or terminal.get('event') != 'model_terminal': continue

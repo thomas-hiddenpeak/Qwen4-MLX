@@ -50,6 +50,8 @@
 
 K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DESIGN.md)新增[完整模型容量追加候选](research/KV_CAPACITY_MODEL_RESULTS.md)：显式AR `capacity256`已有Swift物理机制、混合状态/RAM恢复/预算回退/取消，以及16/128/512输出交错对照；本块decode观察增幅3.85%–7.61%，prefill无可信改善。库与HTTP默认仍为reference；HTTP已接入`serve-gpu --kv-append-mode capacity256`，仅用于AR decode，尚非共享物理页池。原计划6300秒/105分钟的HTTP负载已按用户要求暂停，实际工作段3889.364秒，记录为未完成；自动接续已停、参考服务已恢复。HTTP和该新二进制的耐久结果不沿用C3。
 
+用户恢复后，`counter-witness` + `capacity256` 独立完成[608 秒 HTTP 预检](research/KV_CAPACITY_HTTP_RESULTS.md)。10 个冷输出可区分，74 唯一终态、2 段持续 SSD 替换、1020 实际容量步骤和最终回收全部通过。新测试补上旧 fixture 同输出的识别盲区；旧中断记录独立保留，新负载的两小时、24小时和真实系统压力验收仍待完成。
+
 ## 四、九项关键能力
 
 编号用于后续 PR、测试及结果记录。P0 是本机工业候选的必备项；P1 是容量/成本优化阶段，不能拿它们拖延 P0 的交付。

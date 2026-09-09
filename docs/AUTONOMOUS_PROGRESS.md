@@ -1,5 +1,15 @@
 # 自主研究与开发接续
 
+## 2026-09-09 用户恢复测试：可区分前缀的缓存回归
+
+用户已说“可以继续了”，恢复当前 KV cache 工作；旧八小时窗口已结束，原 heartbeat 保持 PAUSED，不创建新的八小时期限。先修复长测 fixture 的判别能力，再跑独立 600 秒 `counter-witness` + `capacity256` 预检。原 105 分钟计划因暂停只完成约 64.823 分钟工作段，保留为中断结果，不与新运行拼接。
+
+14:38 完成：独立 608.070 秒工作段通过，58 工作成功 + 6 取消 + 10 冷 oracle = 74 唯一终态；10 冷输出全部可区分，base/phase/capacity 三份审计通过。工作段 SSD 读回 6.32 GB、写入 10.92 GB、36 次淘汰，2 个完整窗口持续替换；capacity 1020 实际步骤、fallback 0。最终在途 owner 全归零，仅保留有效 RAM cache lease；client/server exit0、有限关闭及 sampler 完成。414 SHA/102 stat postflight 无变化，参考98393的精确 argv、idle、MTP/drafter 关闭已重新核对，最新恢复 ledger 为 `results/kv-counter-capacity-smoke-v1/run-ledger.json`，冻结解除，无在途 GPU 实验。详见[本轮结果](research/KV_CAPACITY_HTTP_RESULTS.md)。新负载的两小时与24小时验收仍未完成，旧 heartbeat 保持 PAUSED。
+
+根因已直接核对：旧 10 个 oracle 虽有不同系统前缀，用户问题都要求从 1 开始计数，因此输出相同。新模式将各自起始数字只写入已缓存的系统前缀，保持同一个用户问题和 16-token 输出额度；进入 soak 前必须核对预期首整数及全部输出 SHA 互异。默认 `legacy` 保留历史复跑，运行时 `reference` 默认不变。本轮仅改 Python 测试/分析工具，无 Swift 或模型变更。以下启动、暂停与自主窗口内容为历史记录。
+
+14:24 启动独立 `results/kv-counter-capacity-smoke-v1/plan.json`，唯一 controller session72195，wrapper/PGID97630、服务97631/11261。414 文件 SHA 与 102 模型 payload stat 冻结，binary `31daa9b3…9db44` 不变；运行期间不改源码/测试/脚本/native/fixtures、不重建。34 项相关 Python CPU 检查通过（parser14、base oracle audit10、capacity10），另 phase16/telemetry6 原控制通过；旧 C3 755 唯一终态由新版公开 CLI 离线重审通过，同时标记 10 oracle 只有 1 个文本 SHA。新运行完成前不能称为通过；结束后检查全部闭合日志与参考恢复，再解除冻结。
+
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
 **当前已按用户“暂停一下测试”停止，不再自动推进。** 已向核实身份的唯一controller77783发送TERM；自有实验组在2.431秒内完成清理，无KILL。服务77822正常exit0、IO/callback有限关闭完成；client因主动停服以非零退出，原始ConnectionRefusedError和未完成记录全部保留。工作段实际3889.364273917秒（约64.823分钟），不能称105分钟通过。`qwen4-mlx` heartbeat已PAUSED；controller、wrapper、测试服务、telemetry及本任务caffeinate均已退出，三个agent均结束。恢复参考84406已按本轮ledger精确argv/idle/MTPdrafter关闭核对，409hash/102stat postflight无变化。最新恢复ledger为`results/kv-capacity-http-105m/run-ledger.json`；暂停请求及完成证据为同目录`user-pause-request.json`、`user-pause-completed.json`。已解除源码冻结，但不继续开发、测试或发布待验收的三份容量wrapper副本；只有用户新指示才恢复。下文为历史进度，已被本暂停状态覆盖。

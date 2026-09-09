@@ -1,6 +1,7 @@
 """CPU-only churn controls. Fake transport tests do not exercise a live server."""
 from contextlib import redirect_stdout
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import probe_http_cache_churn as churn
+from cache_churn_oracles import audit_oracle_discrimination, counter_witness_start
 from test_http_cache_reliability_parser import frame, nonstream, stream, usage
 
 
@@ -89,6 +91,108 @@ class CacheChurnParserTests(unittest.TestCase):
         self.assertEqual({step[1] for step in steps}, set(profiles))
         self.assertEqual({step[3] for step in steps if step[2]}, {False, True})
         self.assertEqual(steps[0][1], steps[1][1])
+
+    def test_counter_fixtures_put_distinct_witness_only_in_first_system_header(self):
+        source = "Fixture input without a counter.\n" * 1000
+        legacy = churn.make_profiles(source, "model", 7, "fixed", 8, 2)
+        self.assertEqual(legacy, churn.make_profiles(source, "model", 7, "fixed", 8, 2, mode="legacy"))
+        marker = hashlib.sha256(b"fixed:7:long_00").hexdigest()
+        self.assertEqual(legacy["long_00"]["messages"][0]["content"], f"Fixture {marker}.\n" + source)
+        self.assertEqual(legacy["long_00"]["messages"][1]["content"], "请按顺序输出 1 到 100 的整数，用空格分隔，不解释。")
+        profiles = churn.make_profiles(source, "model", 7, "fixed", 8, 2, mode="counter-witness")
+        self.assertEqual([counter_witness_start(name) for name in profiles],
+                         [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 65000, 66000])
+        self.assertEqual(len({body["messages"][1]["content"] for body in profiles.values()}), 1)
+        for name, body in profiles.items():
+            with self.subTest(name=name):
+                witness = str(counter_witness_start(name))
+                header, suffix = body["messages"][0]["content"].split("\n", 1)
+                self.assertEqual(header, "CACHE_COUNTER_START: " + witness)
+                self.assertEqual(suffix, legacy[name]["messages"][0]["content"])
+                self.assertNotIn(witness, body["messages"][1]["content"])
+                self.assertEqual({key: value for key, value in body.items() if key != "messages"},
+                                 {"model": "model", "temperature": 0, "mtp_depth": 0, "max_tokens": 16})
+
+    def test_counter_audit_accepts_distinct_actual_content_and_partial_final_number(self):
+        names = [f"long_{index:02d}" for index in range(8)] + ["short_00", "short_01"]
+        contents = {name: f" {counter_witness_start(name)} {counter_witness_start(name) + 1} 6" for name in names}
+        hashes = {name: hashlib.sha256(content.encode()).hexdigest() for name, content in contents.items()}
+        audit = audit_oracle_discrimination("counter-witness", contents,
+                                             expected_profiles=names, reported_hashes=hashes)
+        self.assertTrue(audit["passed"], audit)
+        self.assertTrue(audit["discriminating"])
+        self.assertTrue(audit["required"])
+        self.assertEqual(audit["profile_count"], 10)
+        self.assertEqual(audit["unique_content_hashes"], 10)
+        self.assertTrue(all(row["starts_with_expected"] for row in audit["profiles"].values()))
+
+    def test_counter_audit_rejects_wrong_missing_colliding_or_forged_oracles(self):
+        baseline = {"long_00": "1000 1001 10", "short_00": "65000 65001 65"}
+        cases = [("wrong_integer", {**baseline, "long_00": "10000 10001"}, "wrong_or_missing_start:long_00"),
+                 ("word_boundary", {**baseline, "long_00": "1000abc"}, "wrong_or_missing_start:long_00"),
+                 ("missing_number", {**baseline, "long_00": ""}, "wrong_or_missing_start:long_00"),
+                 ("missing_profile", {"long_00": baseline["long_00"]}, "missing_oracle:short_00"),
+                 ("swapped", {"long_00": baseline["short_00"], "short_00": baseline["long_00"]}, "wrong_or_missing_start:long_00"),
+                 ("colliding", {"long_00": baseline["long_00"], "short_00": baseline["long_00"]}, "duplicate_oracle_content")]
+        for label, contents, issue in cases:
+            with self.subTest(label=label):
+                audit = audit_oracle_discrimination("counter-witness", contents, expected_profiles=baseline)
+                self.assertFalse(audit["passed"])
+                self.assertFalse(audit["discriminating"])
+                self.assertIn(issue, audit["issues"])
+        hashes = {name: hashlib.sha256(content.encode()).hexdigest() for name, content in baseline.items()}
+        hashes["long_00"] = "0" * 64
+        forged = audit_oracle_discrimination("counter-witness", baseline, reported_hashes=hashes)
+        self.assertFalse(forged["passed"])
+        self.assertIn("content_hash_mismatch:long_00", forged["issues"])
+
+    def test_legacy_equal_oracles_are_honestly_nondiscriminating(self):
+        audit = audit_oracle_discrimination("legacy", {"long_00": "1 2 3 ", "short_00": "1 2 3 "})
+        self.assertTrue(audit["passed"])
+        self.assertFalse(audit["required"])
+        self.assertFalse(audit["discriminating"])
+        self.assertEqual(audit["unique_content_hashes"], 1)
+        self.assertTrue(all(row["expected_start"] is None and row["starts_with_expected"] is None
+                            for row in audit["profiles"].values()))
+
+    def test_counter_main_fails_before_workload_for_wrong_or_colliding_cold_outputs(self):
+        for corruption in ("wrong_integer", "colliding"):
+            class WitnessClient(FakeClient):
+                def raw(self, method, path, body=None, timeout=None, observation=None):
+                    status, headers, raw, timing = super().raw(method, path, body, timeout, observation)
+                    if path == "/health":
+                        return status, headers, raw, timing
+                    start = int(body["messages"][0]["content"].split("\n", 1)[0].split(": ")[1])
+                    value = start + 1 if corruption == "wrong_integer" else 1000
+                    payload = json.loads(raw)
+                    payload["choices"][0]["message"]["content"] = f"{value} {value + 1} "
+                    return status, headers, json.dumps(payload).encode(), timing
+
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "summary.json"
+                with patch.object(churn, "Client", WitnessClient), \
+                        patch.object(churn, "fixture_text", return_value=("system rule\n" * 1500, {})), \
+                        patch.object(churn, "ChurnSchedule") as schedule, \
+                        patch.object(churn, "ThreadPoolExecutor") as executor, redirect_stdout(io.StringIO()):
+                    result = churn.main(["--output", str(output), "--duration-seconds", "1",
+                        "--long-prefixes", "4", "--short-prefixes", "1", "--fixture-mode", "counter-witness"])
+                report = json.loads(output.read_text())
+                self.assertEqual(result, 1)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["error"], "AssertionError: oracle_discrimination")
+                self.assertEqual(report["requests"], 0)
+                self.assertEqual(report["fixture_mode"], "counter-witness")
+                schedule.assert_not_called(); executor.assert_not_called()
+                rows = [json.loads(line) for line in Path(report["events_path"]).read_text().splitlines()]
+                self.assertEqual(sum(row["event"] == "oracle" for row in rows), 5)
+                self.assertFalse(any(row["event"] in ("soak_started", "request", "cancel") for row in rows))
+                audits = [row for row in rows if row["event"] == "oracle_discrimination"]
+                self.assertEqual(len(audits), 1)
+                self.assertEqual({key: value for key, value in audits[0].items() if key != "event"}, report["oracle_discrimination"])
+                self.assertFalse(audits[0]["passed"])
+                self.assertEqual(audits[0]["profile_count"], 5)
+                self.assertTrue(all(row["expected_start"] == counter_witness_start(name)
+                                    for name, row in report["profiles"].items()))
 
     def test_sustained_windows_do_not_accept_only_an_early_total_hit(self):
         before = {"completed_requests": 10, "cached_completions": 5, "cold_completions": 5, "client_abort_requests": 1}

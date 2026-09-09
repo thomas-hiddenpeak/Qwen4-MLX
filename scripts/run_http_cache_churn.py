@@ -6,6 +6,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--output-directory', type=Path, required=True)
 parser.add_argument('--duration-seconds', type=int, default=7200)
 parser.add_argument('--port', type=int, default=11248)
+parser.add_argument('--fixture-mode', choices=('legacy', 'counter-witness'), default='legacy')
+parser.add_argument('--kv-append-mode', choices=('reference', 'capacity256'), default='reference')
 args = parser.parse_args()
 if not 1 <= args.duration_seconds <= 7200:
     parser.error('--duration-seconds must be in 1...7200')
@@ -14,12 +16,14 @@ if not 1024 <= args.port <= 65535:
 root = Path.cwd(); out = args.output_directory.resolve()
 sys.path.insert(0, str(root / 'scripts'))
 from probe_http_cache_reliability import health_contract, fully_idle
+from capacity_http_validation import require_capacity_health, validate_capacity_terminals
 
 port = args.port; child = None; churn = None; sample_thread = None
 sample_stop = threading.Event(); interrupted = threading.Event(); sample_failed = threading.Event()
 sampling = {'completed': False, 'samples': 0, 'rss_samples': 0, 'fd_samples': 0,
             'errors': 0, 'error': None, 'max_samples': 1024, 'interval_seconds': 30}
 record = {'complete': False, 'passed': False, 'services': [],
+          'fixture_mode': args.fixture_mode, 'kv_append_mode': args.kv_append_mode,
           'sampling': sampling, 'interrupted_by_signal': None,
           'process_observations': 'RSS and numeric FDs, not unique physical Metal memory or device I/O'}
 def save():
@@ -46,6 +50,7 @@ def idle():
             raise RuntimeError('Server exited before idle')
         try:
             value = health_contract(json.loads(get('/health')))
+            if args.kv_append_mode == 'capacity256': require_capacity_health(value)
             if value['pid'] != child.pid:
                 raise RuntimeError('Health PID does not match the owned server')
             if fully_idle(value): return value
@@ -137,6 +142,7 @@ try:
         '--prefix-cache-ttl-seconds', '86400', '--prefix-cache-min-free-bytes', '1073741824',
         '--prefix-cache-restore-timeout-seconds', '5', '--prefix-cache-shutdown-timeout-seconds', '30',
         '--state-budget-bytes', '4294967296', '--max-connections', '8']
+    if args.kv_append_mode == 'capacity256': command.extend(['--kv-append-mode', 'capacity256'])
     with (out / 'server.log').open('x') as log:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     row = {'pid': child.pid, 'command': command}; record['services'].append(row); save()
@@ -150,6 +156,7 @@ try:
         '--seed', '20260909', '--concurrency', '4', '--long-prefixes', '8', '--short-prefixes', '2',
         '--max-inflight-prompt-tokens', '30000', '--request-timeout-seconds', '240',
         '--drain-timeout-seconds', '180', '--drain-interval-seconds', '300', '--health-interval-seconds', '2',
+        '--fixture-mode', args.fixture_mode,
         '--output', str(out / 'churn.json')]
     churn = subprocess.Popen(churn_command, stdin=subprocess.DEVNULL)
     record['client'] = {'pid': churn.pid, 'command': churn_command}; save()
@@ -193,10 +200,24 @@ finally:
     if child is not None:
         row['exit_code'] = cleanup.get('server_exit_code')
         row['close_completed_logged'] = 'HTTP prefix cache shutdown completed=true io_completed=true callbacks_completed=true pending_jobs=0 pending_bytes=0' in (out / 'server.log').read_text()
+    capacity_passed = args.kv_append_mode == 'reference'
+    record['capacity_terminal_validation'] = {'complete': False, 'passed': False, 'skipped': True,
+                                             'required': not capacity_passed}
+    if args.kv_append_mode == 'capacity256' and workload_passed and not interrupted.is_set() and cleanup.get('server_exit_code') == 0:
+        try:
+            audit = validate_capacity_terminals(out / 'churn.events.ndjson', out / 'server.log', child.pid,
+                                               stop_requested=interrupted.is_set)
+            record['capacity_terminal_validation'] = audit
+            with (out / 'capacity-terminal-validation.json').open('x') as stream:
+                json.dump(audit, stream, indent=2); stream.write('\n')
+            capacity_passed = audit['complete'] and audit['passed']
+        except (OSError, ValueError, TypeError) as error:
+            record['capacity_terminal_validation'] = {'complete': False, 'passed': False,
+                'errors': [f'{type(error).__name__}: {error}'[:1500]]}
     record['complete'] = record['passed'] = bool(workload_passed and not interrupted.is_set()
         and cleanup.get('server_exit_code') == 0 and cleanup.get('client_exit_code') == 0
         and cleanup.get('sampler_completed') and sampling['samples'] > 0 and sampling['errors'] == 0
-        and row['close_completed_logged'])
+        and row['close_completed_logged'] and capacity_passed)
     if workload_passed and not record['passed']:
         record['error'] = 'Post-workload sampler/close/exit verification failed; inspect cleanup and service records'
     save()
