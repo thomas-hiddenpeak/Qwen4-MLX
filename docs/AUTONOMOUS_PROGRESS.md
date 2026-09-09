@@ -2,6 +2,8 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+08:58 更新：唯一105分钟controller/session22551仍运行，已消费其Starting churn输出，未结束。工作段3150.117407958秒进入uninterrupted后半段，前半段共10次periodic drain，最后一次为soak3058.067959875秒；观测记录`second-half-transition.json`明确full_run_complete=false。08:57工作进度3184.736秒/297成功/30取消/errors0；后续只观察，不再主动排空或新增GPU任务，最终检查后半段确实没有periodic drain。服务77822/11260、sidecar77997/session54107不变，参考仍由controller接管。后续先延续到约09:49再执行既定postflight/全量审计/三脚本公开/文档与推送，09:56:04前暂停heartbeat。
+
 08:43 验收边界补充：root直接统计C3与当前capacity两轮最初10个oracle事件，两轮都只有1个distinct文本SHA，全部输出16tokens。输入前缀/归档工作集确实不同，但此短输出不能充分识别跨前缀误恢复。因此保留原冻结输出/资源gate结果，明确这些soak不独立证明任意会话隔离；数值正确性仍依赖原完整混合张量对照。可靠性/公开复跑文档及最终容量结果草案已写明，发布状态正确性门槛补充“可区分预期输出或恢复状态对照”。本轮不改fixture、不追加GPU实验；后续长测应先补这一识别能力再做24小时，不仅延长现有同输出负载。
 
 08:40 更新：同一controller与版本仍在运行。独立`closed-prefix-0833-review.json`覆盖第6次周期排空为止的实际soak1840.349202秒：175工作成功+17取消+10oracle=202唯一JSON终态；全部成功输出/usage/token守恒与14项数值阶段字段通过，capacity2775步骤（含oracle）/fallback0，6次排空所有在途owner归零。root另按events/server封闭前缀bytes/SHA重算202个ID集合、步骤和drain，保存`closed-prefix-0833-root-verification.json`；原报告明确full_run_complete=false。不要把后续在途请求计入这段通过。
