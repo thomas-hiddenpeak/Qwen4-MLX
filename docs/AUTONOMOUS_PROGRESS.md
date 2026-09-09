@@ -2,6 +2,8 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+**当前已按用户“暂停一下测试”停止，不再自动推进。** 已向核实身份的唯一controller77783发送TERM；自有实验组在2.431秒内完成清理，无KILL。服务77822正常exit0、IO/callback有限关闭完成；client因主动停服以非零退出，原始ConnectionRefusedError和未完成记录全部保留。工作段实际3889.364273917秒（约64.823分钟），不能称105分钟通过。`qwen4-mlx` heartbeat已PAUSED；controller、wrapper、测试服务、telemetry及本任务caffeinate均已退出，三个agent均结束。恢复参考84406已按本轮ledger精确argv/idle/MTPdrafter关闭核对，409hash/102stat postflight无变化。最新恢复ledger为`results/kv-capacity-http-105m/run-ledger.json`；暂停请求及完成证据为同目录`user-pause-request.json`、`user-pause-completed.json`。已解除源码冻结，但不继续开发、测试或发布待验收的三份容量wrapper副本；只有用户新指示才恢复。下文为历史进度，已被本暂停状态覆盖。
+
 08:58 更新：唯一105分钟controller/session22551仍运行，已消费其Starting churn输出，未结束。工作段3150.117407958秒进入uninterrupted后半段，前半段共10次periodic drain，最后一次为soak3058.067959875秒；观测记录`second-half-transition.json`明确full_run_complete=false。08:57工作进度3184.736秒/297成功/30取消/errors0；后续只观察，不再主动排空或新增GPU任务，最终检查后半段确实没有periodic drain。服务77822/11260、sidecar77997/session54107不变，参考仍由controller接管。后续先延续到约09:49再执行既定postflight/全量审计/三脚本公开/文档与推送，09:56:04前暂停heartbeat。
 
 08:43 验收边界补充：root直接统计C3与当前capacity两轮最初10个oracle事件，两轮都只有1个distinct文本SHA，全部输出16tokens。输入前缀/归档工作集确实不同，但此短输出不能充分识别跨前缀误恢复。因此保留原冻结输出/资源gate结果，明确这些soak不独立证明任意会话隔离；数值正确性仍依赖原完整混合张量对照。可靠性/公开复跑文档及最终容量结果草案已写明，发布状态正确性门槛补充“可区分预期输出或恢复状态对照”。本轮不改fixture、不追加GPU实验；后续长测应先补这一识别能力再做24小时，不仅延长现有同输出负载。

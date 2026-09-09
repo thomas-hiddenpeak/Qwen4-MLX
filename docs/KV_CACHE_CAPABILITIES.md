@@ -48,7 +48,7 @@
 
 实际OS压力验收、SSD读写速率控制、成本选择、完整公平份额与长期性能门槛仍有缺口，不能将K03/K04/K05/K06整项标记完成。C3两小时终态、阶段与资源记录已独立核对；本轮OS压力通知为0、level为unknown，监听已运行不等于真实压力验收。libproc footprint只有82.048分钟部分窗口，不能补称全程。启动、观测及恢复步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)。当前仍为整快照恢复；共享物理页池、跨请求页级COW及增量SSD尚未实现，容量缓冲内部的COW不能代替这些能力。
 
-K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DESIGN.md)新增[完整模型容量追加候选](research/KV_CAPACITY_MODEL_RESULTS.md)：显式AR `capacity256`已有Swift物理机制、混合状态/RAM恢复/预算回退/取消，以及16/128/512输出交错对照；本块decode观察增幅3.85%–7.61%，prefill无可信改善。库与HTTP默认仍为reference；HTTP已接入`serve-gpu --kv-append-mode capacity256`，仅用于AR decode，尚非共享物理页池。当前6300秒HTTP负载仍在运行，计划为105分钟，不能记为两小时通过；HTTP和该新二进制的耐久结果不沿用C3。
+K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DESIGN.md)新增[完整模型容量追加候选](research/KV_CAPACITY_MODEL_RESULTS.md)：显式AR `capacity256`已有Swift物理机制、混合状态/RAM恢复/预算回退/取消，以及16/128/512输出交错对照；本块decode观察增幅3.85%–7.61%，prefill无可信改善。库与HTTP默认仍为reference；HTTP已接入`serve-gpu --kv-append-mode capacity256`，仅用于AR decode，尚非共享物理页池。原计划6300秒/105分钟的HTTP负载已按用户要求暂停，实际工作段3889.364秒，记录为未完成；自动接续已停、参考服务已恢复。HTTP和该新二进制的耐久结果不沿用C3。
 
 ## 四、九项关键能力
 
