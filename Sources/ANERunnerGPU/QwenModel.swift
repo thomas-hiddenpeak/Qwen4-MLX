@@ -549,7 +549,8 @@ public final class QwenModel {
                         prefillAttention: GPUAttention.PrefillMode = .reference,
                         profileLogits: Bool = true,
                         prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
-                        kvCapacityPermit: QwenKVCapacityAppendPermit? = nil) throws -> Output {
+                        kvCapacityPermit: QwenKVCapacityAppendPermit? = nil,
+                        pagedSDPAReader: GPUPagedSDPAReader? = nil) throws -> Output {
         guard state.owner == identity, state.valid, state.gdn.count == layerCount, !tokens.isEmpty, evaluateEveryLayers > 0,
               !captureVerification || tokens.count <= 5,
               !verifyScalarLinear || (tokens.count <= 5 && decodeMode == .reference),
@@ -564,6 +565,14 @@ public final class QwenModel {
             try prefillMoEConfiguration.validated(phase: executionPhase)
             guard executionPhase == .prefill, !verifyScalarMoE, !verifyScalarLinear else {
                 throw GPUError.invalid("Prefill MoE configuration cannot select decode or verification kernels")
+            }
+        }
+        if let pagedSDPAReader {
+            guard phase == .decode, tokens.count == 1, !captureTrace, !captureVerification,
+                  !verifyScalarBoundaries, !verifyScalarMoE, !verifyScalarLinear, !verifyTokenMoE,
+                  prefillPrefetch == nil, prefillMoEConfiguration == nil,
+                  state.offset < pagedSDPAReader.maximumTokens else {
+                throw GPUError.invalid("Paged SDPA requires explicit bounded S1 AR decode without captures or verification")
             }
         }
         let kvCapacityRowLimit: Int?
@@ -644,12 +653,12 @@ public final class QwenModel {
                         // double-count attention or nest synchronized measures.
                         attnOut = try attention.forward(pre.mixed, state: &state.attention[i],
                             verificationLinear: linear, prefillMode: prefillAttention, profiler: profiler,
-                            kvCapacityRowLimit: kvCapacityRowLimit)
+                            kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader)
                     } else {
                         attnOut = try profiler.measure("attention", layer: i, tokenCount: n, outputs: { [$0.0] + $0.1 }) {
                             let y = try attention.forward(pre.mixed, state: &state.attention[i],
                                 verificationLinear: linear, prefillMode: prefillAttention,
-                                kvCapacityRowLimit: kvCapacityRowLimit); return (y, state.attention[i].tensors)
+                                kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader); return (y, state.attention[i].tensors)
                         }.0
                     }
                 }

@@ -30,17 +30,18 @@
 
 ## 三、从上游吸收什么
 
-以下固定快照均在本次调研核对。详细源码、版本差异和许可分别见三份研究报告；既有更早的研究快照保留为历史。
+以下固定快照均在对应调研中核对。详细源码、版本差异和许可见各研究报告；既有更早的研究快照保留为历史。
 
 | 来源 | 采用的机制 | 本机适配与取舍 |
 | --- | --- | --- |
 | [vLLM](research/KV_VLLM_REVIEW.md)：release v0.28.0 `2cf0a6915ce544dc493a0990f2ea38d81601128a`；main `1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d` | 物理页池/引用计数、尾页 COW、跨组共同恢复边界、先固定引用再分配、水位准入、传输完成契约 | KV 页与 recurrent 检查点分开；Metal 直接使用页表才形成完整分页路径。部分 main 新功能受 EAGLE/MTP 条件限制，不纳入当前前置条件 |
+| [vllm-metal](research/VLLM_METAL_ADOPTION.md)：`023e544fec59f872f65f66e23232706e4e17ff2e` | Metal 直接页表读取、MLX 图依赖与临时数组寿命、hybrid 对齐 | 保持独立 Swift runner；先落地保留本机 MLX 算术的 32-token reader，完整模型使用 identity 页表验证。共享页池与尾页 COW 后续接入，NAX prefill 另做 QSA 数值适配 |
 | [SGLang](research/KV_SGLANG_REVIEW.md)：main `30e7a3072d3f1e9bd70cd5e44146ca27c80522c4` | Unified Radix 混合组件、会话软保留、分层预取/写回、恢复期限、有效命中与浪费指标 | 保留本项目更严格的文件校验和耐久路径。统一内存不照搬 HBM→CPU 两个独立容量池；其 MLX 辅助状态代码不证明本模型已获支持 |
 | [LMCache](research/KV_TIERED_REVIEW.md)：`47da378cae7fce8efbd14a3cf5ab78e19e63ef3c` | 当前 MP 的查找/预取/读取结束、预留/提交分离，独立存储/预取/淘汰控制器及对象所有权 | 吸收协议和背压，先保持同进程 Swift 所有权；不引入 Python 缓存服务、CUDA IPC 或 RDMA 依赖 |
 | [DwarfStar / antirez/ds4](research/KV_TIERED_REVIEW.md)：`6289c516273979173abbc062209a81dd3706b804` | 专用 runner 的会话检查点、格式与状态 ABI 分层、衰减热度和每字节保留价值 | 继续使用准确 token 身份和严格数值配置；不复制文本键、跨量化恢复或其模型的边界常量 |
 | [MLX LM](research/KV_TIERED_REVIEW.md)：`95fdd057b101eb79f02da2940a8ec153d1761f1b` | cache 类型/metadata 持久化；只有所有层均可裁剪时才允许从长状态回退 | 为本模型明确标注 GDN/PLE 不可任意裁剪。长会话检查点不能无条件替代有价值的短锚点 |
 
-版本注意：vLLM 旧 hybrid 文档、SGLang session 示例与当前源码存在差异；LMCache 当前推荐 MP，旧 in-process async 文档已标记 deprecated。研究报告使用具体源码判断机制，避免把旧文档或开发分支能力当成稳定发布承诺。本轮仅提炼设计；后续复制实现时逐文件保留版权及许可。
+版本注意：vLLM 旧 hybrid 文档、SGLang session 示例与当前源码存在差异；LMCache 当前推荐 MP，旧 in-process async 文档已标记 deprecated。研究报告使用具体源码判断机制，避免把旧文档或开发分支能力当成稳定发布承诺。研究中的机制按下述增量落地；复制实现时逐文件保留版权及许可。
 
 本轮落地进度（2026-09-09）：K01补齐异步读写和提交线程的owner寿命；K03接入真实Dispatch通知、两级准入、有界trim与滞回；K04加入空间水位、读回/发布等待期限并移除共享锁内的POSIX提交。批次B已将K02完整会话查找、共同system生产者、每请求最多两个原网格检查点及默认RAM系统锚点保护接入HTTP；K04关闭等待采用一个覆盖IO和callback的期限；K06新增实际前向/重算token及分阶段终态日志、Prometheus指标。165项相关CPU、实模会话/pressure/timeout及HTTP会话/重启/低空间检查通过，具体版本与计数见[可靠性记录](KV_CACHE_RELIABILITY.md)和[会话实模复核](research/KV_CONVERSATION_B1_RESULTS.md)。
 
@@ -51,6 +52,8 @@
 K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DESIGN.md)新增[完整模型容量追加候选](research/KV_CAPACITY_MODEL_RESULTS.md)：显式AR `capacity256`已有Swift物理机制、混合状态/RAM恢复/预算回退/取消，以及16/128/512输出交错对照；本块decode观察增幅3.85%–7.61%，prefill无可信改善。库与HTTP默认仍为reference；HTTP已接入`serve-gpu --kv-append-mode capacity256`，仅用于AR decode，尚非共享物理页池。原计划6300秒/105分钟的HTTP负载已按用户要求暂停，实际工作段3889.364秒，记录为未完成；自动接续已停、参考服务已恢复。HTTP和该新二进制的耐久结果不沿用C3。
 
 用户恢复后，`counter-witness` + `capacity256` 独立完成[608 秒 HTTP 预检](research/KV_CAPACITY_HTTP_RESULTS.md)。10 个冷输出可区分，74 唯一终态、2 段持续 SSD 替换、1020 实际容量步骤和最终回收全部通过。新测试补上旧 fixture 同输出的识别盲区；旧中断记录独立保留，新负载的两小时、24小时和真实系统压力验收仍待完成。
+
+K07 新增 [vllm-metal 吸收增量](research/VLLM_METAL_ADOPTION.md)：32-token Metal 页表 reader 已通过乱序页/尾页机制和 P11057 完整模型状态对照，作为显式 per-generator 配置接入 AR decode。完整模型暂用现有 capacity view 的 identity 页表，未交付共享页池、增量 SSD 或新的生产默认。性能与进一步采用范围以该报告为准。
 
 ## 四、九项关键能力
 

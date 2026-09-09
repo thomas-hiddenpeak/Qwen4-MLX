@@ -88,6 +88,8 @@ struct RunnerCLI {
                 try probeGPUKVCapacityModel(arguments)
             case "benchmark-gpu-kv-capacity":
                 try benchmarkGPUKVCapacity(arguments)
+            case "benchmark-gpu-paged-attention":
+                try benchmarkGPUPagedAttention(arguments)
             case "generate-gpu":
                 try generateGPU(arguments)
             case "probe-gpu-phase-handoff":
@@ -353,6 +355,9 @@ struct RunnerCLI {
     benchmark-gpu-kv-capacity --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
         [--max-tokens 16] [--context 16384] [--order abba|baab] [--warmup true|false]
         Four generator trials with observers disabled; capacity remains an explicit experimental request policy.
+    benchmark-gpu-paged-attention --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--max-tokens 16] [--context 16384] [--order abba|baab] [--warmup true|false] [--state-check false]
+        Stock versus identity page-table SDPA, both capacity256. State check requires ABBA, no warmup and at most 16 outputs.
     probe-gpu-session --model-dir PATH [--tokens-file PATH] --output NEW_REPORT_JSON
         Exercise typed generation API: invalid input, cancellation, callback failure, busy rejection, fresh-request recovery and scalar MTP.
     probe-gpu-mtp-state --model-dir PATH --output NEW_REPORT_JSON [--verification POLICY]

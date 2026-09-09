@@ -229,7 +229,8 @@ public final class GPUAttention {
                         verificationLinear: GPUVerificationLinear? = nil,
                         prefillMode: PrefillMode = .reference,
                         profiler: GPUProfiler? = nil,
-                        kvCapacityRowLimit: Int? = nil) throws -> Tensor {
+                        kvCapacityRowLimit: Int? = nil,
+                        pagedSDPAReader: GPUPagedSDPAReader? = nil) throws -> Tensor {
         guard x.shape.count == 3, x.shape[0] == 1, x.shape[1] > 0,
               x.shape[2] == 2560, x.dtype == MLX_BFLOAT16,
               state.offset >= 0, state.offset <= 262144 - x.shape[1],
@@ -238,6 +239,12 @@ public final class GPUAttention {
         }
         guard prefillMode == .reference || verificationLinear == nil else {
             throw GPUAttentionError.invalid("QSA prefill fusion cannot select verification kernels")
+        }
+        if let pagedSDPAReader {
+            guard x.shape[1] == 1, positionBase == 0, verificationLinear == nil,
+                  prefillMode == .reference, state.offset < pagedSDPAReader.maximumTokens else {
+                throw GPUAttentionError.invalid("Paged SDPA requires bounded ordinary S1 AR attention")
+            }
         }
         if let rowLimit = kvCapacityRowLimit {
             guard x.shape[1] == 1, positionBase == 0, verificationLinear == nil,
@@ -295,6 +302,9 @@ public final class GPUAttention {
         let sparseMask = try qsaMask(projectedIndex,state: &next,sequence: sequence,
                                      positionBase: positionBase,profiler: profiler)
         let attention = try measure("attention.sdpa",profiler: profiler,sequence: sequence,outputs: { [$0] }) {
+            if let pagedSDPAReader {
+                return try pagedSDPAReader.apply(queries: queries, keys: keys, values: values, mask: sparseMask)
+            }
             if prefillMode == .fusedQSA, let sparseMask, sequence > 8 {
                 // Preserve QSA's exact boolean visibility, including causal tails.
                 // The pinned MLX has a fused D256 kernel with an array mask, but

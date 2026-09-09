@@ -435,6 +435,8 @@ public final class QwenGenerator {
     private var mtpHead: QwenMTP?
     private let prefixCache: QwenPrefixCache?
     private let memoryPressure: QwenMemoryPressurePolicy?
+    /// Explicit per-generator AR experiment; never changes shared model defaults.
+    private let pagedSDPAReader: GPUPagedSDPAReader?
     /// Diagnostics only: readback here perturbs execution and is excluded from
     /// production timing trials. Do not mutate tensors or reenter generation.
     public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
@@ -467,8 +469,10 @@ public final class QwenGenerator {
 
     public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil,
                 prefixDiskStore: QwenPrefixDiskStore? = nil,
-                memoryPressurePolicy: QwenMemoryPressurePolicy? = nil) throws {
+                memoryPressurePolicy: QwenMemoryPressurePolicy? = nil,
+                pagedSDPAReader: GPUPagedSDPAReader? = nil) throws {
         self.model = model
+        self.pagedSDPAReader = pagedSDPAReader
         memoryPressure = memoryPressurePolicy
         guard prefixDiskStore == nil || prefixCacheLimits != nil else {
             throw QwenGenerationError.invalidRequest("SSD prefix cache requires prefix cache limits")
@@ -495,6 +499,17 @@ public final class QwenGenerator {
     /// capacity. Device health and exclusive access are checked at stage entry.
     public func validateRequest(_ request: QwenGenerationRequest) throws {
         try request.validate(configuration: model.configuration)
+        if let pagedSDPAReader {
+            guard request.mtpDepth == 0 else {
+                throw QwenGenerationError.invalidRequest("Paged SDPA reader supports ordinary AR only; MTP is unavailable")
+            }
+            // The final generated token is not forwarded; prefill is unchanged.
+            if request.maxTokens > 1 {
+                guard request.tokens.count + request.maxTokens - 1 <= pagedSDPAReader.maximumTokens else {
+                    throw QwenGenerationError.invalidRequest("Paged SDPA AR request exceeds initialized identity metadata bound")
+                }
+            }
+        }
         guard model.layerCount == model.configuration.layerCount else {
             throw QwenGenerationError.unavailable("generation requires all model layers and the output head")
         }
@@ -889,7 +904,7 @@ public final class QwenGenerator {
                     }
                     let out = try model.forward(tokens: [p.next], state: &p.state,
                         decodeMode: request.decodeMode, phase: .decode,
-                        kvCapacityPermit: kvCapacityPermit)
+                        kvCapacityPermit: kvCapacityPermit, pagedSDPAReader: pagedSDPAReader)
                     guard let logits = out.logits else { throw QwenGenerationError.unavailable("missing target logits") }
                     let selected = try model.greedyToken(logits)
                     try model.evaluate([selected], state: &p.state)
