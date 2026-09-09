@@ -1,0 +1,275 @@
+--- a/src/prefix_cache.zig
++++ b/src/prefix_cache.zig
+@@ -583,10 +583,10 @@
+         return self.commitWithSsm(source_cache, tokens, has_tools, null, null, null);
+     }
+ 
+-    /// Commit with optional SSM checkpoint array (Phase 1). The caller
+-    /// transfers ownership of the slice — the entry frees it on eviction via
+-    /// the shared `freeEntryOwnedState`. Pass null on plain-attention archs;
+-    /// the entry stays SSM-free.
++    /// Commit with optional SSM checkpoint array (Phase 1). Success consumes
++    /// the slice (including an oversized entry skipped without an error).
++    /// On error the caller still owns and must free it. Retained entries free
++    /// it on eviction via `freeEntryOwnedState`. Pass null on plain attention.
+     pub fn commitWithSsm(
+         self: *HotPrefixCache,
+         source_cache: *const KVCache,
+@@ -599,8 +599,8 @@
+         return self.commitWithState(source_cache, tokens, has_tools, 0, ssm_cps, dflash, mtp);
+     }
+ 
+-    /// Commit with SSM checkpoints; ownership of the payload transfers to
+-    /// the entry.
++    /// Commit with SSM checkpoints. Success consumes the incoming payload;
++    /// on error ownership remains with the caller, matching scheduler cleanup.
+     pub fn commitWithState(
+         self: *HotPrefixCache,
+         source_cache: *const KVCache,
+@@ -656,7 +656,29 @@
+         if (ssm_cps) |cps| {
+             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
+         }
+-        const new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
++        // Prefix extensions inherit checkpoints not superseded at the same
++        // position. Bill that complete merged payload BEFORE transferring any
++        // old ownership, so an oversized extension leaves the previous usable
++        // entry intact and releases only the incoming snapshot/checkpoints.
++        var inherited_ssm_bytes: u64 = 0;
++        var inherited_ssm_count: usize = 0;
++        if (replace_idx) |idx| {
++            if (self.entries.items[idx].ssm_checkpoints) |old_cps| {
++                for (old_cps) |*cp| {
++                    const superseded = if (ssm_cps) |new_cps| found: {
++                        for (new_cps) |new_cp| {
++                            if (new_cp.pos == cp.pos) break :found true;
++                        }
++                        break :found false;
++                    } else false;
++                    if (!superseded) {
++                        inherited_ssm_bytes += ssmCheckpointBytes(cp);
++                        inherited_ssm_count += 1;
++                    }
++                }
++            }
++        }
++        const new_bytes = new_kv_bytes + new_ssm_bytes + inherited_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
+         if (self.max_kv_bytes > 0 and new_bytes > self.max_kv_bytes) {
+             var snap = new_snap;
+             snap.deinit();
+@@ -677,10 +699,7 @@
+             snap.deinit();
+             if (new_dflash) |*d| d.deinit();
+             if (new_mtp) |*m3| m3.deinit();
+-            if (ssm_cps) |cps| {
+-                for (cps) |*cp| cp.deinit(self.allocator);
+-                self.allocator.free(cps);
+-            }
++            // Incoming checkpoints remain caller-owned on errors.
+             return err;
+         };
+ 
+@@ -708,45 +727,49 @@
+                     e.ssm_checkpoints = null;
+                     break :blk old;
+                 };
+-                // Both old and new have data. Concat into a sorted-by-pos,
+-                // dedup-by-pos list. Allocate fresh; transfer ownership.
+-                var merged = std.ArrayList(SSMCheckpoint).empty;
+-                errdefer {
+-                    for (merged.items) |*c| c.deinit(self.allocator);
+-                    merged.deinit(self.allocator);
+-                }
+-                // Detach old + new from their containers so we can move them.
++                // Reserve the exact merged length before detaching the old
++                // payload. After this allocation succeeds the ownership move
++                // cannot fail; a reservation failure preserves the old entry.
++                const merged = self.allocator.alloc(SSMCheckpoint, inherited_ssm_count + new.len) catch |err| {
++                    self.allocator.free(tokens_owned);
++                    var failed_snap = new_snap;
++                    failed_snap.deinit();
++                    if (new_dflash) |*d| d.deinit();
++                    if (new_mtp) |*m| m.deinit();
++                    // The scheduler frees incoming checkpoints on error.
++                    return err;
++                };
+                 e.ssm_checkpoints = null;
+-                // Walk both, picking lower pos each step; on tie, prefer the
+-                // new one and discard old (new is the more recently observed
+-                // state at that position).
+                 var i: usize = 0;
+                 var j: usize = 0;
++                var n: usize = 0;
+                 while (i < old.len or j < new.len) {
+                     if (i >= old.len) {
+-                        try merged.append(self.allocator, new[j]);
++                        merged[n] = new[j];
+                         j += 1;
+                     } else if (j >= new.len) {
+-                        try merged.append(self.allocator, old[i]);
++                        merged[n] = old[i];
+                         i += 1;
+                     } else if (old[i].pos < new[j].pos) {
+-                        try merged.append(self.allocator, old[i]);
++                        merged[n] = old[i];
+                         i += 1;
+                     } else if (old[i].pos > new[j].pos) {
+-                        try merged.append(self.allocator, new[j]);
++                        merged[n] = new[j];
+                         j += 1;
+                     } else {
+-                        // Same pos: keep new, drop old.
++                        // Same position: the new state supersedes the old.
+                         var dropped = old[i];
+                         dropped.deinit(self.allocator);
++                        merged[n] = new[j];
+                         i += 1;
+-                        try merged.append(self.allocator, new[j]);
+                         j += 1;
+                     }
++                    n += 1;
+                 }
++                std.debug.assert(n == merged.len);
+                 self.allocator.free(old);
+                 self.allocator.free(new);
+-                break :blk try merged.toOwnedSlice(self.allocator);
++                break :blk merged;
+             };
+ 
+             // Free everything the old entry owned EXCEPT the (now-detached)
+@@ -782,6 +805,15 @@
+             e.mtp_bytes = new_mtp_bytes;
+             e.last_used = self.bumpCounter();
+             self.current_kv_bytes += e.kv_bytes;
++            // A replacement can grow even when the entry count is unchanged.
++            // The entry itself passed the complete merged-size check above;
++            // evict older entries until the aggregate byte cap fits. Do not
++            // access `e` after eviction: swapRemove can relocate that entry.
++            if (self.max_kv_bytes > 0) {
++                while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
++                    self.evictOneLru("byte budget after prefix extension");
++                }
++            }
+             if (self.disk != null) self.disk_dirty = true;
+             self.logResident();
+             return;
+@@ -816,10 +848,7 @@
+             snap.deinit();
+             if (new_dflash) |*d| d.deinit();
+             if (new_mtp) |*m5| m5.deinit();
+-            if (ssm_cps) |cps| {
+-                for (cps) |*cp| cp.deinit(self.allocator);
+-                self.allocator.free(cps);
+-            }
++            // Incoming checkpoints remain caller-owned on errors.
+             return err;
+         };
+         self.current_kv_bytes += new_bytes;
+@@ -1721,3 +1750,107 @@
+     // RAM restore installed the SSM state just the same.
+     try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm2[0].conv_state, 0, s));
+ }
++
++
++// Tiny host-created SSM payloads exercise the real commit ownership and byte
++// accounting paths without model weights or GPU evaluation.
++fn pcBudgetCheckpoint(pos: usize, value: f32) ![]SSMCheckpoint {
++    const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
++    errdefer testing.allocator.free(layers);
++    const data: [8]f32 = @splat(value);
++    layers[0] = .{
++        .conv_state = mlx.mlx_array_new_data(&data, &[_]c_int{8}, 1, .float32),
++        .ssm_state = mlx.mlx_array_new(),
++        .initialized = true,
++    };
++    errdefer {
++        _ = mlx.mlx_array_free(layers[0].conv_state);
++        _ = mlx.mlx_array_free(layers[0].ssm_state);
++    }
++    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
++    cps[0] = .{ .pos = pos, .layers = layers };
++    return cps;
++}
++
++test "HotPrefixCache: prefix extension rejects oversized inherited checkpoints without losing old entry" {
++    var source = try KVCache.init(testing.allocator, 0);
++    defer source.deinit();
++    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 48);
++    defer hc.deinit();
++    const ids = [_]u32{ 1, 2, 3, 4, 5 };
++    try hc.commitWithSsm(&source, ids[0..3], false, try pcBudgetCheckpoint(2, 1.0), null, null);
++    try testing.expectEqual(@as(u64, 32), hc.current_kv_bytes);
++    // New payload is 32 bytes and fits alone; inherited old state makes the
++    // replacement 64 bytes. The old implementation admitted that oversize.
++    try hc.commitWithSsm(&source, &ids, false, try pcBudgetCheckpoint(4, 2.0), null, null);
++    try testing.expectEqual(@as(usize, 1), hc.entryCount());
++    try testing.expectEqual(@as(u64, 32), hc.current_kv_bytes);
++    try testing.expectEqualSlices(u32, ids[0..3], hc.entries.items[0].tokens);
++    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?[0].pos);
++    // Same-position replacement does not double-bill inherited state.
++    try hc.commitWithSsm(&source, &ids, false, try pcBudgetCheckpoint(2, 3.0), null, null);
++    try testing.expectEqual(@as(u64, 32), hc.current_kv_bytes);
++    try testing.expectEqualSlices(u32, &ids, hc.entries.items[0].tokens);
++    try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ssm_checkpoints.?.len);
++}
++
++test "HotPrefixCache: prefix extension evicts older entries when aggregate bytes grow" {
++    var source = try KVCache.init(testing.allocator, 0);
++    defer source.deinit();
++    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 80);
++    defer hc.deinit();
++    const ids = [_]u32{ 1, 2, 3, 4, 5 };
++    const other = [_]u32{ 8, 9, 10 };
++    try hc.commitWithSsm(&source, &other, false, try pcBudgetCheckpoint(2, 2.0), null, null);
++    try hc.commitWithSsm(&source, ids[0..3], false, try pcBudgetCheckpoint(2, 1.0), null, null);
++    try testing.expectEqual(@as(u64, 64), hc.current_kv_bytes);
++    // The extended entry fits at 64 bytes; keeping the other entry would
++    // consume 96 bytes. LRU removal can swap the replaced entry's location.
++    try hc.commitWithSsm(&source, &ids, false, try pcBudgetCheckpoint(4, 3.0), null, null);
++    try testing.expectEqual(@as(usize, 1), hc.entryCount());
++    try testing.expectEqual(@as(u64, 64), hc.current_kv_bytes);
++    try testing.expectEqualSlices(u32, &ids, hc.entries.items[0].tokens);
++    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?.len);
++    try testing.expect(hc.findBestMatch(&other, false, 0, kv_quant.KVQuantConfig.dense) == null);
++}
++
++
++test "HotPrefixCache: prefix extension allocation failures preserve caller and old checkpoint ownership" {
++    // Zero-layer snapshots allocate through `source.allocator`, not the hot
++    // cache's failing allocator. Its first request allocation is the token
++    // copy; its second is the exact merged-checkpoint reservation.
++    for ([_]usize{ 0, 1 }) |fail_index| {
++        var source = try KVCache.init(testing.allocator, 0);
++        defer source.deinit();
++        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 128);
++        defer hc.deinit();
++        const ids = [_]u32{ 1, 2, 3, 4, 5 };
++        try hc.commitWithSsm(&source, ids[0..3], false, try pcBudgetCheckpoint(2, 1.0), null, null);
++        const old_cps = hc.entries.items[0].ssm_checkpoints.?;
++        const old_layers = old_cps[0].layers;
++        const incoming = try pcBudgetCheckpoint(4, 2.0);
++        // This models the scheduler's error cleanup. The test allocator would
++        // catch a double-free if commit released the incoming payload too.
++        defer {
++            for (incoming) |*cp| cp.deinit(testing.allocator);
++            testing.allocator.free(incoming);
++        }
++        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
++        hc.allocator = failing.allocator();
++        defer hc.allocator = testing.allocator;
++        try testing.expectError(error.OutOfMemory, hc.commitWithSsm(&source, &ids, false, incoming, null, null));
++        try testing.expect(failing.has_induced_failure);
++        try testing.expectEqual(fail_index, failing.alloc_index);
++        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
++        try testing.expectEqual(@as(usize, 1), hc.entryCount());
++        try testing.expectEqual(@as(u64, 32), hc.current_kv_bytes);
++        try testing.expectEqualSlices(u32, ids[0..3], hc.entries.items[0].tokens);
++        const retained = hc.entries.items[0].ssm_checkpoints.?;
++        try testing.expect(retained.ptr == old_cps.ptr);
++        try testing.expect(retained[0].layers.ptr == old_layers.ptr);
++        try testing.expectEqual(@as(usize, 2), retained[0].pos);
++        try testing.expectEqual(@as(u64, 32), ssmCheckpointBytes(&retained[0]));
++        try testing.expectEqual(@as(usize, 4), incoming[0].pos);
++        try testing.expectEqual(@as(u64, 32), ssmCheckpointBytes(&incoming[0]));
++    }
++}

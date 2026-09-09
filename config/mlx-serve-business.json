@@ -1,0 +1,15 @@
+{
+  "binary": "../qwen38-ssd/runtime/mlx-serve/zig-business-20260910/bin/mlx-serve",
+  "model": "../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream",
+  "host": "127.0.0.1",
+  "port": 11235,
+  "context_tokens": 262144,
+  "prefill_chunk": 512,
+  "max_concurrent": 1,
+  "prefix_cache_entries": 8,
+  "prefix_cache_memory": "10GB",
+  "prefix_cache_disk": "0",
+  "ssm_checkpoint_stride": 8192,
+  "ssm_checkpoint_max": 2,
+  "timeout_seconds": 1800
+}

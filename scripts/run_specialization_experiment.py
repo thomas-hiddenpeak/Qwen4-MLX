@@ -150,7 +150,7 @@ finally:
             except Exception as error:
                 restoration['error'] = f'Retained reference readiness failed: {error}'
         status.update(phase='ready_reference_retained_after_specialization' if restoration['ready'] else 'reference_restore_needs_attention',
-                      server_retained=restoration['ready'], updated_utc=now())
+                      server_retained=restoration['ready'], reference_ledger=str(OUT / 'run-ledger.json'), updated_utc=now())
         save()
         STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
         assert restoration['ready'], 'Could not verify retained reference; no new model was started'
@@ -171,7 +171,8 @@ finally:
             time.sleep(1)
         if stop_signal is not None: ledger['interrupted_signal'] = stop_signal
         save()
-        status.update(phase='ready_reference_restored_after_specialization' if restoration['ready'] else 'reference_restore_needs_attention', updated_utc=now())
+        status.update(phase='ready_reference_restored_after_specialization' if restoration['ready'] else 'reference_restore_needs_attention',
+                      reference_ledger=str(OUT / 'run-ledger.json'), updated_utc=now())
         STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
         assert restoration['ready'], 'Could not verify restored reference'
         print('Reference ready: PID ' + str(server.pid), flush=True)

@@ -8,6 +8,8 @@ python3 scripts/run_specialization_experiment.py /absolute/path/controller-plan.
 
 执行计划的 `cases` 必须是含 `name`、`command` 的平铺列表，`reference_ledger` 指向最近一次已核验恢复记录，输出目录不能已有 run-ledger。MTP 的嵌套窗口分析计划含 task/budget/processes，不能直接执行；控制器会在暂停参考前拒绝这种结构。运行前还核对参考 PID/精确 argv、状态文件、空闲 metrics 和关闭 MTP/drafter/PLD 的参数。不要绕过单 GPU 所有者的约定启动第二个控制器。
 
+2026-09-10 起，常驻 mlx-serve 采用[业务配置](MLX_SERVE_SERVICE.md)：原生 262144-token 上限和热前缀缓存。新计划从 `../qwen38-ssd/results/experiment-status.json` 的 `reference_ledger` 读取当前记录，再核验其 ready/PID/argv；每次实验恢复都会更新此指针。历史 4096-token、关闭缓存的 argv 仅是旧基线，不得用来覆盖当前服务。实验 case 如需禁用缓存，应在该 case 的独立进程中配置，结束后仍恢复业务服务原参数。
+
 ## 所有权与中断顺序
 
 每个 case 用 `Popen(start_new_session=True)` 创建独立 session/process group，立即记录 Popen PID 与相同的 PGID。清理只向这个新组发送信号，不使用 controller 的父进程组，不按进程名查杀，也不从历史报告取 PID 发信号。case 的模型后代必须保留该组，不能自行 setsid/daemonize；当前 Python HTTP harness 的模型子进程遵守这一约定。

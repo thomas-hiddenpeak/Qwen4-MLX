@@ -1,0 +1,2 @@
+# Unified diffs contain a single-space prefix on unchanged blank lines.
+patches/mlx-serve/*.patch -whitespace
