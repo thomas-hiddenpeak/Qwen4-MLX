@@ -90,6 +90,8 @@ struct RunnerCLI {
                 try benchmarkGPUKVCapacity(arguments)
             case "benchmark-gpu-paged-attention":
                 try benchmarkGPUPagedAttention(arguments)
+            case "probe-gpu-paged-kv-pool":
+                try probeGPUPagedKVPoolMechanism(arguments)
             case "generate-gpu":
                 try generateGPU(arguments)
             case "probe-gpu-phase-handoff":
@@ -350,6 +352,8 @@ struct RunnerCLI {
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
     probe-gpu-kv-capacity --diagnostics-library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
         Model-free Swift capacity allocation/ARC diagnostic; default eval sync. Run in an exclusive GPU window.
+    probe-gpu-paged-kv-pool --library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
+        Model-free physical page sharing, immutable tails, direct SDPA and GPU lifetime checks; diagnostic timing only.
     probe-gpu-kv-capacity-model --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
         Actual generator correctness, RAM restore, workspace fallback and callback cancellation; diagnostic timing only.
     benchmark-gpu-kv-capacity --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON

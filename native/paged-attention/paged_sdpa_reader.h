@@ -2,12 +2,23 @@
 #include <mlx/array.h>
 #include <mlx/stream.h>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace anemlx::paged {
 constexpr int page_tokens = 32, query_heads = 24, kv_heads = 2, head_dim = 256;
 enum class StorageKind { PageMajor, HeadMajor };
+struct ReaderLifetime {
+  std::shared_ptr<const void> owner;
+  std::optional<mlx::core::array> dependency;
+  std::function<void()> validate;
+  std::function<void()> submitted;
+  std::function<void()> encoded;
+  std::function<void(bool)> observed_status;
+  std::function<void(bool)> completed;
+};
 
 // Construct once from small scheduler metadata; no tensor readback in reader.
 // The immutable page IDs are copied into a private MLX graph input. Inputs are
@@ -26,7 +37,7 @@ class PageTable {
   friend mlx::core::array read(
       const mlx::core::array&, const mlx::core::array&, const mlx::core::array&,
       const PageTable&, StorageKind, const std::optional<mlx::core::array>&,
-      mlx::core::Stream);
+      mlx::core::Stream, ReaderLifetime);
 };
 
 struct DispatchInfo {
@@ -72,5 +83,5 @@ mlx::core::array read(
     const PageTable& table,
     StorageKind storage,
     const std::optional<mlx::core::array>& mask,
-    mlx::core::Stream stream);
+    mlx::core::Stream stream, ReaderLifetime lifetime = {});
 }  // namespace anemlx::paged

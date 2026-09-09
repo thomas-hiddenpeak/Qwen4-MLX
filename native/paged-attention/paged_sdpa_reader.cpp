@@ -58,13 +58,16 @@ void require_group(MTL::ComputePipelineState* kernel, MTL::Size group) {
 }
 class Reader final : public mx::UnaryPrimitive {
  public:
-  Reader(mx::Stream stream, int n, int physical, StorageKind kind, bool mask)
-      : UnaryPrimitive(stream), n_(n), physical_(physical), kind_(kind), mask_(mask) {}
+  Reader(mx::Stream stream, int n, int physical, StorageKind kind, bool mask,
+         ReaderLifetime lifetime = {})
+      : UnaryPrimitive(stream), n_(n), physical_(physical), kind_(kind), mask_(mask),
+        lifetime_(std::move(lifetime)) {}
   const char* name() const override { return "ANEMLXPagedSDPAVector32"; }
   void eval_cpu(const std::vector<mx::array>&, mx::array&) override {
     throw std::runtime_error("Paged SDPA reader is GPU-only");
   }
   void eval_gpu(const std::vector<mx::array>& inputs, mx::array& output) override {
+    if (lifetime_.validate) lifetime_.validate();
     const auto& q = inputs[0]; const auto& k = inputs[1]; const auto& v = inputs[2];
     require(q.flags().row_contiguous && inputs[3].flags().row_contiguous,
             "Evaluated query/page-table layout must be row-contiguous");
@@ -94,6 +97,19 @@ class Reader final : public mx::UnaryPrimitive {
     require_group(kernel, group);
     output.set_data(mx::allocator::malloc(output.nbytes()));
     auto& enc = mx::metal::get_command_encoder(stream());
+    if (lifetime_.owner || lifetime_.completed) {
+      enc.get_command_buffer()->addCompletedHandler(
+          [owner = lifetime_.owner, dependency = lifetime_.dependency,
+           observed_status = lifetime_.observed_status,
+           completed = lifetime_.completed](MTL::CommandBuffer* cb) mutable {
+            const bool success = cb->status() != MTL::CommandBufferStatusError;
+            if (observed_status) observed_status(success);
+            dependency.reset();
+            owner.reset();
+            if (completed) completed(success);
+          });
+      if (lifetime_.submitted) lifetime_.submitted();
+    }
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(q, 0); enc.set_input_array(k, 1); enc.set_input_array(v, 2);
     enc.set_input_array(inputs[3], 19);
@@ -107,6 +123,7 @@ class Reader final : public mx::UnaryPrimitive {
       if (mask_) bind_mask(enc, inputs[4], 11, 13);
       enc.dispatch_threadgroups(MTL::Size(24, 1, 1), group);
       encoded_read_count.fetch_add(1, std::memory_order_relaxed);
+      if (lifetime_.encoded) lifetime_.encoded();
       return;
     }
     // Exactly the local MLX partial layout and BF16 intermediate quantization.
@@ -133,6 +150,7 @@ class Reader final : public mx::UnaryPrimitive {
     enc.set_output_array(output, 3); enc.set_bytes(blocks, 4);
     enc.dispatch_threadgroups(MTL::Size(24, 1, 1), MTL::Size(1024, 1, 1));
     encoded_read_count.fetch_add(1, std::memory_order_relaxed);
+    if (lifetime_.encoded) lifetime_.encoded();
   }
  private:
   static void bind_mask(mx::metal::CommandEncoder& enc, const mx::array& mask, int slot, int strides) {
@@ -141,6 +159,7 @@ class Reader final : public mx::UnaryPrimitive {
     enc.set_bytes(token, strides); enc.set_bytes(zero, strides + 1); enc.set_bytes(zero, strides + 2);
   }
   int n_, physical_; StorageKind kind_; bool mask_;
+  ReaderLifetime lifetime_;
 };
 }  // namespace
 
@@ -184,7 +203,7 @@ DispatchInfo dispatch_info(int n, mx::Stream stream) {
 
 mx::array read(const mx::array& q, const mx::array& k, const mx::array& v,
                const PageTable& table, StorageKind kind, const std::optional<mx::array>& mask,
-               mx::Stream stream) {
+               mx::Stream stream, ReaderLifetime lifetime) {
   require(stream.device.type == mx::Device::gpu, "Reader needs an explicit GPU stream");
   require(q.shape() == mx::Shape({1, 24, 1, 256}) && q.dtype() == mx::bfloat16, "Invalid query shape/dtype");
   require(kind == StorageKind::PageMajor || kind == StorageKind::HeadMajor, "Invalid storage kind");
@@ -203,8 +222,10 @@ mx::array read(const mx::array& q, const mx::array& k, const mx::array& v,
             "Expected logical boolean QSA mask [1,1,1,T]");
     inputs.push_back(*mask);
   }
+  if (lifetime.dependency) inputs.push_back(*lifetime.dependency);
   return mx::array({1, 24, 1, 256}, mx::bfloat16,
-      std::make_shared<Reader>(stream, table.tokens_, table.physical_pages_, kind, mask.has_value()),
+      std::make_shared<Reader>(stream, table.tokens_, table.physical_pages_, kind,
+                               mask.has_value(), std::move(lifetime)),
       std::move(inputs));
 }
 

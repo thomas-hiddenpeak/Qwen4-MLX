@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the isolated paged-reader mechanism probe; never execute it.
+"""Build the isolated paged reader or physical KV pool; never execute it.
 
 Reuses the installed MLX compile flags and no-fast-math Metal recipe. Copies
 only candidate sources, builds new objects/metallib/executable in a fresh
@@ -32,7 +32,7 @@ def file_record(path):
     return {"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
 
 
-def build(source_dir, output, runtime, bridge_dir=None):
+def build(source_dir, output, runtime, bridge_dir=None, pool=False):
     source_dir, output, runtime = (p.resolve() for p in (source_dir, output, runtime))
     bridge_dir = bridge_dir.resolve() if bridge_dir is not None else None
     roots = [runtime, source_dir] + ([bridge_dir] if bridge_dir else [])
@@ -42,17 +42,25 @@ def build(source_dir, output, runtime, bridge_dir=None):
         raise ValueError("Output already exists; choose a fresh directory")
     # This is a small standalone candidate, not a general source-tree builder.
     sources = sorted(p for p in source_dir.iterdir() if p.is_file())
-    if not sources or len(sources) > 16 or any(p.is_symlink() for p in sources):
-        raise ValueError("Expected at most 16 regular candidate files without symlinks")
-    cpp = [p for p in sources if p.suffix == ".cpp" and p.name != "paged_sdpa_bridge.cpp"]
-    shaders = [p for p in sources if p.suffix == ".metal"]
+    if not sources or len(sources) > 24 or any(p.is_symlink() for p in sources):
+        raise ValueError("Expected at most 24 regular candidate files without symlinks")
+    cpp_names = {"paged_sdpa_reader.cpp", "paged_sdpa_probe.cpp"}
+    shader_names = {"paged_sdpa_vector.metal"}
+    if pool:
+        cpp_names.update(("immutable_page_pool.cpp", "paged_kv_pool.cpp"))
+        shader_names.add("paged_kv_pool.metal")
+    cpp = [p for p in sources if p.name in cpp_names]
+    shaders = [p for p in sources if p.name in shader_names]
+    if {p.name for p in cpp} != cpp_names or {p.name for p in shaders} != shader_names:
+        raise ValueError("Missing required reader/pool source files")
     if not 1 <= len(cpp) <= 4 or not 1 <= len(shaders) <= 4:
         raise ValueError("Expected 1..4 standalone C++ and 1..4 Metal source files")
     bridge_inputs = []
+    bridge_name = "paged_kv_pool_bridge" if pool else "paged_sdpa_bridge"
     if bridge_dir:
-        bridge_inputs = [bridge_dir / name for name in ("paged_sdpa_bridge.cpp", "paged_sdpa_bridge.h")]
+        bridge_inputs = [bridge_dir / (bridge_name + suffix) for suffix in (".cpp", ".h")]
         if any(not p.is_file() or p.is_symlink() for p in bridge_inputs):
-            raise ValueError("Bridge directory must contain regular paged_sdpa_bridge.cpp/.h files")
+            raise ValueError("Bridge directory must contain regular " + bridge_name + ".cpp/.h files")
         if "paged_sdpa_reader.cpp" not in [p.name for p in cpp]:
             raise ValueError("Shared bridge requires the separate paged_sdpa_reader.cpp source")
         if any(p.name == s.name and p != s for p in bridge_inputs for s in sources):
@@ -74,11 +82,11 @@ def build(source_dir, output, runtime, bridge_dir=None):
     report = {
         "schema": "qwen-paged-reader-native-build-v1", "status": "preparing",
         "source_dir": str(source_dir), "output_root": str(output), "runtime": str(runtime),
-        "bridge_dir": str(bridge_dir) if bridge_dir else None,
+        "bridge_dir": str(bridge_dir) if bridge_dir else None, "physical_pool": pool,
         "developer_dir": os.environ.get("DEVELOPER_DIR"),
         "pinned_stamp": (stage / ".version").read_text().strip(),
         "stock_install_equivalence": equivalence,
-        "scope": "Standalone native probe and optional reader-only shared bridge; no installed library/object/AIR changes or reuse",
+        "scope": "Standalone reader probe and optional reader/pool shared bridge; no installed library/object/AIR changes or reuse",
         "metal_fast_math": False, "gpu_workload_started": False,
         "probe_executed": False, "numerical_validation": "not_run", "performance_validation": "not_run",
         "commands": [], "original_compile_entry": entries[0],
@@ -98,7 +106,7 @@ def build(source_dir, output, runtime, bridge_dir=None):
 
         metallib = output / "lib/paged_reader.metallib"
         probe = output / "bin/paged-reader-probe"
-        shared_library = output / "lib/paged_reader.dylib" if bridge_dir else None
+        shared_library = output / ("lib/paged_kv_pool.dylib" if pool else "lib/paged_reader.dylib") if bridge_dir else None
         library_id = "anemlx_paged_reader_" + hashlib.sha256(
             "".join(item["sha256"] for item in copied_inputs).encode()).hexdigest()[:32]
         cpp_commands, objects, metal_commands, airs = [], [], [], []
@@ -107,6 +115,8 @@ def build(source_dir, output, runtime, bridge_dir=None):
             obj = output / "obj" / (path.name + ".o")
             command = compile_argv(entries[0], original, output / "src" / path.name, obj, metallib)
             command = [arg for arg in command if arg != "-DMLX_EXPORT" and not arg.startswith("-DMETAL_PATH=")]
+            if pool:
+                command = ["-std=c++20" if arg.startswith("-std=") else arg for arg in command]
             command.extend(["-I" + str(output / "src"),
                             "-DANEMLX_PAGED_METALLIB=" + json.dumps(str(metallib)),
                             "-DANEMLX_PAGED_LIBRARY_ID=" + json.dumps(library_id)])
@@ -114,8 +124,8 @@ def build(source_dir, output, runtime, bridge_dir=None):
             objects.append(obj)
         bridge_object = None
         if bridge_dir:
-            bridge_object = output / "obj/paged_sdpa_bridge.cpp.o"
-            command = compile_argv(entries[0], original, output / "src/paged_sdpa_bridge.cpp", bridge_object, metallib)
+            bridge_object = output / ("obj/" + bridge_name + ".cpp.o")
+            command = compile_argv(entries[0], original, output / ("src/" + bridge_name + ".cpp"), bridge_object, metallib)
             command = [arg for arg in command if arg != "-DMLX_EXPORT" and not arg.startswith("-DMETAL_PATH=")]
             command.extend(["-I" + str(output / "src"), "-I" + str(runtime / "lib/mlxc-src"),
                             "-I" + str(stage / "include")])
@@ -136,12 +146,12 @@ def build(source_dir, output, runtime, bridge_dir=None):
         commands = [*cpp_commands, *metal_commands, metal_link, link]
         linked = [probe]
         if shared_library:
-            # Exactly reader + thin C bridge: never link the probe's main or
+            # Reader/pool core + thin C bridge: never link the probe's main or
             # test fixture objects into the library loaded by Swift.
             commands.append([cpp_commands[0][0], "-dynamiclib", "-arch", "arm64", "-mmacosx-version-min=26.2",
                              "-Wl,-undefined,error", "-Wl,-headerpad_max_install_names",
-                             "-Wl,-install_name,@rpath/paged_reader.dylib", "-Wl,-rpath," + str(stage / "lib"),
-                             str(output / "obj/paged_sdpa_reader.cpp.o"), str(bridge_object), str(stock),
+                             "-Wl,-install_name,@rpath/" + shared_library.name, "-Wl,-rpath," + str(stage / "lib"),
+                             *[str(obj) for obj in objects if obj.name != "paged_sdpa_probe.cpp.o"], str(bridge_object), str(stock),
                              "-framework", "Metal", "-framework", "Foundation", "-o", str(shared_library)])
             linked.append(shared_library)
         for binary in linked:
@@ -186,8 +196,10 @@ def build(source_dir, output, runtime, bridge_dir=None):
             exports = output / "logs/bridge-exports.log"
             run_command(["/usr/bin/nm", "-gU", str(shared_library)], output, exports, report["commands"])
             symbols = exports.read_text().splitlines()
-            for suffix in ("version", "last_error", "create", "free", "metadata_bytes", "encoded_reads", "read", "dispatch_info"):
-                if not any(line.endswith(" T _anemlx_paged_sdpa_" + suffix) for line in symbols):
+            prefix = "anemlx_paged_kv_pool_" if pool else "anemlx_paged_sdpa_"
+            exports = ("version", "last_error", "create", "free", "import", "fork", "append", "state_free", "state_info", "page_ids", "ready", "read", "materialize", "statistics") if pool else ("version", "last_error", "create", "free", "metadata_bytes", "encoded_reads", "read", "dispatch_info")
+            for suffix in exports:
+                if not any(line.endswith(" T _" + prefix + suffix) for line in symbols):
                     raise ValueError("Missing shared bridge C export: " + suffix)
         changed = [item["path"] for item in report["original_inputs"] if sha256(item["path"]) != item["sha256"]]
         if changed:
@@ -209,7 +221,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, default=PREP)
     parser.add_argument("--output", type=Path, required=True, help="Fresh output directory")
-    parser.add_argument("--bridge-dir", type=Path, help="Optional thin C bridge source directory; also builds paged_reader.dylib")
+    parser.add_argument("--bridge-dir", type=Path, help="Optional C bridge directory; builds paged_reader.dylib or, with --pool, paged_kv_pool.dylib")
+    parser.add_argument("--pool", action="store_true", help="Build the physical shared-page pool and its optional bridge")
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     parser.add_argument("--developer-dir", type=Path, default=DEFAULT_DEVELOPER)
     args = parser.parse_args()
@@ -217,7 +230,7 @@ def main():
         parser.error("A full Xcode Developer directory is required for Metal compilation")
     os.environ["DEVELOPER_DIR"] = str(args.developer_dir.resolve())
     try:
-        report = build(args.source_dir, args.output, args.runtime, args.bridge_dir)
+        report = build(args.source_dir, args.output, args.runtime, args.bridge_dir, args.pool)
     except BuildFailed as error:
         print(json.dumps({"status": "failed", "error": str(error), "exit_code": error.exit_code}), file=sys.stderr)
         return error.exit_code
