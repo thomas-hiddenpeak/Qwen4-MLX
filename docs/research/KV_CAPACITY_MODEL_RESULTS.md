@@ -4,6 +4,12 @@
 
 首次转换/增长先由模型联合额度申请额外workspace permit，绑定model/session/offset并只消费一次；额度不足安全回退concat。许可由实际decode步骤保留至同步完成或错误恢复之后。正常生成不会加载独立allocation诊断库；物理机制证据另见[Swift机制验证](KV_SWIFT_CAPACITY_MECHANISM.md)。
 
+## 缓存存储与计费边界
+
+RAM保存及恢复通过`privatePrefixStateCopy`对所有持久张量做独立gather复制，构造新State并完成evaluate，不直接把带私有capacity helper的State加入缓存；缓存lease按紧凑逻辑payload计费。SSD导出验证完整descriptor的shape/dtype/nbytes，仅序列化逻辑长度，空余容量行不进入归档。已接收的异步IO继续持有Data及workspace lease，超时、取消等待或删除索引不提前释放它们。
+
+请求预算为末端紧凑状态的old/new allowance，转换或增长另有workspace；K/V、QSA raw与pooled分别跟踪retained extent。以上已做独立源码审查，未发现生成器管理路径中的新漏计问题，但不是物理峰值证明。公开State/Tensor被外部调用者任意保留时不会自动增加ledger lease；allocator缓存、通用activation、投影视图padding和RSS仍需独立观测。实际HTTP检查点在prefill边界发布，普通decode不会自动保存每个capacity状态。
+
 ## 数值与生命周期
 
 release二进制`cea597c4d4d4ff56a991f78b0142d39e9fa510c80e14712b0280a4abebe08ac6`通过6项新增CPU许可检查、19项既有请求/预算检查及5项实际GPU State测试（无skip）。GPU测试覆盖public K/V替换、nil替换、旧state/view不可变、KV与QSA raw各自extent及重复小裁切。

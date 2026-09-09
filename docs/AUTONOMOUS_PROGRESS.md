@@ -2,6 +2,8 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+08:21 更新：现有105分钟controller继续运行，未新增模型进程或重建。08:19观察工作段901.314秒、83成功/8取消、客户端errors0，两次周期drain；SSD实际已有25次restore/61次eviction（含初始填充），writeFailure/corruption/logdrop均0，logical peak1,954,740,180B/4GiB，OS通知仍0。全部是中途观测，不是最终验收。独立`results/kv-capacity-accounting-review/REVIEW.md`核对容量追加→紧凑RAM保存/恢复→SSD逻辑payload及异步lease，11源码/测试SHA由root重核；未发现运行时拥有链路的新漏计，不是RSS证明，没有源码修复候选。root另逐段读公开base/phase及capacity terminal validator，最终仍按原对账顺序执行，不以配置可见替代实际步骤。存储/计费边界已补入完整模型结果文档；所有409冻结文件保持不变，截止与收尾约定不变。
+
 08:10 接续：`4b2b45e`公开churn、`18b136df431c5051f1e497f00376ff928dc46d77` HTTP显式容量开关均已推送且remote SHA一致。controller真实PID77783/session22551，wrapper PGID77821，server77822/11260；只读sidecar PID77997/session54107。10个oracle通过，soak从wrapper客户端elapsed120.134秒开始；首个周期drain已发生，当前仍运行，不能提前验收。阶段commit后重新核对409个冻结SHA无变化。禁止新controller/build/冻结文件编辑；下轮继续已有会话。最后一次约09:42的heartbeat应保持当前turn观察到收尾或截止，不提前结束等待可能已超出UNTIL的下一轮；需要中断只能TERM已验证的自有controller77783并等finally恢复，不能kill controller或其他服务。
 
 结束后的公开容量工具已准备在`results/kv-capacity-http-public-candidate/`：`promotion-map.json`列出逐字镜像到`scripts/run_http_capacity_churn.py`、`scripts/capacity_http_validation.py`、`scripts/test_capacity_http_validation.py`，10项CPU discovery和独立导入/字节审阅通过。**只在本轮postflight解除冻结后**提升，再从公开目录定向复跑10项CPU，不需重建GPU。参照同目录PROMOTION.md及当前复跑文档完成真实105分钟结果记录；现阶段全部待最终验收。截止09:56:04必须暂停现有`qwen4-mlx` heartbeat，保存完整字段，不新建automation。
