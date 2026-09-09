@@ -23,12 +23,15 @@ extension RunnerCLI {
             "--prefix-cache-bytes", "--prefix-cache-entries", "--prefix-cache-directory",
             "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes",
             "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds",
-            "--prefix-cache-shutdown-timeout-seconds"])
+            "--prefix-cache-shutdown-timeout-seconds", "--kv-append-mode"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
             }
             return n
+        }
+        guard let kvAppendMode = GPUAttention.KVAppendMode(rawValue: args["--kv-append-mode"] ?? "reference") else {
+            throw CLIError.usage("--kv-append-mode must be reference or capacity256")
         }
         let prefixCacheBytes = try number("--prefix-cache-bytes", 536_870_912, 0...8_589_934_592)
         let prefixCacheDirectory: URL?
@@ -62,7 +65,8 @@ extension RunnerCLI {
             prefixCacheMinFreeBytes: try number("--prefix-cache-min-free-bytes", 1_073_741_824, 0...Int.max),
             prefixCacheRestoreTimeoutSeconds: try number("--prefix-cache-restore-timeout-seconds", 5, 1...300),
             prefixCacheShutdownTimeoutSeconds: try number("--prefix-cache-shutdown-timeout-seconds", 30, 1...300),
-            stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max))
+            stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max),
+            kvAppendMode: kvAppendMode)
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
         // general CLI catch's synchronous stderr write after a sink failure.
@@ -78,6 +82,7 @@ private struct GPUHTTPConfiguration: Sendable {
     let prefixCacheMinFreeBytes, prefixCacheRestoreTimeoutSeconds: Int
     let prefixCacheShutdownTimeoutSeconds: Int
     let stateBudgetBytes: Int
+    let kvAppendMode: GPUAttention.KVAppendMode
     var prefixDiskLimits: QwenPrefixDiskLimits {
         .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes,
               minAvailableBytes: prefixCacheMinFreeBytes)
@@ -357,6 +362,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 "prefix_cache_policy": configuration.prefixCacheBytes == 0 ? NSNull() : [
                     "lookup": "complete_canonical_prompt", "maximum_checkpoints_per_request": 2,
                     "checkpoint_grid_tokens": 416, "mtp_enabled": false] as Any,
+                "kv_append_policy": [
+                    "kv_append_mode": configuration.kvAppendMode.rawValue,
+                    "scope": "autoregressive_decode_only", "prefill_uses_capacity": false,
+                    "mtp_kv_append_mode": "reference"],
                 "prefix_cache_shutdown_timeout_seconds": configuration.prefixCacheShutdownTimeoutSeconds,
                 "state_budget": h.stateBudgetJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "mlx_memory": h.mlxMemory as Any? ?? NSNull(),
@@ -729,7 +738,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     let request = QwenGenerationRequest(tokens: tokens, maxTokens: work.chat.maxTokens,
                         contextLimit: 16_384, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
                         verification: work.chat.mtpDepth == 2 ? .batchedScalarLinear : .scalar,
-                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCachePlan: prefixPlan)
+                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCachePlan: prefixPlan,
+                        kvAppendMode: work.chat.mtpDepth == 0 ? configuration.kvAppendMode : .reference)
                     let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
                         self.health.withLock { $0.runningJob = active.schedulerID?.uuidString }
@@ -837,6 +847,13 @@ private final class GPUHTTPServer: @unchecked Sendable {
         let work = active.work
         var modelFields: [String: Any] = ["model_kind": event.kind.rawValue, "stage": event.stage.rawValue,
             "scheduler_elapsed_seconds": finite(event.timing.elapsedSeconds)]
+        // The completed result supplies the selected policy and evaluated step counts.
+        // Failed/cancelled events without a result have unknown execution counts.
+        let terminalPhases = event.result?.phases
+        modelFields["kv_append_mode"] = terminalPhases?.kvAppendMode as Any? ?? NSNull()
+        modelFields["kv_capacity_token_steps"] = terminalPhases?.kvCapacityTokenSteps as Any? ?? NSNull()
+        modelFields["kv_capacity_workspace_fallbacks"] = terminalPhases?.kvCapacityWorkspaceFallbacks as Any? ?? NSNull()
+        modelFields["kv_capacity_workspace_peak_bytes"] = terminalPhases?.kvCapacityWorkspacePeakBytes as Any? ?? NSNull()
         if let result = event.result {
             modelFields["model_finish_reason"] = result.finishReason.rawValue
             modelFields["prompt_tokens"] = result.statistics.promptTokenCount
