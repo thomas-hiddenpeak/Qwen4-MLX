@@ -1,6 +1,6 @@
 # KV cache 本机运行与维护
 
-适用：`1ca481b` 的 Swift/MLX HTTP AR 服务。恢复单位是 Attention KV/QSA、GDN、PLE 与历史的完整状态。详细合同及分版本证据见[缓存可靠性](KV_CACHE_RELIABILITY.md)；接口与固定限额见[HTTP 服务](HTTP_SERVER_EXPERIMENT.md)。
+适用：当前 Swift/MLX HTTP AR 服务。恢复单位是 Attention KV/QSA、GDN、PLE 与历史的完整状态。详细合同及分版本证据见[缓存可靠性](KV_CACHE_RELIABILITY.md)；接口与固定限额见[HTTP 服务](HTTP_SERVER_EXPERIMENT.md)。
 
 ## 启动
 
@@ -21,6 +21,8 @@ KV_CACHE_PARENT="$(cd "$HOME/Library/Caches/Qwen4-MLX" && pwd -P)"
 ```
 
 这是 512 MiB RAM / 8 GiB SSD / 4 GiB 联合逻辑状态额度的示例，SSD另保留至少1 GiB可用空间。已有缓存末级目录必须属于服务UID且group/other无权限，推荐0700；CLI先规范化路径、解析符号链接，store再逐组件以O_NOFOLLOW打开物理路径。省略SSD目录及SSD专属参数就是RAM-only；`--prefix-cache-bytes 0`关闭RAM，同时不能启用SSD。服务仅监听127.0.0.1，加载期间`/health`返回503，等`status=ready`再送请求。
+
+容量追加由启动参数`--kv-append-mode capacity256`显式开启，默认仍为`reference`；只用于AR decode，prefill及显式MTP请求保持原路径，尚非Paged KV。核对`/health`的`kv_append_policy`，以及completed模型终态的`kv_append_mode`、`kv_capacity_token_steps`、`kv_capacity_workspace_fallbacks`和`kv_capacity_workspace_peak_bytes`。最后一项是额外workspace逻辑预留峰值，不能当作RSS或MLX实际峰值；失败/取消没有完整result时这些字段可能为null。
 
 ## 看是否命中、是否排空
 

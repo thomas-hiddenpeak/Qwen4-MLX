@@ -2,6 +2,10 @@
 
 ## 2026-09-09 八小时自主窗口：KV 管理批次 C 读优先回归
 
+08:10 接续：`4b2b45e`公开churn、`18b136df431c5051f1e497f00376ff928dc46d77` HTTP显式容量开关均已推送且remote SHA一致。controller真实PID77783/session22551，wrapper PGID77821，server77822/11260；只读sidecar PID77997/session54107。10个oracle通过，soak从wrapper客户端elapsed120.134秒开始；首个周期drain已发生，当前仍运行，不能提前验收。阶段commit后重新核对409个冻结SHA无变化。禁止新controller/build/冻结文件编辑；下轮继续已有会话。最后一次约09:42的heartbeat应保持当前turn观察到收尾或截止，不提前结束等待可能已超出UNTIL的下一轮；需要中断只能TERM已验证的自有controller77783并等finally恢复，不能kill controller或其他服务。
+
+结束后的公开容量工具已准备在`results/kv-capacity-http-public-candidate/`：`promotion-map.json`列出逐字镜像到`scripts/run_http_capacity_churn.py`、`scripts/capacity_http_validation.py`、`scripts/test_capacity_http_validation.py`，10项CPU discovery和独立导入/字节审阅通过。**只在本轮postflight解除冻结后**提升，再从公开目录定向复跑10项CPU，不需重建GPU。参照同目录PROMOTION.md及当前复跑文档完成真实105分钟结果记录；现阶段全部待最终验收。截止09:56:04必须暂停现有`qwen4-mlx` heartbeat，保存完整字段，不新建automation。
+
 08:04 更新：完整模型容量策略已推送`a7db110`。HTTP显式`--kv-append-mode capacity256`已集成并release构建49.06秒通过，非法mode在加载模型前明确拒绝；默认reference，MTP仍走reference，15项接线与8类生命周期独立静态审查未发现阻断。唯一controller/session22551已于08:01:15启动`results/kv-capacity-http-105m/plan.json`，工作段6300秒，端口11260、服务77822、wrapper/PGID77821，case timeout6738秒。409文件/102模型stat冻结，binary=`31daa9b372634b5a7163e3a99a16957c316d6efe4a0dd589ae7b0ba0eaa9db44`；结束前不改Sources/Tests/scripts/native/已冻结ignored wrapper或重建，不启动第二GPU任务。参考77076已由controller暂停，结束后只用本轮新的restoration ledger。只读telemetry/session54107从08:02:30开始，30秒采样/max240，记录自己的实际partial时间窗。预计09:49左右结束，09:56:04截止，最后20分钟只收尾。
 
 公开churn v2的4脚本与复跑文档已在冻结前按manifest提升；root以公开base/phase重新审计C3完整755终态通过，16+6分析器CPU及9parser检查通过，原C3结果不覆写。公开base默认拒绝未完成结果，final read intent/liveFlight及close/退出/采样合同更严格；实际snapshot输入SHA绑定。新HTTP服务验收尚在运行，不能继承旧C3的两小时证明。结束顺序：等待controller与sidecar→409hash/102stat postflight→公开base完整对账→phase→telemetry摘要→capacity-terminal-validation独立复核→文档/commit/push/恢复核验→截止前暂停heartbeat。容量wrapper/helper公开副本仅在ignored准备，必须本轮解冻后才提升。
