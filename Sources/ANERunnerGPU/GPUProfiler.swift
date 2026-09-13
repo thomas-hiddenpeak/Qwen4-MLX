@@ -38,6 +38,7 @@ public final class GPUProfiler {
     public struct Report: Codable {
         public let mode: Mode
         public var phaseFilter: QwenExecutionPhase? = nil
+        public var minimumPosition: Int? = nil
         public let attentionBreakdown: Bool?
         public let moeBreakdown: Bool?
         public let stages: [Stage]
@@ -48,6 +49,8 @@ public final class GPUProfiler {
     }
     public let mode: Mode
     public let phaseFilter: QwenExecutionPhase?
+    /// Inclusive absolute forward-start offset. Nil preserves all positions.
+    public let minimumPosition: Int?
     public let attentionBreakdown: Bool
     public let moeBreakdown: Bool
     public var isRecording: Bool { mode != .disabled && recordingEnabled }
@@ -62,10 +65,14 @@ public final class GPUProfiler {
 
     public init(mode: Mode = .disabled, allocatorSnapshots: Bool = false, maximumRecords: Int = 4096,
                 attentionBreakdown: Bool = false, moeBreakdown: Bool = false,
-                phaseFilter: QwenExecutionPhase? = nil) throws {
+                phaseFilter: QwenExecutionPhase? = nil, minimumPosition: Int? = nil) throws {
         guard maximumRecords > 0 else { throw GPUError.invalid("Profiler record limit must be positive") }
+        if let minimumPosition, minimumPosition < 0 {
+            throw GPUError.invalid("Profiler minimum position must be nonnegative")
+        }
         self.mode = mode
         self.phaseFilter = phaseFilter
+        self.minimumPosition = minimumPosition
         self.allocatorSnapshots = allocatorSnapshots
         self.maximumRecords = maximumRecords
         self.attentionBreakdown = attentionBreakdown
@@ -101,6 +108,9 @@ public final class GPUProfiler {
                            logicalWeightBytes: UInt64? = nil,
                            outputs: (T) -> [Tensor], _ body: () throws -> T) throws -> T {
         if !isRecording || (phaseFilter != nil && phase != phaseFilter) { return try body() }
+        // Keep isRecording independent of this window: QwenModel uses it to
+        // decide whether to set the next forward context in the first place.
+        if let minimumPosition, position.map({ $0 < minimumPosition }) ?? true { return try body() }
         guard !active, !name.isEmpty, tokenCount > 0 else {
             throw GPUError.invalid("Invalid or nested profiler stage")
         }
@@ -160,7 +170,7 @@ public final class GPUProfiler {
     }
 
     public var report: Report {
-        Report(mode: mode,phaseFilter: phaseFilter,attentionBreakdown: attentionBreakdown,moeBreakdown: moeBreakdown,stages: stages,droppedRecords: droppedRecords,
+        Report(mode: mode,phaseFilter: phaseFilter,minimumPosition: minimumPosition,attentionBreakdown: attentionBreakdown,moeBreakdown: moeBreakdown,stages: stages,droppedRecords: droppedRecords,
                actualDRAMBytesAvailable: false,deviceOnlyTimeAvailable: false,
                notes: [
                 "hostBodyMilliseconds is host closure wall time: usually lazy graph construction, but includes any explicit I/O/evaluation inside the body.",
@@ -169,6 +179,7 @@ public final class GPUProfiler {
                 "Synchronized stages remove normal overlap and may change allocator reuse. Their totals are not undisturbed prefill or decode latency.",
                 "phase and position identify the enclosing trunk forward, including a final S1 prefill. Detailed attention or MoE stages replace the corresponding outer stage and are not added to an inclusive parent.",
                 "When phaseFilter is set, unmatched or absent forward context runs without profiler clocks, synchronization, output collection or allocator snapshots.",
+                "minimumPosition is an inclusive forward-start offset. Earlier or absent positions run only the body; chunks crossing the boundary are not split, and isRecording remains unchanged.",
                 "startedUptimeNanoseconds and endedUptimeNanoseconds use DispatchTime uptime, matching command timing. They bound elapsedMilliseconds after the preceding drain and before the final allocator snapshot; failed stages are excluded from performance analysis.",
                 "Allocator active/cache/peak are capacity counters, not DRAM traffic. logicalWeightBytes is a caller-supplied estimate, not hardware bytes.",
                 "No DRAM read/write or physical SSD byte counter is exposed by this helper. No bandwidth is inferred from allocations or model sizes."

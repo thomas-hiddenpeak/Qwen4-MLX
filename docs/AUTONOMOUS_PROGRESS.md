@@ -1,5 +1,19 @@
 # 自主研究与开发接续
 
+04:49 最后两项实机回归已结束，进入05:00前收尾。`results/night-final-small-v1`绑定最终binary `91d626264dbfdbbd40d5c22bc6c4292a9ead873ec0c89ac7a71f2d01e1861117`：80项选定CPU测试、2项profiling参数早拒绝通过；64K旧格式SSD正常恢复通过14055项独立审计及38项历史对照，实际约1.915GB文件的121个payload hash与先前cold oracle一致，最终state预算及lease归零。没有真实OOM/Metal故障注入。
+
+32K末段profile通过：1123条记录、288个attention子阶段完整，无失败/丢失；P32766输出IDs `[16,11]`、实际decode1、最终offset32767。两个bulk块中SDPA占attention子阶段elapsed约59.32%/57.67%，选块mask约8.21%/8.43%；不能当整模型或无观察器吞吐。详见[profiling结果与后续kernel方向](research/LONG_PREFILL_PROFILE.md)。两case及控制器均退出0，04:44:27 postflight核对577文件/102模型stat无变化；参考PID80349精确argv、ready/idle、MTP/drafter关闭。它是原作者11235业务服务，Swift测试进程均已退出。
+
+后续继续以KV管理为主：按[流式SSD实施计划](research/KV_STREAMING_SSD_PLAN.md)完成单tensor有界传输和真实生命周期，先小归档状态/故障回归再放行完整262K；当前262K仅已验证CLI/HTTP与RAM缓存，SSD仍有2GiB归档上限。attention优化另按实际profile先做同Q/K/V/mask单层数值诊断，不放宽fusedQSA既有58/121失败门槛。真实业务可区分输出、发布配置长稳和实际系统压力仍待完成，MTP性能继续后置。以下04:40及更早内容是历史接续快照，不应重复启动已结束控制器。
+
+04:40 接续：优化后完整262K CLI已完成，`results/ram-restore-reference262-v1`的P262142/O2、RAM B262080/实际suffix62、cold/warm各1轮真正decode及最终offset262143通过。binary为`9eb775401b96350a8265dcbbba9d9b13a3c4a1cf96d23ee7cc2a6bc749e0b90c`。独立6579检查全过；与旧`da457…`基线的13214项检查全过，6组121张量共726记录、全部host及IDs`[16,11]`/finish严格相等。每请求结束仅留有效cache7506284552B/1lease，最终清cache后所有state预算/lease0；预算峰值23327859736B。
+
+本轮cold/warm诊断prefill为2342.269821405s/2.739274625s；RAM restore为3.410ms（旧274.385ms），warm业务allocator prefill峰值少591.855MiB，decode峰值不变。cold比旧样本少111.963s不归因于RAM修改；这些不是无观察器吞吐/RSS/DRAM计数。79份有效footprint采样覆盖2341.708s、采样最大94726841848B，thermal nominal2/fair78，不作跨不同覆盖基线的RSS收益结论。详见[完整结果和计时口径](research/KV_LONG_CONTEXT_RESULTS.md)。
+
+probe退出0，04:34:30 postflight核对575个冻结文件/102个模型payload stat无变化，参考PID79025按精确argv恢复，idle且MTP/drafter关闭；这是该轮快照，不是当前服务PID承诺。**根代理随后启动的最后一轮32K profile与64K v1 SSD正常路径回归仍在测试，尚未完成其postflight和验收。** 当前源码及运行输入继续按该控制器冻结，其他agent不得build/GPU或编辑活跃树；完整262K通过不能替代最后这轮验证。SSD恢复错误分类仅收窄model import的typed archive invalidation，底层IO broad catch和已消费backend错误的模型可用性仍是独立缺口，不能扩大为全部故障恢复完成。
+
+05:00截止与服务恢复、阶段commit/push及未完成项归档要求保持；此更新不宣称全夜工作结束。MTP性能仍后置，完整262K SSD流式持久化仍是计划。以下04:01及更早条目保留为历史记录，已完成的full262控制器不应重复启动。
+
 04:01 更新：`9e380e7`已提交、推送并核对远端SHA。RAM compact snapshot共享恢复、合法1–2GiB SSD导入修复、262K真实HTTP及请求进度已进入主线。183项相关CPU、capacity/paged短实模全状态、实际1.915GB SSD归档恢复及独立payload校验通过；`results/ram-restore-http262-v3`的6成功+1取消、P262142/O2及P262112/O32前后31decode、RAM B262080复用、边界与资源合同通过独立原始响应审计。随后`results/live-progress-http-v1`的36项CPU与226次健康采样通过冷/热、部分prefill取消及恢复，573文件/102模型stat postflight无变化，参考74518按原argv恢复。
 
 当前唯一GPU控制器为`results/ram-restore-reference262-v1/plan.json`，03:54:16开始，exec session84592、模型PID74998；二进制`9eb775401b96350a8265dcbbba9d9b13a3c4a1cf96d23ee7cc2a6bc749e0b90c`、Sources/Tests/scripts/native及输入保持冻结，不能build或改代码。该轮要补优化后完整262K的121张量/host与旧`da457…`基线逐项比较，尚未完成。参考74518由控制器暂停，结束后先完成postflight并恢复精确argv。只读30秒telemetry为session26471，不能当DRAM计数或连续峰值。

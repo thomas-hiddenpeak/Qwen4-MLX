@@ -10,8 +10,13 @@ public struct QwenPrefixStateArchiveDescriptor: Codable, Equatable, Sendable {
 
     public enum ValidationError: Error, LocalizedError, Equatable {
         case invalid(String)
+        /// Only archive-controlled decoding/structure failures after the local
+        /// import layout, offset and payload allowance have been validated.
+        case invalidArchive(String)
         public var errorDescription: String? {
-            switch self { case .invalid(let message): return "Prefix archive: " + message }
+            switch self {
+            case .invalid(let message), .invalidArchive(let message): return "Prefix archive: " + message
+            }
         }
     }
 
@@ -170,12 +175,38 @@ public struct QwenPrefixStateArchiveDescriptor: Codable, Equatable, Sendable {
     public static func decodeAndValidate(_ metadata: Data, expectedLayout: Layout,
                                          expectedOffset: Int, actualPayloadBytes: Int,
                                          maxPayloadBytes: Int = QwenPrefixStateArchiveDescriptor.defaultMaximumPayloadBytes) throws -> Self {
-        guard !metadata.isEmpty, metadata.count <= maximumMetadataBytes else {
-            throw ValidationError.invalid("metadata limit exceeded")
+        // A valid archive rejected by a caller's layout, offset or allowance
+        // is not evidence of disk corruption. Derive the required size from
+        // the model before inspecting any archive-controlled fields.
+        let requiredBytes = try estimatedLogicalPayloadBytes(layout: expectedLayout, offset: expectedOffset)
+        guard (1...absoluteMaximumPayloadBytes).contains(maxPayloadBytes),
+              requiredBytes <= maxPayloadBytes, actualPayloadBytes >= 0 else {
+            throw ValidationError.invalid("invalid import allowance or payload byte count")
         }
-        let descriptor = try JSONDecoder().decode(Self.self, from: metadata)
-        try descriptor.validate(expectedLayout: expectedLayout, expectedOffset: expectedOffset,
-                                actualPayloadBytes: actualPayloadBytes, maxPayloadBytes: maxPayloadBytes)
+        guard !metadata.isEmpty, metadata.count <= maximumMetadataBytes else {
+            throw ValidationError.invalidArchive("metadata limit exceeded")
+        }
+        let descriptor: Self
+        do { descriptor = try JSONDecoder().decode(Self.self, from: metadata) }
+        catch let error as DecodingError {
+            throw ValidationError.invalidArchive("metadata decoding failed: \(error)")
+        }
+        do {
+            try descriptor.validate(expectedLayout: expectedLayout, expectedOffset: expectedOffset,
+                                    actualPayloadBytes: actualPayloadBytes, maxPayloadBytes: maxPayloadBytes)
+        } catch ValidationError.invalid(let message) {
+            // validate() keeps its existing local/export contract. Here its
+            // local arguments are already checked, leaving only file content.
+            throw ValidationError.invalidArchive(message)
+        }
         return descriptor
+    }
+
+    /// Shared CPU-only disk invalidation policy. Arbitrary device, admission,
+    /// cancellation or later promotion errors do not establish a bad archive.
+    public static func isInvalidArchive(_ error: Error) -> Bool {
+        guard let error = error as? ValidationError else { return false }
+        if case .invalidArchive = error { return true }
+        return false
     }
 }

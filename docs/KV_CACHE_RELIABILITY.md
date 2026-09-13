@@ -6,6 +6,8 @@
 
 操作步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)，本页保留完整合同与分版本证据。
 
+2026-09-14新增[262144 CLI/HTTP与RAM共享恢复实测](research/KV_LONG_CONTEXT_RESULTS.md)，以及[SSD导入错误分类修复](research/KV_SSD_FAILURE_CLASSIFICATION.md)：后者只依据typed内容错误失效归档，80项选定CPU测试及实际约1.9GB归档的完整状态/文件恢复通过。底层IO错误分类和真实设备故障恢复仍未完成。[大SSD流式方案](research/KV_STREAMING_SSD_PLAN.md)是后续实现计划，当前不支持262K SSD归档恢复。
+
 ## C3 两小时持续淘汰验证（2026-09-09）
 
 运行源码 `1ca481b`、二进制 SHA256 `78036ae494a196f9c8e26b4b61d0e6b992fb54bcf393dfa89304795847cfac23` 完成 **7205.783 秒工作段**，另有模型加载、10个冷参考请求和最终排空。期间 `e74ac1d` 只改文档，未改变运行源码。配置为 RAM160 MiB、SSD1 GiB、联合逻辑状态额度4 GiB，8个不同10k+长前缀与2个短前缀的独立归档合计3,118,656,042 B，为SSD额度的2.904倍。4个client workers配合30k在途prompt额度，并不代表4个长请求同时驻留。

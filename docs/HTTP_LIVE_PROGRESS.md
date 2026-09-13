@@ -8,6 +8,8 @@
 
 2026-09-14 的 `results/live-progress-http-v1` 使用 binary `9eb775401b96350a8265dcbbba9d9b13a3c4a1cf96d23ee7cc2a6bc749e0b90c`，36项相关CPU测试通过。真实P11053/O32请求、RAM命中B10816、独立P11058的部分prefill取消以及再次命中原缓存全部通过；226次健康采样检查字段、请求ID、阶段、单调计数、缓存口径及最终清理。三次完整输出一致，结束后列表为空、request/workspace归零。服务正常退出，573个冻结文件和102个模型payload stat复核无变化，参考服务恢复原argv。该短测试不证明最大队列压力或耐久能力，也不作为吞吐基准。
 
+独立审计重新解析原始JSON/SSE、226条health、四个唯一模型终态及输入分词；三次完成各有31次decode，final offset11084，热请求实际计算237 token。取消发生在416/11058的部分prefill，输出计数为0，之后对应ID消失。最终保留366366728B有效RAM及一个cache lease，日志排空。审计 `independent-progress-audit.json` 的SHA256为 `2f19b7c53f2f85e72fcc3bee2c00f40e36b7b6d74030d64a8b61deed5c7b326d`。217个busy样本的旧`running_job`仍为null且known=false；本改动提供新字段，未修复或重新定义旧字段。
+
 可对一个新启动、空RAM、reference attention、关闭SSD/paging的自有测试服务运行：
 
 ```sh

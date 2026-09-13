@@ -1,6 +1,6 @@
 # 独立 Runner 长上下文与 RAM 前缀缓存结果
 
-2026-09-14。**当前已完成32K数值筛选、64K及完整262144 reference CLI冷/热RAM验证，以及RAM恢复优化版本的真实262144 HTTP容量、缓存复用和取消恢复验收。** `fusedQSA` 的32K跨模式数值门槛失败，默认继续使用 `reference`。本页汇总同一增量的证据和后续优先级，不把准备好的代码、脚本或静态分析当成实测通过。
+2026-09-14。**当前已完成32K数值筛选、64K及完整262144 reference CLI冷/热RAM验证、RAM恢复优化版本的真实262144 HTTP验收，以及优化后262K CLI与旧基线的全状态对照。** `fusedQSA` 的32K跨模式数值门槛失败，默认继续使用 `reference`。本页汇总同一增量的证据和后续优先级，不把准备好的代码、脚本或静态分析当成实测通过。
 
 这里的模型上限是 **262144 tokens（256 Ki tokens）**，指完整渲染提示词与请求输出预算之和，**不是265000 tokens**。缓存命中不减少该逻辑长度。合成重复文本用于容量与状态一致性检查，不代表真实长文、工具或coding-agent业务质量。
 
@@ -47,12 +47,14 @@ da457be460df0e5158b71f4f9d1e3c924f4616e25f33dd1bbfbe888e9a741e00
 
 以下只记录带诊断观察器的阶段墙钟，扣除观察器区间；不是无观察器的吞吐验收，也不从一次decode换算稳定tokens/s：
 
-| 场景 | 冷prefill / warm实际suffix prefill | 冷decode / warm decode（各一次） |
+| 场景 | 冷prefill / warm实际suffix prefill | 冷decode round / warm decode round（各一次） |
 | --- | ---: | ---: |
-| 32K reference | 47.911s / 1.509s | 0.930s / 0.045s |
-| 32K fusedQSA | 43.484s / 1.096s | 0.934s / 0.040s |
-| 64K reference | 158.220s / 1.436s | 0.884s / 1.034s |
-| 262144 reference | 2454.232s / 3.115s | 1.034s / 1.016s |
+| 32K reference | 47.911s / 1.509s | 0.901s / 0.042s |
+| 32K fusedQSA | 43.484s / 1.096s | 0.931s / 0.038s |
+| 64K reference | 158.220s / 1.436s | 0.842s / 1.005s |
+| 262144 reference | 2454.232s / 3.115s | 0.942s / 0.916s |
+
+本表decode统一采用原始`decode_round_seconds_excluding_diagnostics`，即生成器`decodeSeconds`扣除普通decode观察器时间；不是纯kernel耗时。另一个`decode_step_wall_seconds_excluding_diagnostics`计完整step API墙钟并扣其观察器区间，仍含不同范围的回调/收尾开销：262144旧基线分别为1.033847166s/1.015845916s，因此不能与本表的0.942458750s/0.916147042s混用。
 
 64K的业务allocator prefill峰值为83842793714字节（cold）和83702683508字节（warm），包含已驻留模型；它不是进程RSS或stateBudget上限。诊断复制峰值另列，均不冒充物理DRAM流量。上述完成窗口最终request/cache/workspace及lease均归零，不能据此断言任意压力、超时或长期运行已经合格。
 
@@ -90,7 +92,7 @@ O2 warm实际恢复字段为0.005057750s；这不是与旧CLI 0.274s在相同观
 
 物理页配置若另行启用，当前native逻辑上限131072 tokens；更长请求必须在设备写入前选择整游标dense fallback，并核对没有长前缀native导入。无需先扩大页池，才能验证262144的dense服务。现有2GiB SSD归档上限及旧式全量Data路径仍保留；本页不声称支持262K SSD持久化或恢复。
 
-## RAM恢复优化：短回归与HTTP通过，CLI全状态对照待补
+## RAM恢复优化：短回归、HTTP与262K CLI全状态对照通过
 
 这是前述`da457…`容量基线之后的独立增量。RAM恢复改为只在已压紧的私有cache Snapshot上调用内部`forkCompactRAMPrefixState`：新请求创建新session identity，共享48个immutable attention K/V/QSA Tensor引用，73个GDN/PLE张量仍私有复制。保存与发布仍执行完整私有拷贝；public fork、SSD归档格式和全部request/cache/workspace预算不因共享而减少。该入口拒绝空状态及paged状态，不能用shape/stride相似就把任意外部或capacity state当作compact来源。
 
@@ -108,15 +110,41 @@ RAM修改、SSD导入限额窄修复及其探针采用同一组合release二进�
 | --- | --- | --- |
 | capacity256 / RAM恢复 / 预算回退 / 取消 | 74组状态、8954个BF16张量记录；74组完整host与已接受历史报告严格一致，输出与同轮reference/历史对应结果一致；最终budget/lease0 | 通过，独立记录复核无失败 |
 | M2真实paged prefix cache | 133组状态、16093个BF16张量记录、14个完成trial；同轮冷参考及不同suffix oracle一致，历史对应state/host/输出严格一致 | 通过；物理page IDs与时间不作跨运行相等要求 |
-| 优化后262144 CLI全121状态cold/warm及对baseline比较 | `results/ram-restore-reference262-v1`（计划） | **PENDING**：HTTP已经通过，CLI诊断全状态重放与受控性能对照仍须单独完成；不能沿用旧binary的baseline通过 |
+| 优化后262144 CLI全121状态cold/warm及对baseline比较 | `results/ram-restore-reference262-v1`，binary `9eb775…`；6组anchor/726个BF16记录及全部host与旧基线严格相等 | **通过**：独立6579项检查、跨版本13214项检查均无失败；计时和allocator差异仅描述本轮样本，详见下文 |
 | 优化后的真实262144 HTTP | `results/ram-restore-http262-v3/http` | **通过**：匹配最终binary的原生chat fixture，cold/warm、O32、取消/恢复、边界拒绝与资源合同完成；HTTP不暴露全121 state hash |
 | 合法大于1GiB的SSD实模恢复 | `results/ram-restore-short-v1/ssd.json` | **通过**：7组状态/847张量与历史64K cold匹配，实际归档121个payload hash独立一致，详见下节 |
 
-短回归原始数据为 `results/ram-restore-short-v1/capacity.json`、`paged.json`、`cpu.log` 和 `run-ledger.json`；独立记录为 `independent-capacity-analysis-v1.json`、`independent-paged-analysis-v1.json`、`independent-paged-historical-comparison-v1.json`。独立工作重新配对已记录hash/host/完整输出，未重跑GPU。两类短回归支持本改动没有破坏这些既有分支和回收路径；短回归本身不能证明优化后262K全121状态、实际内存压力或吞吐已经合格；长HTTP另由前节真实验证支持。短回归整批完成后，`postflight.json`核对572个冻结文件和102个模型payload stat，无变化；参考服务以PID69588恢复，精确原argv、idle及MTP/drafter关闭均核实。
+短回归原始数据为 `results/ram-restore-short-v1/capacity.json`、`paged.json`、`cpu.log` 和 `run-ledger.json`；独立记录为 `independent-capacity-analysis-v1.json`、`independent-paged-analysis-v1.json`、`independent-paged-historical-comparison-v1.json`。独立工作重新配对已记录hash/host/完整输出，未重跑GPU。两类短回归支持本改动没有破坏这些既有分支和回收路径；短回归本身不能证明优化后262K全121状态、实际内存压力或吞吐已经合格；长HTTP由前节支持，优化后CLI全状态另由下文完整实测支持。短回归整批完成后，`postflight.json`核对572个冻结文件和102个模型payload stat，无变化；参考服务以PID69588恢复，精确原argv、idle及MTP/drafter关闭均核实。
+
+### 优化后262144 CLI：完整基线对照通过
+
+本轮完整重放使用二进制`9eb775401b96350a8265dcbbba9d9b13a3c4a1cf96d23ee7cc2a6bc749e0b90c`，包含上述RAM恢复优化及后续HTTP请求进度增量；与旧`da457…`基线使用相同真实token输入（SHA256 `0933af4a03c648ba1c1ac84ad02310040e4b6069d90a247850dead6e2f3b183e`），P262142/O2/B262080、chunk416/eval4、reference AR、24GiB state预算/8GiB RAM缓存，SSD及paged关闭。cold/warm都产生完整IDs`[16,11]`、length结束、实际decode1和offset262143；warm从RAM恢复262080，仅实际计算62。
+
+`results/ram-restore-reference262-v1/model.json`为`complete=true, passed=true`；`independent-analysis.json`通过6579项检查，`independent-baseline-comparison.json`通过13214项检查，均0失败。后者对两份完整报告先各自审计，再逐项比较cold/warm的B、P、P+1六个anchor：**726个BF16 tensor记录、全部host字段及完整输出与旧基线严格相等**。独立工作只读取原始JSON，没有重新执行GPU。
+
+| 同一fixture的诊断指标 | 旧基线 `da457…` | 本轮 `9eb775…` |
+| --- | ---: | ---: |
+| cold prefill活动时间 | 2454.232353087s | 2342.269821405s |
+| warm prefill活动时间（实际62 tokens） | 3.114880958s | 2.739274625s |
+| warm target forward | 2.838359624s | 2.734099166s |
+| warm RAM restore | 0.274384875s | 0.003410000s |
+| cold / warm decode round（各一次） | 0.942458750s / 0.916147042s | 0.875742083s / 0.832787417s |
+| cold业务allocator prefill峰值 | 95510718306B | 95510719194B |
+| warm业务allocator prefill峰值 | 95261783216B | 94641177912B |
+
+warm恢复字段由274.385ms降至3.410ms；warm prefill峰值少620605304B（591.855MiB），warm decode allocator峰值94398816178B不变。cold prefill相差111.963s（约4.56%），**不将冷请求波动归因于RAM恢复修改**。各指标扣除对应观察器区间，仍是单轮诊断；不是无观察器吞吐、物理复制字节、DRAM带宽或RSS。尤其不能把约6.936GiB的模型推导复制量当成同等实测峰值下降。
+
+两次请求结束时都只保留7506284552B有效RAM快照/1个lease，request与workspace为0；最终清缓存后request/cache/workspace/total/currentLeases全部为0，state逻辑预算峰值23327859736B、rejections0。模型/allocator仍驻留，不能把账本归零说成进程内存归零。probe退出0；2026-09-13 20:34:30 UTC的postflight核对575个冻结文件和102个模型payload stat，mismatches为空；参考服务以PID79025恢复，精确原argv、idle及MTP/drafter关闭均核实。该PID只是本轮恢复快照，下一控制器可能已再次接管。
+
+只读telemetry有79份有效进程样本，覆盖2341.708424459s，采样footprint最大94726841848B；80次thermal读取为nominal2/fair78，最后ESRCH与模型正常退出一致。它不是连续峰值、RSS、DRAM计数或性能因果证据；覆盖范围不同的旧基线不能用于宣称RSS改善。`telemetry-summary.json`单列采样限制。
+
+新模型报告SHA256为`74237018b7b3449fbad98e4d27e75db1048503d2cd23bc2244696ec3cd364b10`；独立分析为`f3bf6ca95352a621ec0778d58714de1c4ade5f68406d8dd4b5881f0cd11f11e6`；基线比较为`ea4196efcd4aa1dcf91e6b45953e67a8489abbc835ba602ceab99ad2321d2c3f`。最后一轮独立二进制的[32K末段profile](LONG_PREFILL_PROFILE.md)与[64K旧格式SSD正常恢复](KV_SSD_FAILURE_CLASSIFICATION.md)也已完成并通过各自独立检查；本段的全262K状态与时间仍绑定`9eb775…`，不转记到其他版本，也不扩大到业务质量、耐久或262K SSD支持。
 
 前两次HTTP未完成的来源均保留：v1在启动前正确拒绝旧`43de3b6e…`分词fixture与最终`5b1653ce…`binary不一致，wrapper退出2，未启动测试server。重新分词后的v2通过三项400/413边界，随后客户端记录`event("request_start", name=...)`与helper形参`name`冲突，抛出`TypeError: event() got multiple values for argument 'name'`，尚未开始正常推理请求。修复仅将记录helper形参改为`event_name`，没有修改Swift运行时或放宽门槛。v2 client退出1、server退出0并恢复参考服务；不能记为模型推理失败或完整验收通过。最终v3使用同一`5b1653ce…`binary和匹配fixture，通过完整流程。v1和v3均记录610文件/102模型stat不变，分别绑定各自postflight。
 
 ## 合法1–2GiB SSD导入回归：通过
+
+完整262K SSD的后续格式、单tensor暂存、线程及关闭寿命方案见[流式SSD实施计划](KV_STREAMING_SSD_PLAN.md)。该方案尚未实现，也不扩大本页已验证的1–2GiB旧格式能力。
 
 旧cache恢复调用沿用模型import的1GiB默认值，与已显式配置并获准读写的1–2GiB归档不一致，可能把有效文件当恢复失败并安排失效。窄修复仅传入当前模型与checkpoint offset推导的确切logical payload上限，保留全部descriptor/shape/offset校验和2GiB绝对上限；不提高默认512MiB pending额度，也不实现流式读写。
 
@@ -144,11 +172,11 @@ RAM修改、SSD导入限额窄修复及其探针采用同一组合release二进�
 
 **性能解释受配置限制。** 此SSD探针未像旧64K baseline那样把MLX allocator cache限为256MiB；实际cold/warm观察到的cache分别为28472652548B/28472800004B（约28.47GB），累计allocator peak83826949872B。带诊断的cold/warm请求墙钟为303.154s/6.794s，恢复字段0.322210125s；不将这些数值与旧baseline直接横比，不据此宣称RAM共享更慢、SSD更快或RSS下降。state逻辑ledger峰值9587421224B、最终归零，也不能代表该allocator驻留已释放。
 
-本项通过的是现有全量Data路径、同进程同model的新generator恢复，不能改称跨重启、262K SSD、持续decode性能或流式支持。SIGINT/SIGTERM为协作取消，正在执行的GPU/系统调用不会被强行打断；该probe具备有界取消清理分支，但本次成功运行没有执行取消故障注入。HTTP已按前节完成有限窗口验收；优化后262K CLI全121状态及受控baseline性能对照仍待补。
+本项通过的是现有全量Data路径、同进程同model的新generator恢复，不能改称跨重启、262K SSD、持续decode性能或流式支持。SIGINT/SIGTERM为协作取消，正在执行的GPU/系统调用不会被强行打断；该probe具备有界取消清理分支，但本次成功运行没有执行取消故障注入。HTTP已按前节完成有限窗口验收；优化后262K CLI全121状态和已记录阶段/allocator与基线的逐项比较也已完成。最后`91d626…`二进制的64K旧格式SSD回归另已独立通过14055项审计和38项历史比较，详见[错误分类修复及最终回归](KV_SSD_FAILURE_CLASSIFICATION.md)，不把其他版本的结果自动继承。
 
 ## 后续三项优先级
 
-1. **先巩固reference容量与RAM可靠性。** CLI容量和上述有限HTTP窗口已通过，下一步补优化后CLI全121状态对照、真实业务与更长运行窗口；工业发布目标仍包含262144总窗口与前缀缓存。对已压紧的RAM快照，已按上述增量只在restore时共享48个immutable attention Tensor引用，GDN/PLE仍私有复制、新session identity；保存、SSD及预算合同不变。必须单独对照全121状态、分支/clear/取消、恢复时间与真实峰值；capacity首次有效写入必须换入私有buffer。该修改已进入上述组合版本并通过短回归与262144 HTTP；CLI全状态对照及实际复制/峰值/恢复时间收益仍待单独比较；不能忽略suffix concat仍可能复制整个前缀。[现有完整状态与缓存合同](../KV_CACHE_RELIABILITY.md)优先于性能调整。
+1. **先巩固reference容量与RAM可靠性。** CLI容量、上述有限HTTP窗口及优化后CLI全121状态对照已通过，下一步是实际业务与更长运行窗口；工业发布目标仍包含262144总窗口与前缀缓存。对已压紧的RAM快照，已按上述增量只在restore时共享48个immutable attention Tensor引用，GDN/PLE仍私有复制、新session identity；保存、SSD及预算合同不变。必须单独对照全121状态、分支/clear/取消、恢复时间与真实峰值；capacity首次有效写入必须换入私有buffer。该修改已进入主线并通过短回归、262144 HTTP和完整CLI跨版本状态对照；本轮记录restore及allocator差异，但没有直接测量物理复制字节或完成重复无观察器性能验收，不能忽略suffix concat仍可能复制整个前缀。[现有完整状态与缓存合同](../KV_CACHE_RELIABILITY.md)优先于性能调整。
 2. **再减少长prefill实际稀疏算术。** 保留现有QSA selector/top512四token块及0–3个因果尾，直接按query gather至最多2051行，按时间升序、validity mask及GQA共享执行QK/softmax/PV。262144/2051约127.8倍仅是这两次矩阵乘的算术减少上限；selector、MoE/GDN/PLE、KV复制、gather和同步成本仍在。Q8的K/V gather有效载荷约33.6MB，但整块416的惰性图可能累计约1.75GB，必须用真实求值与owner边界限制暂存。先核对相同selector成员/score/权重/输出，再过32K/64K已有数值与cold/warm门槛，最后才测无观察器prefill；不绕过本轮58项失败。[阶段分离](../PREFILL_DECODE_SEPARATION.md)与[attention存储边界](KV_ATTENTION_STORAGE_DESIGN.md)继续适用。
 3. **最后扩展大SSD流式读写。** 先在现有大小限制内建立单缓冲（起步8MiB）、ack/背压、FD/epoch/SHA及预算所有权，再做小上下文121状态roundtrip；通过后才允许新路径的大归档。完整目标State仍需预约约7GiB，额外host staging才应随chunk有界；把文件上限与在途buffer额度分开，禁止只是把1MiB读取循环追加到全量Data。最终校验前不发布半状态，取消/clear/超时后实际IO仍持有FD和lease；保留`fsync→rename→目录fsync`发布与旧格式隔离。大文件写成功、RAM命中或增大配置都不构成262K SSD恢复通过。[SSD队列](KV_SSD_QUEUE_DESIGN.md)和[超时所有权](KV_SSD_TIMEOUT_VALIDATION.md)是必须保留的合同。MTP继续排在这些工作之后。
 

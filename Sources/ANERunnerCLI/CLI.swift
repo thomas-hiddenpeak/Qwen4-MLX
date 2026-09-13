@@ -366,6 +366,8 @@ struct RunnerCLI {
         GDN tuning library: --gdn-gemv-mode reference|bm4|rows4|bm2|bm1|gemm|gemmSplit|prefetch4|prefetch4Vector or --gdn-gemv-order CSV
         Profiling: --profile-stages disabled|hostBodyOnly|synchronizedStages
         Optional stage filter: --profile-phase prefill|decode|verification (requires profiling; default all phases)
+        Attention stage detail: --profile-attention true|false (default false; requires profiling)
+        Profile window: --profile-from-token N (inclusive forward-start offset; 0 <= N < prompt tokens; requires profiling)
         Routing diagnostic: --capture-verification-routing true (D2 scalar-linear, one request, at most 128 output tokens; profiling disabled)
         System telemetry: --telemetry-dir NEW_PATH [--telemetry-interval-ms 200]
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
@@ -419,6 +421,9 @@ struct RunnerCLI {
         --mode screen|full --context 32768|65536|262144 --max-tokens 2|8
         screen compares reference/fusedQSA at32K/64K; full takes --prefill-attention reference|fusedQSA.
         Full262K requires O2; checks RAM reuse and actual decode. State finiteness is not a quality evaluation.
+    probe-gpu-large-ssd-import --model-dir PATH --tokens-file TOKENS_65534_JSON --cache-dir NEW_DIRECTORY --output NEW_REPORT_JSON
+        Cold checkpoint65312 then fresh-generator SSD restore; fixed O2, actual decode and full-state checks.
+        Existing whole-Data 1...2GiB archive path; requires new cache/output paths; diagnostic timing only.
     probe-gpu-prefill-attention --model-dir PATH --tokens-file PATH --output NEW_REPORT_JSON --golden-report PATH [--order reference,fusedQSA] [--max-tokens 128] [--mtp-depth 0|2]
     probe-gpu-hotspots --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_REPORT_JSON [--max-tokens 128] [--detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert|moe-composed] [--moe-config PATH] [--baseline-moe-config PATH] [--ab-order ABBA|BAAB]
     probe-gpu-prefix-cache --model-dir PATH --tokens-file AGENT_11K.json --output NEW.json

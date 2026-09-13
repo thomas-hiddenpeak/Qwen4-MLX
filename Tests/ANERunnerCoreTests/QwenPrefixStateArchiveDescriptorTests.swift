@@ -205,4 +205,57 @@ final class QwenPrefixStateArchiveDescriptorTests: XCTestCase {
             try Descriptor.estimatedLogicalPayloadBytes(layout: layout, offset: 262_144))
         XCTAssertThrowsError(try validate(d, cap: Descriptor.absoluteMaximumPayloadBytes))
     }
+
+    func testImportInvalidationPreservesLocalAdmissionAndExportFailures() throws {
+        let d = try valid(), metadata = try d.encoded()
+        func reject(_ cap: Int, offset: Int? = nil, expectedLayout: Descriptor.Layout? = nil,
+                    payloadBytes: Int? = nil) {
+            XCTAssertThrowsError(try Descriptor.decodeAndValidate(metadata,
+                expectedLayout: expectedLayout ?? layout, expectedOffset: offset ?? d.offset,
+                actualPayloadBytes: payloadBytes ?? d.tensorPayloadBytes, maxPayloadBytes: cap)) {
+                XCTAssertFalse(Descriptor.isInvalidArchive($0))
+            }
+        }
+        for cap in [0, d.tensorPayloadBytes, d.logicalPayloadBytes - 1,
+                    Descriptor.absoluteMaximumPayloadBytes + 1] { reject(cap) }
+        reject(d.logicalPayloadBytes, offset: 0)
+        reject(d.logicalPayloadBytes, payloadBytes: -1)
+        let wrongLayout = Descriptor.Layout(layerTypes: layout.layerTypes, pleLayerIndices: [1],
+            hiddenSize: 1, hcCount: 4, ngramSize: 3, pleConvKernel: 4,
+            vocabularySize: 248_320, maximumPositions: 262_144)
+        reject(d.logicalPayloadBytes, expectedLayout: wrongLayout)
+        // Preserve the existing direct validation/export error domain.
+        var bad = d; bad.attentionOffsets[3] -= 1
+        XCTAssertThrowsError(try validate(bad)) { XCTAssertFalse(Descriptor.isInvalidArchive($0)) }
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(Data("not json".utf8),
+            expectedLayout: layout, expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes,
+            maxPayloadBytes: d.logicalPayloadBytes - 1)) { XCTAssertFalse(Descriptor.isInvalidArchive($0)) }
+        let large = try valid(49_920)
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(large.encoded(), expectedLayout: layout,
+            expectedOffset: large.offset, actualPayloadBytes: large.tensorPayloadBytes)) {
+            XCTAssertFalse(Descriptor.isInvalidArchive($0))
+        }
+        XCTAssertEqual(try Descriptor.decodeAndValidate(large.encoded(), expectedLayout: layout,
+            expectedOffset: large.offset, actualPayloadBytes: large.tensorPayloadBytes,
+            maxPayloadBytes: large.logicalPayloadBytes), large)
+    }
+
+    func testImportInvalidationIdentifiesOnlyAdmittedArchiveContent() throws {
+        let d = try valid()
+        func reject(_ metadata: Data, payloadBytes: Int? = nil) {
+            XCTAssertThrowsError(try Descriptor.decodeAndValidate(metadata, expectedLayout: layout,
+                expectedOffset: d.offset, actualPayloadBytes: payloadBytes ?? d.tensorPayloadBytes,
+                maxPayloadBytes: d.logicalPayloadBytes)) { XCTAssertTrue(Descriptor.isInvalidArchive($0)) }
+        }
+        for metadata in [Data(), Data("not json".utf8), Data("{}".utf8),
+                         Data(repeating: 32, count: Descriptor.maximumMetadataBytes + 1)] { reject(metadata) }
+        var bad = d; bad.tensors.removeLast(); reject(try bad.encoded())
+        bad = d; bad.pleHistory[1] = [248_320, 1]; reject(try bad.encoded())
+        bad = d; bad.version += 1; reject(try bad.encoded())
+        bad = d; bad.offset += 1; reject(try bad.encoded())
+        bad = d; bad.logicalPayloadBytes += 1; reject(try bad.encoded())
+        reject(try d.encoded(), payloadBytes: d.tensorPayloadBytes - 1)
+        let laterDecode = DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "promotion JSON"))
+        XCTAssertFalse(Descriptor.isInvalidArchive(laterDecode))
+    }
 }

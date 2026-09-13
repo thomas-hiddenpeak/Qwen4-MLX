@@ -20,7 +20,7 @@ extension RunnerCLI {
     }
 
     static func generateGPU(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--profile-phase", "--capture-verification-routing", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
+        try args.validate(["--model-dir", "--prompt", "--tokens-file", "--raw-prompt", "--max-tokens", "--prefill-chunk", "--context", "--output", "--repeat", "--profile-stages", "--profile-phase", "--profile-attention", "--profile-from-token", "--capture-verification-routing", "--ssd-workers", "--ssd-prefetch", "--ssd-prefetch-order", "--prefill-accumulation", "--telemetry-dir", "--telemetry-interval-ms", "--decode-mode", "--decode-order", "--wired-policy", "--wired-order", "--gpu-command-timing-output", "--gdn-gemv-mode", "--gdn-gemv-order", "--mtp-depth", "--mtp-order", "--mtp-verification", "--mtp-verification-order", "--mtp-draft-history", "--prefill-eval-layers", "--verify-eval-layers", "--prefill-attention", "--prefill-moe-config"])
         guard let mode = GPUProfiler.Mode(rawValue: args["--profile-stages"] ?? "disabled") else {
             throw CLIError.usage("Invalid --profile-stages mode")
         }
@@ -32,6 +32,20 @@ extension RunnerCLI {
         }
         guard phaseFilter == nil || mode != .disabled else {
             throw CLIError.usage("--profile-phase requires a non-disabled --profile-stages mode")
+        }
+        let attentionProfile = args["--profile-attention"] ?? "false"
+        guard ["true", "false"].contains(attentionProfile) else {
+            throw CLIError.usage("--profile-attention requires true or false")
+        }
+        let minimumPosition: Int?
+        if let text = args["--profile-from-token"] {
+            guard let value = Int(text), value >= 0 else {
+                throw CLIError.usage("--profile-from-token requires a nonnegative forward-start offset")
+            }
+            minimumPosition = value
+        } else { minimumPosition = nil }
+        guard mode != .disabled || (args["--profile-attention"] == nil && minimumPosition == nil) else {
+            throw CLIError.usage("--profile-attention and --profile-from-token require non-disabled --profile-stages")
         }
         let captureValue = args["--capture-verification-routing"] ?? "false"
         guard captureValue == "true" || captureValue == "false" else {
@@ -120,7 +134,8 @@ extension RunnerCLI {
         }
         let ssdWorkers = try positive("--ssd-workers", 1, GPUSSDReader.maximumWorkers)
         let tokenizer = try QwenTokenizer(modelDirectory: directory)
-        let profiler = try GPUProfiler(mode: mode, maximumRecords: 8192, phaseFilter: phaseFilter)
+        let profiler = try GPUProfiler(mode: mode, maximumRecords: 8192,
+            attentionBreakdown: attentionProfile == "true", phaseFilter: phaseFilter, minimumPosition: minimumPosition)
         guard let accumulation = GPUMoE.PrefillAccumulation(rawValue: args["--prefill-accumulation"] ?? "reference") else { throw CLIError.usage("Invalid --prefill-accumulation; use reference or float32") }
         // Validate the saved selection and loaded native identities before
         // allocating any model weights. No environment selector is changed.
@@ -138,6 +153,9 @@ extension RunnerCLI {
             tokens = try tokenizer.encode(rendered)
         }
         guard !tokens.isEmpty, tokens.count + count <= context else { throw CLIError.usage("Prompt plus output exceeds configured context") }
+        if let minimumPosition, minimumPosition >= tokens.count {
+            throw CLIError.usage("--profile-from-token must be below the actual prompt token count")
+        }
         guard args["--telemetry-dir"] != nil || args["--telemetry-interval-ms"] == nil else {
             throw CLIError.usage("--telemetry-interval-ms requires --telemetry-dir")
         }
@@ -210,6 +228,7 @@ extension RunnerCLI {
                                             evaluateEveryLayers: prefillEvalLayers, decodeMode: .reference,
                                             prefillPrefetch: prefetch, phase: .prefill,
                                             prefillAttention: prefillAttention,
+                                            profileLogits: minimumPosition == nil || end == tokens.count,
                                             prefillMoEConfiguration: moeSelection?.configuration)
                 let commandForwardEnd = commandTiming == nil ? 0 : GPUCommandTimingSession.now()
                 let forwardEnd = telemetry == nil ? nil : GPUTelemetrySession.now()

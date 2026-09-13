@@ -475,7 +475,11 @@ final class QwenPrefixCache {
                     } catch {
                         if error is QwenPrefixPagedAttachmentFailure { throw error }
                         try recoverOptionalFailure(model: model, error: error)
-                        _ = disk?.invalidateAsync(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
+                        // A successful join does not prove the original failure
+                        // came from disk data (allocation/evaluation may fail too).
+                        if QwenPrefixStateArchiveDescriptor.isInvalidArchive(error) {
+                            _ = disk?.invalidateAsync(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
+                        }
                         restoreFailures += 1
                     }
                 }
