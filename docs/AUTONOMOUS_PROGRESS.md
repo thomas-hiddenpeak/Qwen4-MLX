@@ -1,5 +1,11 @@
 # 自主研究与开发接续
 
+04:01 更新：`9e380e7`已提交、推送并核对远端SHA。RAM compact snapshot共享恢复、合法1–2GiB SSD导入修复、262K真实HTTP及请求进度已进入主线。183项相关CPU、capacity/paged短实模全状态、实际1.915GB SSD归档恢复及独立payload校验通过；`results/ram-restore-http262-v3`的6成功+1取消、P262142/O2及P262112/O32前后31decode、RAM B262080复用、边界与资源合同通过独立原始响应审计。随后`results/live-progress-http-v1`的36项CPU与226次健康采样通过冷/热、部分prefill取消及恢复，573文件/102模型stat postflight无变化，参考74518按原argv恢复。
+
+当前唯一GPU控制器为`results/ram-restore-reference262-v1/plan.json`，03:54:16开始，exec session84592、模型PID74998；二进制`9eb775401b96350a8265dcbbba9d9b13a3c4a1cf96d23ee7cc2a6bc749e0b90c`、Sources/Tests/scripts/native及输入保持冻结，不能build或改代码。该轮要补优化后完整262K的121张量/host与旧`da457…`基线逐项比较，尚未完成。参考74518由控制器暂停，结束后先完成postflight并恢复精确argv。只读30秒telemetry为session26471，不能当DRAM计数或连续峰值。
+
+已验证结论见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)和[HTTP请求进度](HTTP_LIVE_PROGRESS.md)。独立agent只在ignored目录准备逐tensor大SSD方案和末段prefill细分诊断候选；均未宣称实现/提速。若完整回归按预计04:35左右完成，可在postflight后做一次有界32K末段诊断；04:40起以收尾为主，05:00停止新工作、恢复服务、保存未完成项并暂停heartbeat。以下02:37及更早内容为历史记录，不重复执行。
+
 02:37 更新：显式长上下文容量配置与完整状态 probe 已通过182项相关CPU、9项CLI负控和真实262144上下文CLI检查。`results/long-context-reference262-v1` 的P262142/O2冷/热各1次实际decode、B262080恢复/62新输入、6组121张量及host精确一致；独立6579检查全过，最终全部状态预算/lease0。冷prefill2454.232s，warm3.115s（restore0.274s），MLX业务峰值95.511GB；这是带状态诊断的容量结果，不是稳定吞吐或质量验收。599文件/102模型stat postflight通过，参考服务66360按精确原argv恢复、idle且MTP/drafter关闭。32K fusedQSA跨模式仍有58/121误差超限，默认reference。详见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)。
 
 已接入公开长上下文启动/HTTP验证工具，4个--help、原始decode fixture再核对及新的32K真实CPU分词通过；**完整HTTP验证尚未执行**。下一步：RAM共享恢复和SSD导入限额修复→短实模回归→同输入262K跨版本状态/峰值对照→对该版本直接运行公开HTTP脚本（含32-token decode、取消后大缓存再用）。先前计划的旧版HTTP冷运行省略，以免多做一次约41分钟prefill；所有通过结论仍按实际二进制区分。
