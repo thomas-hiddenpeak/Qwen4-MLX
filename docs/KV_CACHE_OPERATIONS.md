@@ -20,7 +20,7 @@ KV_CACHE_PARENT="$(cd "$HOME/Library/Caches/Qwen4-MLX" && pwd -P)"
   --state-budget-bytes 4294967296
 ```
 
-这是 512 MiB RAM / 8 GiB SSD / 4 GiB 联合逻辑状态额度的示例，SSD另保留至少1 GiB可用空间。已有缓存末级目录必须属于服务UID且group/other无权限，推荐0700；CLI先规范化路径、解析符号链接，store再逐组件以O_NOFOLLOW打开物理路径。省略SSD目录及SSD专属参数就是RAM-only；`--prefix-cache-bytes 0`关闭RAM，同时不能启用SSD。服务仅监听127.0.0.1，加载期间`/health`返回503，等`status=ready`再送请求。
+这是默认16384上下文、512 MiB RAM / 8 GiB SSD / 4 GiB联合逻辑状态额度的示例，SSD另保留至少1 GiB可用空间。SSD总额度8 GiB不表示能保存一份8 GiB状态：HTTP默认单项待处理payload最多512 MiB，归档格式绝对payload上限2 GiB。显式262144的RAM-only配置见[长上下文入口](HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)，不能只放大context而沿用此处其他额度。已有缓存末级目录必须属于服务UID且group/other无权限，推荐0700；CLI先规范化路径、解析符号链接，store再逐组件以O_NOFOLLOW打开物理路径。省略SSD目录及SSD专属参数就是RAM-only；`--prefix-cache-bytes 0`关闭RAM，同时不能启用SSD。服务仅监听127.0.0.1，加载期间`/health`返回503，等`status=ready`再送请求。
 
 容量追加由启动参数`--kv-append-mode capacity256`显式开启，默认仍为`reference`；只用于AR decode，prefill及显式MTP请求保持原路径，尚非Paged KV。核对`/health`的`kv_append_policy`，以及completed模型终态的`kv_append_mode`、`kv_capacity_token_steps`、`kv_capacity_workspace_fallbacks`和`kv_capacity_workspace_peak_bytes`。最后一项是额外workspace逻辑预留峰值，不能当作RSS或MLX实际峰值；失败/取消没有完整result时这些字段可能为null。
 
@@ -34,9 +34,11 @@ curl --max-time 5 -fsS http://127.0.0.1:11236/metrics
 | 关注点 | 看什么 |
 |---|---|
 | 本次真实复用 | 响应`usage.prompt_tokens_details.cached_tokens`；JSON模型终态的`cache_source`与cached/computed tokens。`prefix_cache.restoredHits`包括RAM/SSD，`diskHits`只计实际SSD恢复；索引hits不等于成功复用。 |
-| 请求与临时owner结束 | 停止送新请求后，`idle=true`，active、active_jobs、pending_requests、queued_prefills、ready_decodes、resident_sequences、reserved_tokens、waiting_prefix_sequences均为0；再看`state_budget.requestBytes/workspaceBytes`、SSD`pendingJobs/pendingBytes/foregroundReadIntents`回到0。 |
+| 请求与临时owner结束 | 停止送新请求后，`idle=true`，active、active_jobs、pending_requests、queued_prefills、ready_decodes、resident_sequences、reserved_tokens、waiting_prefix_sequences均为0；再看`state_budget.requestBytes`、SSD`pendingJobs/pendingBytes/foregroundReadIntents`及RAM`liveFlights`回到0。未启用paging时workspace归0；启用时按下述固定arena例外精确核对。 |
 | 正常保留 | 空闲时RAM entries、`cacheBytes`和对应lease可以大于0。MLX allocator保留也不会随请求结束必然清空。 |
 | 故障线索 | `restoreFailures`、SSD`corruptions/writeFailures/storageUnavailable`、`logging.dropped_events/write_failures`，结合本次请求ID与时间查看；有日志丢失时不能声称终态对账完整。 |
+
+显式M2 paging在服务存活时保留十二层固定arena及其静态元数据预留；`state_budget.workspaceBytes`必须恰好等于`paged_kv_pool.statistics.arena_reserved_bytes`，不能容忍额外workspace。该数可按每层页数及`vm_page_bytes`独立重算，现有[HTTP验证器](../scripts/probe_http_cache_reliability.py)已实现此检查。排空时`active_decode_claims`、`claimed_pages_per_layer`、`in_flight_operations`和`failed_operations`均为0，完成操作等于写/读/导出的总和；这一完成计数恒等式不要求在非空闲回调瞬间成立。RAM保留时允许对应物理页继续存活，`state_budget.cacheBytes`应与`prefix_cache.logicalPayloadBytes`一致；RAM条目和逻辑字节均归0后，`live_pages`也须为0。arena只在context销毁后归还，MLX allocator保留另计。
 
 health是执行器边界快照，空闲也约每100ms刷新；不要用单次采样或`running_job=null`判定已释放。结构化日志只统计`qwen-http-lifecycle-v1`的`model_terminal`，不再加一次兼容文本行；模型完成与客户端实际收到完整响应分别核对。
 

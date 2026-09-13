@@ -458,8 +458,11 @@ final class QwenPrefixCache {
                         let state = try restoring {
                             let archive = QwenPrefixStateArchive(metadata: match.metadata, payload: match.payload,
                                 logicalPayloadBytes: try model.estimatedPrefixStateBytes(at: match.prefixTokenCount))
+                            // Core has admitted/verified this read and its ticket still
+                            // owns2xpayload+metadata workspace. Use this model/offset's
+                            // exact logical size; the descriptor retains its2GiB cap.
                             let restored = try model.importPrefixState(archive, expectedOffset: match.prefixTokenCount,
-                                checkCancellation: checkCancellation)
+                                maxPayloadBytes: archive.logicalPayloadBytes, checkCancellation: checkCancellation)
                             try checkCancellation()
                             promotedAttachment = try saveMemory(tokens: Array(f.tokens.prefix(match.prefixTokenCount)),
                                 namespace: f.namespace, executionNamespace: f.executionNamespace,
@@ -618,7 +621,7 @@ final class QwenPrefixCache {
                 }
                 do {
                     let state = try restoring {
-                        let copy = try model.privatePrefixStateCopy(match.value.state)
+                        let copy = try model.forkCompactRAMPrefixState(match.value.state)
                         try checkCancellation()
                         return copy
                     }

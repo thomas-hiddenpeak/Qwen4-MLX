@@ -1,6 +1,6 @@
 # 本机文字 HTTP/SSE 实验服务
 
-当前新增的可选 SSD、联合容量和并发缓存生命周期见 [缓存可靠性](KV_CACHE_RELIABILITY.md)。以下各轮历史测试仍绑定其原版本。
+当前新增的可选 SSD、联合容量和并发缓存生命周期见 [缓存可靠性](KV_CACHE_RELIABILITY.md)。以下各轮历史测试仍绑定其原版本。当前容量参数已增加显式262144配置，默认仍为16384；完整CLI及本次已通过的真实HTTP长上下文有界验收见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)；HTTP覆盖冷/热RAM、O32解码和约32K预填取消后复用，不替代质量、耐久或262K SSD验收，复跑命令见[长上下文工具](HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)。
 
 2026-09-08 新增并完成 [AR 前缀缓存验收](AR_PREFIX_CACHE.md)及 [function tools 闭环](HTTP_TOOL_CALLING.md)：同一 `2941a0dd…5a9a54` 二进制通过新功能40项检查、9次推理及另一个服务进程的19项旧HTTP回归。HTTP默认512 MiB/8条快照；MTP保持冷prefill。下文旧版soak/背压数据仍绑定各自版本，不表示本轮已重跑这些较长套件。
 
@@ -17,7 +17,12 @@
 | `--model-dir` | 必需 | 模型目录绝对或相对路径 |
 | `--port` | 11236 | 1024…65535 |
 | `--max-connections` | 8 | 1…32 |
-| `--max-body-bytes` | 262144 | 1024…1048576 |
+| `--max-body-bytes` | 262144 | 1024…67108864；不会随context自动增长 |
+| `--context-limit` | 16384 | 1…262144，并受实际模型maximumPositions约束；prompt+输出预算 |
+| `--max-reserved-tokens` | 32768 | 不小于context-limit；所有已准入请求的调度逻辑额度 |
+| `--max-resident-sequences` | 2 | 1…2 |
+| `--connection-deadline-seconds` | 300 | 1…86400；连接总期限 |
+| `--prefill-attention` | reference | reference或显式fusedQSA；后者32K跨模式数值门槛未通过 |
 | `--output-buffer-bytes` | 65536 | 8192…1048576 |
 | `--prefix-cache-bytes` | 536870912 | 0…8589934592；0关闭 |
 | `--prefix-cache-entries` | 8 | 1…256 |
@@ -30,13 +35,15 @@
 | `--prefix-cache-shutdown-timeout-seconds` | 30 | 1…300；SSD关闭等待期限，需SSD目录 |
 | `--state-budget-bytes` | 4294967296 | request/cache/workspace 联合逻辑额度 |
 
-固定 header 上限 16 KiB、待提交邮箱 8 请求、SSE 输出 256 条目（含一个最多 4 KiB 终态条目）。推理调度沿用 8 prefill / 2 ready、32768 逻辑预留 token、2 resident sequences、decodeBurst 4。请求接收期限 15 秒，单次发送无进展期限 15 秒，整个连接期限 300 秒。连接数满时直接关闭新连接，邮箱/推理队列满时返回 429；模型尚未 ready 或不可用返回 503。
+固定 header 上限 16 KiB、待提交邮箱 8 请求、SSE 输出 256 条目（含一个最多 4 KiB 终态条目）。推理调度保持8 prefill / 2 ready及decodeBurst4；逻辑预留token默认32768、resident默认2，可按上表显式配置。请求接收期限15秒，单次发送无进展期限15秒，整个连接期限默认300秒，可用`--connection-deadline-seconds`调整。连接数满时直接关闭新连接，邮箱/推理队列满时返回 429；模型尚未 ready 或不可用返回 503。
 
 每连接只处理一个 HTTP/1.1 请求，`Connection: close`。POST 必须有唯一 Content-Length；不接收 chunked、Transfer-Encoding、重复关键 header、折叠 header、重复 JSON key 或额外 pipelined 请求。SSE body 使用关闭连接作为边界，没有 chunked 编码。
 
 ## 接口合同
 
 `GET /health` 返回顶层 `status=loading/ready/stopping/failed`，ready 时 HTTP 200，其余 503。还包含 `idle`、`active`、`active_jobs`、`pending_requests`、`queued_prefills`、`ready_decodes`、`resident_sequences`、`reserved_tokens`。这是 worker 的阶段边界缓存，网络线程不访问模型。`running_job` 仅在能观察实际活动 ID 时填写；prefill 中无法从边界采样得知时为 null，`running_job_known=false`，不猜测。判断取消清理完成时应同时检查 idle 和所有队列/资源计数，而非只看 running_job。
+
+`request_progress` 另外提供按公开请求ID关联的阶段及token进度，来自已完成调度片段；逻辑prompt进度包含已恢复缓存。字段口径、限制与真实取消恢复验证见[HTTP请求进度](HTTP_LIVE_PROGRESS.md)。
 
 当前还返回独立的`logging`快照：`buffered_bytes/buffered_events/queued_events/in_flight_bytes`及固定额度，累计`enqueued_events/written_events/dropped_events/dropped_bytes/write_failures`、`last_write_errno`、`accepting/writer_exited`。这些是诊断日志状态，不是模型响应字节或显存计数。日志器固定最多65536字节、128条记录，单条最多4096字节；正在写入的记录仍计入额度。`--output-buffer-bytes`不调整这个日志额度。
 
@@ -53,7 +60,7 @@
 }
 ```
 
-model 必须精确匹配。基本 messages 使用字符串 role/content；角色为 system/user/assistant/tool，system 只能在第一条，至少有一条 user。携带 tool_calls 的 assistant 可用 null content，tool 需按顺序提供匹配的 tool_call_id。使用 no-thinking 模板；function tools 与调用历史的详细合同见[工具协议](HTTP_TOOL_CALLING.md)。max_tokens 默认128，AR范围1…4096；stream默认false；temperature只能省略或为数字0；mtp_depth只能为0（默认AR）或显式实验2（batchedScalarLinear、draft history1024）。**工具请求必须mtp_depth=0；纯文本mtp_depth=2的max_tokens仅允许1…256**，更长输出尚未验证。context16384、prefill chunk416，prompt加max_tokens仍按完整逻辑长度验证，不因缓存命中缩小预算。
+model 必须精确匹配。基本 messages 使用字符串 role/content；角色为 system/user/assistant/tool，system 只能在第一条，至少有一条 user。携带 tool_calls 的 assistant 可用 null content，tool 需按顺序提供匹配的 tool_call_id。使用 no-thinking 模板；function tools 与调用历史的详细合同见[工具协议](HTTP_TOOL_CALLING.md)。max_tokens 默认128，AR范围1…4096；stream默认false；temperature只能省略或为数字0；mtp_depth只能为0（默认AR）或显式实验2（batchedScalarLinear、draft history1024）。**工具请求必须mtp_depth=0；纯文本mtp_depth=2的max_tokens仅允许1…256**，更长输出尚未验证。context默认16384、prefill chunk416，prompt加max_tokens仍按完整逻辑长度验证，不因缓存命中缩小预算。服务context超过16384或显式启用paged pool时只接受AR，拒绝MTP请求；容量参数不会自动扩展RAM、状态额度或请求体上限。
 
 tools支持function定义，tool_choice支持auto/none。required、指定函数及strict=true明确拒绝。stop、top_p、多choice、随机采样、图片/数组content、reasoning等其他字段仍返回400，不静默丢弃；布尔值不能充当整数。已支持工具闭环不等于完整agent协议兼容。
 

@@ -2,7 +2,7 @@
 
 当前工作集中在 AR 缓存生命周期。这个混合模型的恢复单位包括 Attention KV/QSA、GDN recurrent/conv、PLE convolution 和 n-gram 历史；只有 KV 不能恢复请求。MTP 性能优化继续延后。
 
-2026-09-09 的[关键能力计划](KV_CACHE_CAPABILITIES.md)统一安排完整会话复用、真实压力控制、分层 I/O 调度、物理页共享与工业发布门槛。完整会话复用已接入；本页分别描述当前合同和各版本的验证，规划本身不构成交付证明。
+始于2026-09-09、持续更新的[关键能力计划](KV_CACHE_CAPABILITIES.md)统一安排完整会话复用、真实压力控制、分层 I/O 调度、物理页共享与工业发布门槛。完整会话复用已接入；本页分别描述当前合同和各版本的验证，规划本身不构成交付证明。
 
 操作步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)，本页保留完整合同与分版本证据。
 
@@ -42,7 +42,7 @@ RAM 前缀缓存默认 512 MiB / 8 条。SSD 是显式开启的可选层，服�
 
 父目录必须存在；最后一级由 store 创建为 0700，也可使用已有的专属 0700 目录。文件为 0600；同一目录只允许一个 store，通过进程锁拒绝重复持有。底层逐级打开目录且不跟随符号链接。请使用物理路径，尤其注意 macOS 的 `/tmp`、`/var` 是别名路径。缓存管理只删除符合自身命名格式的文件。禁用 RAM 缓存时不能同时配置 SSD。
 
-RAM 与 SSD 都有条目、字节、key token 和 TTL 上限。RAM TTL 从本层发布/提升时计算；SSD TTL 从原始发布时计算并跨重启保留。SSD 文件字节取文件长度和实际分配块数中的较大者，写临时文件前也保留磁盘额度。后台读写最多 2 个 job、512 MiB 待处理数据；单个超限归档跳过缓存，继续正常计算。写入拒绝或失败不等于推理失败。
+RAM 与 SSD 都有条目、字节、key token 和 TTL 上限。RAM TTL 从本层发布/提升时计算；SSD TTL 从原始发布时计算并跨重启保留。SSD 文件字节取文件长度和实际分配块数中的较大者，写临时文件前也保留磁盘额度。HTTP默认后台读写最多2个job、512 MiB待处理payload；库可显式设置更大待处理额度，但归档payload仍有2 GiB绝对上限，完整262K状态不适用。单个超限归档跳过缓存，继续正常计算。写入拒绝或失败不等于推理失败。
 
 HTTP对完整canonical会话一次分词，查找至prompt倒数第二个token，并在原416-token网格上最多发布系统/工具锚点和会话尾部两个完整检查点。准确token前缀相同才复用；编辑历史、工具结果或工具定义不会跨越不一致处。共同系统锚点的producer身份与每个请求的完整查找范围分开，分支可以共同等待系统状态后独立执行。最深完整SSD状态可优先于较浅RAM状态；当前选择基于可复用深度，尚未用延迟成本模型判断哪个更快。
 
@@ -78,7 +78,7 @@ SSD 默认保留 1 GiB 文件系统可用空间，可通过 `--prefix-cache-min-
 
 ## 观测与验收
 
-`/health` 包含 `prefix_cache`、`prefix_cache_limits`、`prefix_disk_cache`、`prefix_disk_cache_limits`、`state_budget`、`mlx_memory` 、`memory_pressure`、`memory_pressure_monitor_running` 和 `waiting_prefix_sequences`。空闲执行器每 100 ms 刷新快照。分别看索引 hits、真正 restoredHits、diskHits、corruptions/writeFailures、pending jobs/bytes、liveFlights、diskReadTimeouts/diskPublicationTimeouts、spaceRejections/spaceQueryFailures/spaceRecoveries，以及 request/workspace 在空闲后的归零。
+`/health` 包含 `prefix_cache`、`prefix_cache_limits`、`prefix_disk_cache`、`prefix_disk_cache_limits`、`state_budget`、`mlx_memory` 、`memory_pressure`、`memory_pressure_monitor_running` 和 `waiting_prefix_sequences`。空闲执行器每 100 ms 刷新快照。分别看索引 hits、真正 restoredHits、diskHits、corruptions/writeFailures、pending jobs/bytes、liveFlights、diskReadTimeouts/diskPublicationTimeouts、spaceRejections/spaceQueryFailures/spaceRecoveries，以及request和临时workspace在空闲后的归零。显式M2配置保留固定arena及静态元数据workspace，必须与独立计算的固定预留严格相等；claim、在途操作、cache与live pages的排空规则见[运维合同](KV_CACHE_OPERATIONS.md)，不能将任意非零workspace视作正常。
 
 prefill报告`cacheSource`、cached/computed tokens、lookup/restore/save/wait，以及`actualForwardTokenCount`和`recomputedTokenCount`。成功HTTP终态JSON记录`prompt_tokens = cached_prompt_tokens + computed_prompt_tokens`，并单列`actual_prefill_tokens = computed_prompt_tokens + recomputed_prefill_tokens`。来源只记录最终实际采用的前缀，SSD读后提升RAM不重复计费；`restoreWaits`仅表示读fence等待，不证明节省了第二次SSD读取。日志分别保留prefill计算、执行器active/suspension及decode耗时。
 
@@ -88,7 +88,7 @@ HTTP 成功终态还记录实际 `decoded_tokens`、`decode_service_seconds`、`
 
 SSD归档是状态缓存，与PLE的n-gram读取分别管理。应用层成功archive字节计数不是物理SSD流量或DRAM带宽；诊断全状态读回会影响时间，不作为吞吐结论。
 
-工业发布门槛要求：完整输出与混合状态正确；并发、取消、清理及预算耗尽后恢复；跨进程重启与损坏回退；长期压力下额度不越界、请求/临时 lease 不残留、资源不持续增长；有明确的长提示词尾延迟和恢复成本。短窗口验证只是这些门槛的一部分，不自动意味着可生产部署。Paged KV、跨请求 GPU batching、跨机器 PD 和 MTP 缓存尚未交付。
+工业发布门槛要求：完整输出与混合状态正确；并发、取消、清理及预算耗尽后恢复；跨进程重启与损坏回退；长期压力下额度不越界、请求/临时 lease 不残留、资源不持续增长；有明确的长提示词尾延迟和恢复成本。短窗口验证只是这些门槛的一部分，不自动意味着可生产部署。M2物理KV页附件已接入库及HTTP并通过[短期回归](research/KV_PAGED_HTTP_RESULTS.md)，默认关闭，仍保留dense快照；它不代表K07整项、262K物理页或耐久验收完成。跨请求GPU batching、跨机器PD和MTP缓存尚未交付。262144的CLI与HTTP状态另见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)，不沿用本页C3旧版本的两小时记录。
 
 ## 2026-09-09 批次C：忙写后的读恢复
 

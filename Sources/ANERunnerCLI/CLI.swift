@@ -106,6 +106,8 @@ struct RunnerCLI {
                 try probeGPUPhaseHandoff(arguments)
             case "probe-gpu-long-context":
                 try probeGPULongContext(arguments)
+            case "probe-gpu-large-ssd-import":
+                try probeGPULargeSSDImport(arguments)
             case "probe-gpu-prefill-attention":
                 try probeGPUPrefillAttention(arguments)
             case "probe-gpu-hotspots":

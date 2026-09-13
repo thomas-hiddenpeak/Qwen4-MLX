@@ -253,8 +253,8 @@ def run(args):
         report['notes'].append('Extended P262112/O32 uses the original prompt cache; no independent cold oracle for this new prompt and no quality claim.')
     progress = (out/'progress.ndjson').open('x')
 
-    def event(name, **fields):
-        line = json.dumps({'event': name, 'unix_seconds': time.time(), **fields}, allow_nan=False)
+    def event(event_name, **fields):
+        line = json.dumps({'event': event_name, 'unix_seconds': time.time(), **fields}, allow_nan=False)
         progress.write(line+'\n'); progress.flush(); print(line, flush=True)
     def save():
         temp = out/'summary.pending.json'

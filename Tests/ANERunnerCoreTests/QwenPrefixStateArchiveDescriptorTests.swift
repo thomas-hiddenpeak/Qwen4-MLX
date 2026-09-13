@@ -167,6 +167,37 @@ final class QwenPrefixStateArchiveDescriptorTests: XCTestCase {
         XCTAssertThrowsError(try huge.encoded())
     }
 
+    func testPreviouslyAdmittedArchiveAboveDefaultUsesExactModelLimit() throws {
+        // Only121 descriptors and a small JSON blob are allocated. The bytes
+        // below represent a legitimate>1GiB state; no large payload Data or GPU exists.
+        let d = try valid(49_920), metadata = try d.encoded()
+        let admittedLimit = try Descriptor.estimatedLogicalPayloadBytes(layout: layout, offset: d.offset)
+        XCTAssertGreaterThan(d.tensorPayloadBytes, Descriptor.defaultMaximumPayloadBytes)
+        XCTAssertLessThan(d.logicalPayloadBytes, Descriptor.absoluteMaximumPayloadBytes)
+        XCTAssertLessThanOrEqual(d.tensorPayloadBytes + metadata.count, Descriptor.absoluteMaximumPayloadBytes)
+        XCTAssertEqual(admittedLimit, d.logicalPayloadBytes)
+        // The old omitted argument fails despite legal2GiB SSD admission.
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(metadata, expectedLayout: layout,
+            expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes))
+        XCTAssertEqual(try Descriptor.decodeAndValidate(metadata, expectedLayout: layout,
+            expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes,
+            maxPayloadBytes: admittedLimit), d)
+        // The model-derived limit still includes PLE history; using only raw
+        // tensor bytes is too small, and an archive cannot enlarge its own size.
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(metadata, expectedLayout: layout,
+            expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes,
+            maxPayloadBytes: d.tensorPayloadBytes))
+        var forged = d; forged.logicalPayloadBytes += 1
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(forged.encoded(), expectedLayout: layout,
+            expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes,
+            maxPayloadBytes: admittedLimit))
+        // Structural validation remains mandatory even when the size is admitted.
+        forged = d; forged.attentionOffsets[3] -= 1
+        XCTAssertThrowsError(try Descriptor.decodeAndValidate(forged.encoded(), expectedLayout: layout,
+            expectedOffset: d.offset, actualPayloadBytes: d.tensorPayloadBytes,
+            maxPayloadBytes: admittedLimit))
+    }
+
     func testFullContextEstimateDoesNotAllocateOrOverflowButArchiveCapRejectsIt() throws {
         let d = try valid(262_144)
         XCTAssertGreaterThan(d.logicalPayloadBytes, Descriptor.absoluteMaximumPayloadBytes)

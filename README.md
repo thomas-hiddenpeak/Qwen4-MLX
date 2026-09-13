@@ -37,7 +37,8 @@ env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -
 | 前缀缓存 | HTTP默认512 MiB / 8条完整混合状态快照，压缩前缀树与LRU；自动复用完整会话/工具历史，有限保留共享系统与会话尾部检查点；库默认关闭，显式MTP保持冷prefill |
 | SSD 状态缓存 | 显式开启的有界持久化层，完整混合状态归档、异步恢复/写入、校验及重启恢复、可用空间水位、请求等待期限及有界关闭等待；与 n-gram SSD 读取分别管理 |
 | 工具调用 | function tools、auto/none、非流式/SSE调用及工具结果续答；客户端执行工具 |
-| 尚未实现 | 物理 KV 页共享、跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码 |
+| 物理 KV 页共享 | 显式开启的 M2 页附件已接入库与HTTP并通过短期回归；仍保留完整dense快照，无稳定吞吐收益，默认关闭 |
+| 尚未实现 | 跨进程PD、跨请求GPU连续批处理、强制/严格约束工具解码、262K完整SSD归档恢复 |
 
 chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表与作者任意输入全部逐位等价。初期短输入、后续11k与不同候选的验证范围分别保留在各实验文档中。
 
@@ -49,7 +50,7 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
   --port 11236
 ```
 
-仅监听 `127.0.0.1`。`GET /health` 提供服务及资源状态，`GET /v1/models` 返回实际模型ID，`POST /v1/chat/completions` 支持流式或非流式文字与工具调用。网络队列与固定推理线程分离；各版本分别实测取消恢复、非流式输出超限、真实AR SSE背压，以及日志管道堵塞时的服务活性。
+上述 Swift 服务仅监听 `127.0.0.1:11236`；实验中使用的 `11235` 是作者的独立参考服务，不是本 runner，也不由这条命令启动。`GET /health` 提供服务及资源状态，`GET /v1/models` 返回实际模型ID，`POST /v1/chat/completions` 支持流式或非流式文字与工具调用。网络队列与固定推理线程分离；各版本分别实测取消恢复、非流式输出超限、真实AR SSE背压，以及日志管道堵塞时的服务活性。
 
 这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文默认16384；可显式选择更长的服务容量、资源与期限配置，见[长上下文复跑入口](docs/HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)。AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
 
@@ -57,7 +58,7 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 
 可用 `--prefix-cache-bytes 0` 关闭缓存，`--prefix-cache-directory` 启用持久化SSD，`--state-budget-bytes` 配置request/cache/workspace联合逻辑额度，`--prefix-cache-shutdown-timeout-seconds` 设置SSD关闭等待期限（默认30秒）。该期限约束SSD队列与回调排空，不能保证挂起的GPU或系统调用立即终止。实际范围和验证见[使用合同](docs/KV_CACHE_RELIABILITY.md)。缓存收益来自减少重复prefill；不代表基础decode吞吐提升。
 
-启动、诊断、停服与重启见[KV cache运维](docs/KV_CACHE_OPERATIONS.md)；持续SSD读写淘汰、取消与资源归还的公开复跑入口见[HTTP cache churn](docs/HTTP_CACHE_CHURN_REPRODUCIBILITY.md)。长上下文的真实分词、RAM冷热复用、解码及取消恢复验证见[HTTP长上下文复跑](docs/HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)；该入口不扩大SSD归档限制。
+启动、诊断、停服与重启见[KV cache运维](docs/KV_CACHE_OPERATIONS.md)；持续SSD读写淘汰、取消与资源归还的公开复跑入口见[HTTP cache churn](docs/HTTP_CACHE_CHURN_REPRODUCIBILITY.md)。长上下文的真实分词、RAM冷热复用、解码及取消恢复流程见[HTTP长上下文复跑](docs/HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)。最大262144是完整prompt加请求输出预算，不是265000；默认仍为16384，较大请求还需显式配置body、调度、RAM及期限。基线CLI的P262142/O2冷/热RAM全状态对照已通过；真实262144 HTTP的冷JSON、热SSE、O32解码及约32K预填取消后的缓存复用已通过本次有界验收，状态与版本见[长上下文结果](docs/research/KV_LONG_CONTEXT_RESULTS.md)。这不代表完整长文质量、262K中途取消或耐久发布门槛已经通过。该入口不扩大当前2GiB SSD payload限制。
 
 显式容量策略`--kv-append-mode capacity256`仅用于普通AR decode，默认`reference`。完整模型四组对照观察到约3.9%–7.6%的decode增幅，输出一致；prefill没有可信收益，HTTP持续负载另行验收。实现范围、样本和漂移见[KV容量追加](docs/research/KV_CAPACITY_MODEL_RESULTS.md)。
 

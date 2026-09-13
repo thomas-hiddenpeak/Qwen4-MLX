@@ -410,7 +410,25 @@ public final class QwenModel {
         try copyPrefixState(source, sharePagedKV: true)
     }
 
-    private func copyPrefixState(_ source: State, sharePagedKV: Bool) throws -> State {
+    /// Internal RAM-hit path only. QwenPrefixCache passes its private Snapshot
+    /// state, already compacted by privatePrefixStateCopy at publication. Do
+    /// not use this entry point for arbitrary checkpoints or capacity views:
+    /// logical shape alone cannot prove a compact backing allocation.
+    ///
+    /// Attention arrays remain immutable while either the cache or the request
+    /// owns their Tensor handles. Reference suffix prefill creates new concat
+    /// outputs; any later capacity update must preserve the old live handles.
+    /// The full request/cache leases still cover each logical owner separately.
+    /// GDN/PLE tensors stay private and makeState supplies a new session identity.
+    func forkCompactRAMPrefixState(_ source: State) throws -> State {
+        guard source.offset > 0, !source.hasPagedKV else {
+            throw GPUError.invalid("Compact RAM prefix restoration requires nonempty dense state")
+        }
+        return try copyPrefixState(source, sharePagedKV: false, shareCompactAttention: true)
+    }
+
+    private func copyPrefixState(_ source: State, sharePagedKV: Bool,
+                                 shareCompactAttention: Bool = false) throws -> State {
         guard source.owner == identity, source.valid,
               source.gdn.allSatisfy({ $0.verificationCapture == nil }),
               source.ple.allSatisfy({ $0.verificationCapture == nil }) else {
@@ -429,19 +447,24 @@ public final class QwenModel {
         func clone(_ value: Tensor?) throws -> Tensor? {
             try value.map { try GPUVerificationCopy.tensor($0) }
         }
+        func attentionTensor(_ value: Tensor?) throws -> Tensor? {
+            if shareCompactAttention { return value }
+            return try clone(value)
+        }
         for i in layers.indices {
             result.gdn[i] = GPUGatedDeltaNet.State(convHistory: try clone(source.gdn[i].convHistory),
                 recurrent: try clone(source.gdn[i].recurrent), offset: source.gdn[i].offset)
             let attention = source.attention[i]
-            var copied = GPUAttention.State(rawIndexerKeys: try clone(attention.rawIndexerKeys),
-                pooledIndexerKeys: try clone(attention.pooledIndexerKeys), offset: attention.offset)
+            var copied = GPUAttention.State(rawIndexerKeys: try attentionTensor(attention.rawIndexerKeys),
+                pooledIndexerKeys: try attentionTensor(attention.pooledIndexerKeys), offset: attention.offset)
             if sharePagedKV, let paged = attention.pagedKV {
                 try copied.installPagedKV(paged.fork())
             } else if let kv = try attention.materializedKV() {
                 // A paged export is already an independent compact allocation.
-                // Dense sources need the existing gather copy to sever aliases.
-                copied.keys = attention.pagedKV == nil ? try clone(kv.keys) : kv.keys
-                copied.values = attention.pagedKV == nil ? try clone(kv.values) : kv.values
+                // Only the internal RAM-hit path shares its compact dense
+                // snapshot. Other dense callers retain the existing gather copy.
+                copied.keys = attention.pagedKV == nil ? try attentionTensor(kv.keys) : kv.keys
+                copied.values = attention.pagedKV == nil ? try attentionTensor(kv.values) : kv.values
             }
             result.attention[i] = copied
             result.ple[i].history = source.ple[i].history

@@ -183,9 +183,34 @@ private final class GPUHTTPInbox: @unchecked Sendable {
     var count: Int { condition.lock(); defer { condition.unlock() }; return requests.count }
 }
 
+/// Value-only progress copied from the inference thread at scheduler boundaries.
+/// Prompt progress includes restored cache tokens; it is not a forward counter.
+private struct GPUHTTPRequestProgress: Sendable {
+    let requestID: String
+    let promptTotal: Int
+    var stage: QwenLocalScheduler.Stage = .prefill
+    var lastEvent: QwenLocalScheduler.EventKind?
+    var processedPromptTokens = 0, generatedTokens = 0
+
+    mutating func observe(_ event: QwenLocalScheduler.Event) {
+        stage = event.stage; lastEvent = event.kind
+        if let count = event.processedPromptTokens { processedPromptTokens = count }
+        if let count = event.generatedTokenCount { generatedTokens = count }
+    }
+
+    /// JSON is constructed only for a health request on the network queue.
+    var json: [String: Any] {
+        ["request_id": requestID, "stage": stage.rawValue,
+         "last_event": lastEvent?.rawValue as Any? ?? NSNull(),
+         "prompt_total": promptTotal, "processed_prompt_tokens": processedPromptTokens,
+         "generated_tokens": generatedTokens]
+    }
+}
+
 private struct GPUHTTPHealth: Sendable {
     var state = "loading", detail: String?
     var runningJob: String?
+    var requestProgress: [GPUHTTPRequestProgress] = []
     var idle = false, active = 0, jobs = 0
     var prefills = 0, ready = 0, resident = 0, reserved = 0, waitingPrefix = 0
     var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?, pagedKVJSON: Data?
@@ -283,13 +308,15 @@ private final class GPUHTTPClient: @unchecked Sendable {
 /// Owns CPU text state only and is used exclusively on the fixed inference thread.
 private final class GPUHTTPActive {
     let work: GPUHTTPWork
+    var progress: GPUHTTPRequestProgress
     var utf8 = IncrementalUTF8Decoder()
     var text = ""
     var textBudget: QwenHTTPTextBudget
     var schedulerID: UUID?
     var toolParser: QwenToolStreamParser?
     var invalidToolCall = false
-    init(_ work: GPUHTTPWork, maxTextBytes: Int) {
+    init(_ work: GPUHTTPWork, promptTotal: Int, maxTextBytes: Int) {
+        progress = GPUHTTPRequestProgress(requestID: work.id, promptTotal: promptTotal)
         self.work = work; textBudget = QwenHTTPTextBudget(maxBytes: maxTextBytes)
         if work.chat.parsesTools {
             toolParser = QwenToolStreamParser(tools: work.chat.activeTools,
@@ -473,6 +500,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 "pending_requests": inbox.count, "connections": clients.count,
                 "running_job": h.runningJob as Any? ?? NSNull(),
                 "running_job_known": h.active == 0 || h.runningJob != nil,
+                "request_progress": h.requestProgress.map { $0.json },
+                "request_progress_sample": "completed_scheduler_slice",
+                "processed_prompt_tokens_includes_cache": true,
                 "detail": h.detail.map { String($0.prefix(512)) } as Any? ?? NSNull(),
                 "prefix_cache": h.prefixCacheJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "prefix_cache_limits": configuration.prefixCacheBytes == 0 ? NSNull() : [
@@ -789,7 +819,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
         shutdown(error: error)
         for signal in signals { signal.cancel() }; signals.removeAll()
         listener.stateUpdateHandler = nil
-        health.withLock { $0.state = error == nil ? "stopping" : "failed"; $0.active = 0; $0.jobs = 0; $0.idle = true }
+        health.withLock {
+            $0.state = error == nil ? "stopping" : "failed"; $0.active = 0; $0.jobs = 0; $0.idle = true
+            $0.requestProgress.removeAll()
+        }
         guard !completionSignalled else { return }
         completionSignalled = true; finished.signal()
     }
@@ -871,10 +904,14 @@ private final class GPUHTTPServer: @unchecked Sendable {
             // All MLX interaction stays on this inference OS thread. The
             // network queue sees only the copied numeric values below.
             let memory = try? MX.memory()
+            // Existing queue/ready admission limits bound this list (currently
+            // 8 + 2 jobs). No request text, token IDs or device state escapes.
+            let progress = jobs.values.map { $0.progress }.sorted { $0.requestID < $1.requestID }
             health.withLock {
                 $0.prefixCacheJSON = cacheJSON; $0.pagedKVJSON = pagedJSON
                 $0.prefixDiskJSON = diskJSON; $0.stateBudgetJSON = budgetJSON; $0.mlxMemory = memory
                 $0.active = active; $0.jobs = jobs.count; $0.prefills = s.queuedPrefills
+                $0.requestProgress = progress
                 $0.runningJob = s.runningJob?.uuidString
                 $0.ready = s.readyDecodes; $0.resident = s.residentSequences; $0.reserved = s.reservedTokens
                 $0.waitingPrefix = s.waitingPrefixSequences ?? 0
@@ -922,7 +959,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
                         draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil,
                         prefillAttention: configuration.prefillAttention, prefixCachePlan: prefixPlan,
                         kvAppendMode: work.chat.mtpDepth == 0 ? configuration.kvAppendMode : .reference)
-                    let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
+                    let active = GPUHTTPActive(work, promptTotal: tokens.count,
+                                               maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
                         self.health.withLock { $0.runningJob = active.schedulerID?.uuidString }
                         let text = active.utf8.append(try tokenizer.decodeBytes([token], skipSpecialTokens: true))
@@ -955,10 +993,15 @@ private final class GPUHTTPServer: @unchecked Sendable {
             }
             if inbox.isStopping { return false }
             snapshot(active: scheduler.snapshot().isIdle ? 0 : 1)
-            if let event = try scheduler.runNext(), [.completed, .failed, .cancelled].contains(event.kind),
-               let active = jobs.removeValue(forKey: event.jobID) {
-                if pagedKVContext != nil { pagedKVCompleted.record(event.result?.phases) }
-                complete(event, active: active)
+            if let event = try scheduler.runNext() {
+                if [.completed, .failed, .cancelled].contains(event.kind) {
+                    if let active = jobs.removeValue(forKey: event.jobID) {
+                        if pagedKVContext != nil { pagedKVCompleted.record(event.result?.phases) }
+                        complete(event, active: active)
+                    }
+                } else if let active = jobs[event.jobID] {
+                    active.progress.observe(event)
+                }
             }
             snapshot()
             let paused = scheduler.snapshot()
