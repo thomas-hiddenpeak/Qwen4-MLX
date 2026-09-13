@@ -114,6 +114,68 @@ struct QwenPrefixCheckpoint: Equatable {
     }
 }
 
+/// Immutable cache provenance and the independently admitted attachment
+/// metadata. A request retains this same wrapper through a paused prefill or
+/// handoff, so evicting its dense cache entry cannot release admission early.
+final class QwenPrefixPagedAttachment {
+    let prefix: QwenPagedKVPrefix
+    let namespace, executionNamespace: String
+    let checkpoint: QwenPrefixCheckpoint
+    let metadataBytes: Int
+    private let metadataLease: QwenStateBudget.Lease
+
+    fileprivate static func metadataCharge(offset: Int, attentionLayers: Int,
+                                           namespace: String, executionNamespace: String) throws -> Int {
+        // Token keys belong to the bounded radix index; this wrapper stores
+        // only their digest. Account its strings separately from page metadata.
+        let namespaceBytes = namespace.utf8.count, executionBytes = executionNamespace.utf8.count
+        guard namespaceBytes > 0, namespaceBytes <= 65_536,
+              executionBytes > 0, executionBytes <= 65_536 else {
+            throw GPUError.invalid("Paged cache attachment namespace exceeds its binding allowance")
+        }
+        return try QwenPagedKVPrefix.estimatedMetadataBytes(offset: offset, attentionLayerCount: attentionLayers)
+            + namespaceBytes + executionBytes + 64 + 4_096
+    }
+
+    fileprivate init(prefix: QwenPagedKVPrefix, metadataLease: QwenStateBudget.Lease,
+                     namespace: String, executionNamespace: String, checkpoint: QwenPrefixCheckpoint) throws {
+        let bytes = try Self.metadataCharge(offset: prefix.offset, attentionLayers: prefix.attentionStates.count,
+            namespace: namespace, executionNamespace: executionNamespace)
+        guard checkpoint.boundary == prefix.offset, checkpoint.key.utf8.count == 64,
+              metadataLease.kind == .cache, !metadataLease.isReleased, metadataLease.bytes == bytes else {
+            throw GPUError.invalid("Paged cache attachment has inconsistent binding or metadata admission")
+        }
+        self.prefix = prefix; self.metadataLease = metadataLease; self.metadataBytes = bytes
+        self.namespace = namespace; self.executionNamespace = executionNamespace; self.checkpoint = checkpoint
+    }
+
+    /// Host-only identity check. A generator supplies its execution namespace
+    /// and context; a cache additionally supplies its complete disk namespace.
+    /// Invalid optional attachment metadata is ignored without evicting dense KV.
+    func matches(tokens: [Int32], namespace expectedNamespace: String? = nil,
+                 executionNamespace expectedExecution: String, context: QwenPagedKVContext) -> Bool {
+        guard prefix.context === context, executionNamespace == expectedExecution,
+              expectedNamespace == nil || namespace == expectedNamespace,
+              prefix.offset > 0, prefix.offset <= tokens.count, checkpoint.boundary == prefix.offset,
+              !metadataLease.isReleased, metadataLease.bytes == metadataBytes,
+              checkpoint == QwenPrefixCheckpoint(tokens: tokens, namespace: namespace, boundary: prefix.offset) else {
+            return false
+        }
+        do {
+            try prefix.validate(modelOwner: context.modelOwner, context: context, layerIndices: context.pools.keys.sorted())
+            return true
+        } catch { return false }
+    }
+}
+
+/// An optional RAM attachment failure must not be interpreted as a corrupt
+/// SSD archive by the surrounding restore fallback. Capacity is preflighted;
+/// unexpected writer/device errors propagate after synchronization.
+private struct QwenPrefixPagedAttachmentFailure: Error, CustomStringConvertible {
+    let cause: String
+    var description: String { "Paged prefix attachment failed: " + cause }
+}
+
 /// One request lookup context survives both checkpoint publications. Only
 /// ownedProducer is a computation flight; full lookup tokens are never its key.
 final class QwenPrefixCacheFlight {
@@ -121,6 +183,7 @@ final class QwenPrefixCacheFlight {
     let namespace: String, tokens: [Int32], identity = UUID(), epoch: UInt64
     let checkpoints: [QwenPrefixCheckpoint]
     let prefillChunk: Int
+    let executionNamespace: String
     let systemProducerBoundary: Int?
     let allowWaitingForLeader: Bool
     var ownedProducer: QwenPrefixCheckpoint?
@@ -140,11 +203,12 @@ final class QwenPrefixCacheFlight {
     let startedAt = DispatchTime.now().uptimeNanoseconds
     init(cache: QwenPrefixCache, namespace: String, tokens: [Int32],
          checkpoints: [QwenPrefixCheckpoint], prefillChunk: Int, systemProducerBoundary: Int?,
-         epoch: UInt64, allowWaitingForLeader: Bool) {
+         epoch: UInt64, allowWaitingForLeader: Bool, executionNamespace: String = "") {
         self.allowWaitingForLeader = allowWaitingForLeader
         self.cache = cache; self.namespace = namespace; self.tokens = tokens; self.epoch = epoch
         self.checkpoints = checkpoints; self.prefillChunk = prefillChunk
         self.systemProducerBoundary = systemProducerBoundary
+        self.executionNamespace = executionNamespace
     }
     func detachRead() {
         readFence?.finishConsumer()
@@ -166,11 +230,13 @@ final class QwenPrefixCache {
         let state: QwenModel.State
         let lease: QwenStateBudget.Lease
         let createdAt: TimeInterval
+        let pagedAttachment: QwenPrefixPagedAttachment?
     }
     private let index: QwenPrefixCacheIndex<Snapshot>
     private let ttlSeconds: TimeInterval?
     private let diskRestoreTimeoutSeconds: TimeInterval
     private let memoryPressure: QwenMemoryPressurePolicy?
+    private let pagedKVContext: QwenPagedKVContext?
     let disk: QwenPrefixDiskStore?
     let diskIdentity: String
     private var published = 0, skippedOversize = 0, restoreFailures = 0
@@ -188,7 +254,8 @@ final class QwenPrefixCache {
     private var epoch: UInt64 = 0
 
     init(limits: QwenPrefixCacheLimits, disk: QwenPrefixDiskStore?, model: QwenModel,
-         memoryPressure: QwenMemoryPressurePolicy? = nil) throws {
+         memoryPressure: QwenMemoryPressurePolicy? = nil,
+         pagedKVContext: QwenPagedKVContext? = nil) throws {
         if let ttl = limits.ttlSeconds, !ttl.isFinite || ttl <= 0 { throw GPUError.invalid("Invalid prefix cache TTL") }
         guard limits.diskRestoreTimeoutSeconds.isFinite, limits.diskRestoreTimeoutSeconds > 0 else {
             throw GPUError.invalid("Invalid prefix SSD restore timeout")
@@ -196,6 +263,8 @@ final class QwenPrefixCache {
         index = try QwenPrefixCacheIndex(maxEntries: limits.maxEntries,
             maxBytes: limits.maxBytes, maxKeyTokens: limits.maxKeyTokens)
         ttlSeconds = limits.ttlSeconds; self.disk = disk
+        self.pagedKVContext = pagedKVContext
+        if let pagedKVContext { try model.validatePagedKVContext(pagedKVContext) }
         diskRestoreTimeoutSeconds = limits.diskRestoreTimeoutSeconds; self.memoryPressure = memoryPressure
         diskIdentity = try disk == nil ? "memory" : QwenPrefixCacheIdentity.fingerprint(modelDirectory: model.configuration.modelDirectory)
     }
@@ -254,7 +323,9 @@ final class QwenPrefixCache {
         return QwenPrefixCacheFlight(cache: self, namespace: ns, tokens: tokens,
             checkpoints: checkpoints, prefillChunk: request.prefillChunk,
             systemProducerBoundary: policy.systemProducerBoundary,
-            epoch: epoch, allowWaitingForLeader: allowWaitingForLeader)
+            epoch: epoch, allowWaitingForLeader: allowWaitingForLeader,
+            executionNamespace: request.prefixCacheNamespace(accumulation: model.prefillAccumulation.rawValue,
+                fusedPrefill: model.fusedPrefillEnabled))
     }
     func releaseFlight(key: String, identity: UUID) {
         flights.release(key: key, identity: identity)
@@ -323,18 +394,21 @@ final class QwenPrefixCache {
         return nil
     }
     private func recoverOptionalFailure(model: QwenModel, error: Error) throws {
-        if error as? QwenGenerationError == .cancelled { throw error }
+        // Cancellation cannot return admissions before submitted work joins.
+        // A failed join takes precedence over the original cancellation.
         do { try MX.synchronize() }
         catch {
             model.failGenerationRecovery(String(describing: error))
             throw QwenGenerationError.unavailable("Prefix device recovery failed")
         }
+        if error as? QwenGenerationError == .cancelled { throw error }
     }
 
     struct Resolution {
         let state: QwenModel.State?
         let source: String
         let lookupSeconds, restoreSeconds: Double
+        let pagedAttachment: QwenPrefixPagedAttachment?
     }
     /// Nil means asynchronous I/O or another prefix leader is still pending.
     /// No GPU work is submitted for a waiting follower.
@@ -352,12 +426,13 @@ final class QwenPrefixCache {
             defer { restoreWork += elapsed(start) }
             return try body()
         }
-        func resolved(_ state: QwenModel.State?, source: String) -> Resolution {
+        func resolved(_ state: QwenModel.State?, source: String,
+                      pagedAttachment: QwenPrefixPagedAttachment? = nil) -> Resolution {
             releaseReadAdmission(f)
             f.resolved = true
             return .init(state: state, source: source,
                 lookupSeconds: f.lookupSeconds + max(0, elapsed(started) - restoreWork),
-                restoreSeconds: f.restoreSeconds + restoreWork)
+                restoreSeconds: f.restoreSeconds + restoreWork, pagedAttachment: pagedAttachment)
         }
         try checkCancellation()
         guard current(f) else {
@@ -379,20 +454,23 @@ final class QwenPrefixCache {
                 let expected = f.readCheckpoint?.boundary
                 if let match = read.take(), match.prefixTokenCount == expected {
                     do {
+                        var promotedAttachment: QwenPrefixPagedAttachment?
                         let state = try restoring {
                             let archive = QwenPrefixStateArchive(metadata: match.metadata, payload: match.payload,
                                 logicalPayloadBytes: try model.estimatedPrefixStateBytes(at: match.prefixTokenCount))
                             let restored = try model.importPrefixState(archive, expectedOffset: match.prefixTokenCount,
                                 checkCancellation: checkCancellation)
                             try checkCancellation()
-                            _ = try saveMemory(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace,
+                            promotedAttachment = try saveMemory(tokens: Array(f.tokens.prefix(match.prefixTokenCount)),
+                                namespace: f.namespace, executionNamespace: f.executionNamespace,
                                 state: restored, model: model, retainingSystemPrefix: f.systemProducerBoundary,
                                 checkCancellation: checkCancellation, observer: nil)
                             return restored
                         }
                         diskHits += 1; restoredHits += 1
-                        return resolved(state, source: "disk")
+                        return resolved(state, source: "disk", pagedAttachment: promotedAttachment)
                     } catch {
+                        if error is QwenPrefixPagedAttachmentFailure { throw error }
                         try recoverOptionalFailure(model: model, error: error)
                         _ = disk?.invalidateAsync(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
                         restoreFailures += 1
@@ -546,7 +624,9 @@ final class QwenPrefixCache {
                     }
                     _ = index.lookup(tokens: f.tokens, namespace: f.namespace)
                     restoredHits += 1
-                    return resolved(state, source: "memory")
+                    let attachment = compatibleAttachment(match.value.pagedAttachment, tokens: f.tokens,
+                        namespace: f.namespace, executionNamespace: f.executionNamespace)
+                    return resolved(state, source: "memory", pagedAttachment: attachment)
                 } catch {
                     try recoverOptionalFailure(model: model, error: error)
                     index.remove(tokens: Array(f.tokens.prefix(match.prefixTokenCount)), namespace: f.namespace)
@@ -560,17 +640,95 @@ final class QwenPrefixCache {
         }
     }
 
-    private func saveMemory(tokens: [Int32], namespace: String, state: QwenModel.State, model: QwenModel,
-                            retainingSystemPrefix: Int?,
+    private func compatibleAttachment(_ attachment: QwenPrefixPagedAttachment?, tokens: [Int32],
+                                      namespace: String, executionNamespace: String) -> QwenPrefixPagedAttachment? {
+        guard let attachment, let pagedKVContext,
+              attachment.matches(tokens: tokens, namespace: namespace,
+                executionNamespace: executionNamespace, context: pagedKVContext) else { return nil }
+        return attachment
+    }
+
+    /// The caller already inserted a valid dense snapshot. Every capacity
+    /// denial below preserves that entry and does not evict another snapshot.
+    private func makeOptionalAttachment(tokens: [Int32], namespace: String, executionNamespace: String,
+                                         state: QwenModel.State, denseBytes: Int, model: QwenModel,
+                                         retainingPrefix: Int?, extending: QwenPrefixPagedAttachment?,
+                                         checkCancellation: () throws -> Void) throws -> QwenPrefixPagedAttachment? {
+        guard let context = pagedKVContext, state.offset == tokens.count,
+              state.offset > 0, state.offset <= context.maximumTokens,
+              memoryPressure?.checkOptionalCacheAdmission() ?? true else { return nil }
+        let ancestor = compatibleAttachment(extending, tokens: tokens, namespace: namespace,
+            executionNamespace: executionNamespace)
+        // Binding bounds are host-only optional metadata validation. A rejected
+        // binding does not invalidate an otherwise useful dense snapshot.
+        guard let charge = try? QwenPrefixPagedAttachment.metadataCharge(offset: state.offset,
+            attentionLayers: context.pools.count, namespace: namespace, executionNamespace: executionNamespace) else { return nil }
+        guard denseBytes <= index.maxBytes, charge <= index.maxBytes - denseBytes,
+              charge <= index.maxBytes - index.statistics.logicalPayloadBytes else { return nil }
+        let combinedBytes = denseBytes + charge
+        if let retainingPrefix,
+           !index.canInsertAlongsidePrefix(tokens: tokens, namespace: namespace,
+                logicalPayloadBytes: combinedBytes, prefixTokenCount: retainingPrefix) { return nil }
+        let oldOffset = ancestor?.prefix.offset ?? 0
+        let rows = state.offset - oldOffset
+        let requiredPages = rows == 0 ? 0 : (oldOffset % 32 + rows + 31) / 32
+        do {
+            let statistics = try context.layerStatistics
+            guard statistics.values.allSatisfy({ $0.failedOperations == 0 }) else {
+                model.failGenerationRecovery("Paged cache attachment arena has failed device operations")
+                throw GPUError.invalid("Cannot publish an attachment from a failed physical KV arena")
+            }
+            // Future request page claims are accounted by the context helper;
+            // optional cache pages must never consume a promised decode slot.
+            guard try context.canReserveOptionalPages(pagesPerLayer: requiredPages) else { return nil }
+        } catch {
+            throw QwenPrefixPagedAttachmentFailure(cause: String(describing: error))
+        }
+        // Deliberately avoid reserve(...model:), whose LRU eviction is useful
+        // for required dense state but wrong for an optional metadata upgrade.
+        guard let metadataLease = model.stateBudget.reserve(bytes: charge, kind: .cache) else { return nil }
+        defer { withExtendedLifetime(metadataLease) {} }
+        do {
+            try checkCancellation()
+            let prefix = try model.makePagedKVPrefix(state: state, context: context, extending: ancestor?.prefix)
+            // Completion pins can outlive a Swift State. Join before an error
+            // or cancellation could drop the optional metadata reservation.
+            try MX.synchronize()
+            try checkCancellation()
+            return try QwenPrefixPagedAttachment(prefix: prefix, metadataLease: metadataLease,
+                namespace: namespace, executionNamespace: executionNamespace,
+                checkpoint: QwenPrefixCheckpoint(tokens: tokens, namespace: namespace, boundary: state.offset))
+        } catch {
+            do { try MX.synchronize() }
+            catch {
+                model.failGenerationRecovery(String(describing: error))
+                throw QwenPrefixPagedAttachmentFailure(cause: "device recovery failed: \(error)")
+            }
+            if error as? QwenGenerationError == .cancelled { throw error }
+            if let stats = try? context.layerStatistics, stats.values.contains(where: { $0.failedOperations > 0 }) {
+                model.failGenerationRecovery("Paged cache attachment observed a failed device operation")
+            }
+            throw QwenPrefixPagedAttachmentFailure(cause: String(describing: error))
+        }
+    }
+
+    private func saveMemory(tokens: [Int32], namespace: String, executionNamespace: String,
+                            state: QwenModel.State, model: QwenModel, retainingSystemPrefix: Int?,
                             checkCancellation: () throws -> Void,
-                            observer: ((String, QwenModel.State) throws -> Void)?) throws -> Bool {
-        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return false }
+                            observer: ((String, QwenModel.State) throws -> Void)?,
+                            extending: QwenPrefixPagedAttachment? = nil) throws -> QwenPrefixPagedAttachment? {
+        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return nil }
         if let existing = index.peek(tokens: tokens, namespace: namespace), existing.prefixTokenCount == tokens.count {
-            duplicateSkipped += 1
-            return false
+            if let ttlSeconds, Date().timeIntervalSince1970 - existing.value.createdAt >= ttlSeconds {
+                index.remove(tokens: tokens, namespace: namespace); expired += 1
+            } else {
+                duplicateSkipped += 1
+                return compatibleAttachment(existing.value.pagedAttachment, tokens: tokens,
+                    namespace: namespace, executionNamespace: executionNamespace)
+            }
         }
         let bytes = try model.prefixStatePayloadBytes(state)
-        guard bytes <= index.maxBytes, tokens.count <= index.maxKeyTokens else { skippedOversize += 1; return false }
+        guard bytes <= index.maxBytes, tokens.count <= index.maxKeyTokens else { skippedOversize += 1; return nil }
         var retainedPrefix = retainingSystemPrefix
         if let boundary = retainedPrefix, boundary < tokens.count,
            let anchor = index.peek(tokens: tokens, namespace: namespace, maxPrefixTokens: boundary),
@@ -583,54 +741,75 @@ final class QwenPrefixCache {
            !index.canInsertAlongsidePrefix(tokens: tokens, namespace: namespace,
                                            logicalPayloadBytes: bytes, prefixTokenCount: boundary) {
             retainedSystemAnchorSkips += 1
-            return false
+            return nil
         }
-        guard let lease = reserve(bytes: bytes, kind: .cache, model: model) else { return false }
+        guard let lease = reserve(bytes: bytes, kind: .cache, model: model) else { return nil }
         let saved: QwenModel.State
         do { saved = try model.privatePrefixStateCopy(state) }
-        catch { lease.release(); try recoverOptionalFailure(model: model, error: error); budgetSkipped += 1; return false }
+        catch {
+            // Failed lazy copies may still be retained by native completion.
+            // Keep admission through recovery, including a throwing join.
+            defer { withExtendedLifetime(lease) {} }
+            try recoverOptionalFailure(model: model, error: error)
+            lease.release()
+            budgetSkipped += 1
+            return nil
+        }
         try observer?("publish", saved)
         try checkCancellation()
-        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return false }
+        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return nil }
+        let createdAt = Date().timeIntervalSince1970
         let inserted = index.insert(tokens: tokens, namespace: namespace,
-            value: Snapshot(state: saved, lease: lease, createdAt: Date().timeIntervalSince1970),
+            value: Snapshot(state: saved, lease: lease, createdAt: createdAt, pagedAttachment: nil),
             logicalPayloadBytes: bytes, retainingPrefixTokens: retainedPrefix)
-        if inserted { published += 1 }
-        return inserted
+        guard inserted else { return nil }
+        published += 1
+        guard let attachment = try makeOptionalAttachment(tokens: tokens, namespace: namespace,
+            executionNamespace: executionNamespace, state: saved, denseBytes: bytes, model: model,
+            retainingPrefix: retainedPrefix, extending: extending, checkCancellation: checkCancellation) else { return nil }
+        // Preflighted metadata fits alongside all current entries. Replacing
+        // this exact key retains its dense handles/lease and charges the wrapper.
+        let upgraded = index.insert(tokens: tokens, namespace: namespace,
+            value: Snapshot(state: saved, lease: lease, createdAt: createdAt, pagedAttachment: attachment),
+            logicalPayloadBytes: bytes + attachment.metadataBytes, retainingPrefixTokens: retainedPrefix)
+        return upgraded ? attachment : nil
     }
+    @discardableResult
     func publish(_ f: QwenPrefixCacheFlight, at boundary: Int, state: QwenModel.State, model: QwenModel,
                  checkCancellation: () throws -> Void,
-                 observer: ((String, QwenModel.State) throws -> Void)?) throws {
+                 observer: ((String, QwenModel.State) throws -> Void)?,
+                 extending: QwenPrefixPagedAttachment? = nil) throws -> QwenPrefixPagedAttachment? {
         // Only this exact checkpoint's computation ownership is released.
         // Retain the request context for the next publication opportunity.
         defer {
             releaseProducer(f, at: boundary)
             if current(f) { _ = prepareProducer(f, after: boundary, mayWait: false) }
         }
-        guard current(f) else { return }
+        guard current(f) else { return nil }
         guard let checkpoint = f.checkpoints.first(where: { $0.boundary == boundary }),
               state.offset == boundary, boundary > 0, boundary <= f.tokens.count,
               boundary % f.prefillChunk == 0 else {
             throw QwenGenerationError.unavailable("prefix publication does not match a complete planned checkpoint")
         }
         let tokens = Array(f.tokens.prefix(boundary)), key = checkpoint.key
-        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
-        _ = try saveMemory(tokens: tokens, namespace: f.namespace, state: state, model: model,
+        guard memoryPressure?.checkOptionalCacheAdmission() ?? true else { return nil }
+        let attachment = try saveMemory(tokens: tokens, namespace: f.namespace, executionNamespace: f.executionNamespace,
+            state: state, model: model,
             retainingSystemPrefix: f.systemProducerBoundary,
-            checkCancellation: checkCancellation, observer: observer)
+            checkCancellation: checkCancellation, observer: observer, extending: extending)
         guard let disk, disk.peek(tokens: tokens, namespace: f.namespace)?.prefixTokenCount != tokens.count,
-              memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
+              memoryPressure?.checkOptionalCacheAdmission() ?? true else { return attachment }
         // A waiter may have timed out and recomputed while this key's original
         // write is still in progress. Retain its ownership; never enqueue a
         // second full archive or replace the pending publication record.
-        if let pending = publications[key], !pending.isComplete { duplicateSkipped += 1; return }
+        if let pending = publications[key], !pending.isComplete { duplicateSkipped += 1; return attachment }
         // Avoid a known-low-value full host export while a foreground request
         // waits for SSD admission. This hint owns nothing; enqueue still makes
         // the atomic decision if a reader arrives after this check.
-        guard (disk.statistics.foregroundReadIntents ?? 0) == 0 else { return }
+        guard (disk.statistics.foregroundReadIntents ?? 0) == 0 else { return attachment }
         let bytes = try model.prefixStatePayloadBytes(state)
         guard bytes <= disk.limits.maxPendingBytes, bytes <= (Int.max - QwenPrefixStateArchiveDescriptor.maximumMetadataBytes) / 2,
-              let lease = reserve(bytes: bytes * 2 + QwenPrefixStateArchiveDescriptor.maximumMetadataBytes, kind: .workspace, model: model) else { return }
+              let lease = reserve(bytes: bytes * 2 + QwenPrefixStateArchiveDescriptor.maximumMetadataBytes, kind: .workspace, model: model) else { return attachment }
         // The submitting executor also owns the exported host archive until
         // this call returns, even if a small write completes immediately.
         defer { withExtendedLifetime(lease) {} }
@@ -638,7 +817,7 @@ final class QwenPrefixCache {
             let archive = try model.exportPrefixState(state, maxPayloadBytes: disk.limits.maxPendingBytes,
                 checkCancellation: checkCancellation)
             try checkCancellation()
-            guard current(f), memoryPressure?.checkOptionalCacheAdmission() ?? true else { return }
+            guard current(f), memoryPressure?.checkOptionalCacheAdmission() ?? true else { return attachment }
             let publication = QwenPrefixDiskPublication()
             publications = publications.filter { !$0.value.isComplete }
             if disk.enqueue(tokens: tokens, namespace: f.namespace, metadata: archive.metadata,
@@ -651,10 +830,13 @@ final class QwenPrefixCache {
                 publications[key] = publication
             } else { lease.release() }
         } catch {
-            lease.release()
+            // The outer lifetime guard retains the lease through this join;
+            // explicit release must not return export workspace before it.
             try recoverOptionalFailure(model: model, error: error)
+            lease.release()
             diskFallbacks += 1
         }
+        return attachment
     }
 }
 

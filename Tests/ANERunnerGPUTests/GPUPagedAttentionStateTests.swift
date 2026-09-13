@@ -126,6 +126,55 @@ final class GPUPagedAttentionStateTests: XCTestCase {
         XCTAssertTrue(valid.pagedKV === pageState)
     }
 
+    func testPagedPrefixBulkHandoffWritesOnlySuffixAndKeepsAncestor() throws {
+        let libraryPath = try library()
+        for (prefixRows, rows) in [(31,449), (416,832), (2051,2467)] {
+            let pool = try GPUPagedKVPool(libraryPath: libraryPath,
+                maximumPages: (rows + 31) / 32 + 3)
+            let prefixDense = try compact(rows: prefixRows)
+            var prefix = prefixDense
+            try prefix.usePagedKV(pool: pool); try evaluate(prefix)
+            let ancestor = try XCTUnwrap(prefix.pagedKV)
+            let ids = try ancestor.pageIDs
+            let dense = try compact(rows: rows)
+            var state = dense
+            let before = try pool.statistics
+            try state.usePagedKV(prefix: ancestor); try evaluate(state)
+            let after = try pool.statistics
+            let appended = try XCTUnwrap(state.pagedKV)
+            XCTAssertEqual(try Array(appended.pageIDs.prefix(prefixRows / 32)), Array(ids.prefix(prefixRows / 32)))
+            XCTAssertEqual(after.encodedWrites - before.encodedWrites, 1)
+            XCTAssertEqual(after.writtenRowBytes - before.writtenRowBytes, UInt64((rows - prefixRows) * 2048))
+            XCTAssertEqual(after.copiedTailBytes - before.copiedTailBytes, UInt64((prefixRows % 32) * 2048))
+            XCTAssertEqual(after.encodedMaterializations, before.encodedMaterializations)
+            XCTAssertEqual(try ancestor.pageIDs, ids)
+            try assertKV(state, equals: dense)
+            try assertKV(prefix, equals: prefixDense)
+        }
+    }
+
+    func testEqualOffsetPagedPrefixForkDoesNotAllocateOrWrite() throws {
+        let pool = try GPUPagedKVPool(libraryPath: library(), maximumPages: 3)
+        let dense = try compact(rows: 33)
+        var original = dense
+        try original.usePagedKV(pool: pool); try evaluate(original)
+        let ancestor = try XCTUnwrap(original.pagedKV)
+        var forked = dense
+        let before = try pool.statistics
+        try forked.usePagedKV(prefix: ancestor); try evaluate(forked)
+        let after = try pool.statistics
+        XCTAssertEqual(after.encodedWrites, before.encodedWrites)
+        XCTAssertEqual(after.livePages, before.livePages)
+        XCTAssertEqual(after.encodedMaterializations, before.encodedMaterializations)
+        XCTAssertEqual(try forked.pagedKV?.pageIDs, try ancestor.pageIDs)
+        var tooShort = try compact(rows: 32)
+        XCTAssertThrowsError(try tooShort.usePagedKV(prefix: ancestor))
+        XCTAssertNil(tooShort.pagedKV)
+        XCTAssertEqual(tooShort.offset, 32)
+        XCTAssertEqual(try pool.statistics, after)
+        try assertKV(forked, equals: dense)
+    }
+
     func testPublicSettersDropPagedOwnerAndRejectIncompleteDensePair() throws {
         let libraryPath = try library()
         for replaceKeys in [true,false] {

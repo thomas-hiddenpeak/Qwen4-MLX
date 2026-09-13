@@ -16,7 +16,7 @@
 
 | 能力 | 研究起点 `cb75be3` 的历史状态 | 当时识别的缺口；当前进度见下文 |
 | --- | --- | --- |
-| 精确混合状态与前缀树 | 完整快照、私有恢复、压缩 radix、LRU、TTL、条目/字节/key token 限额 | 尚未共享物理 KV 页；每个检查点保存整份状态 |
+| 精确混合状态与前缀树 | 完整快照、私有恢复、压缩 radix、LRU、TTL、条目/字节/key token 限额 | 默认保存整份状态；显式实验配置可附加共享物理 KV 页，仍保留 dense 快照和恢复成本 |
 | HTTP 自动复用范围 | 自动选取系统提示词与工具定义的准确 token 前缀 | 多轮 user/assistant/tool 历史、重复长文档、分支路径尚未自动成为完整复用范围 |
 | 状态追加与恢复 | Attention KV、QSA 历史使用 concat；RAM 保存/恢复复制完整快照 | 长前缀追加、恢复、分叉存在整段分配/复制；需测量并降低实际复制字节 |
 | 内存与并发 | 模型级 request/cache/workspace 联合逻辑预留；同前缀合并、取消接管 | 尚无实际系统内存压力反馈、水位滞回、会话公平份额；账本不是物理内存上限 |
@@ -56,6 +56,8 @@ K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DES
 K07 新增 [vllm-metal 吸收增量](research/VLLM_METAL_ADOPTION.md)：32-token Metal reader 已通过第一轮机制及 P11057 完整模型状态对照，显式 per-generator AR decode 仍读取 capacity view 的 identity 页表。第二增量实现独立单层固定物理 arena、不可变分支页表、完整页共享、尾页始终 COW、图/命令完成引用与显式导出；CPU 元数据 2,257 项检查通过，同步/异步 GPU 各通过 1,435 项检查。整模型/HTTP 尚未采用该页池，也未新增生产默认。
 
 2026-09-14 第三增量已把页池接入完整模型的显式实验配置：十二层 arena 各计一次原生寿命预算，求值根不导出连续 KV，分叉保留 KV 页并私有化 GDN/QSA/PLE。P11057 的 29 组完整混合状态与归档续写对照通过，3,509 个 BF16 张量记录一致；普通 decode 的直接页操作及零隐式导出通过。两组 O128 测量没有单请求吞吐收益，保留默认；现有前缀树仍保存 dense 快照，跨请求物理页复用、HTTP 与增量 SSD 尚未交付。具体口径见研究记录。
+
+同日第四增量已将[跨请求页附件](research/KV_PAGED_PREFIX_RESULTS.md)接入真实库生成器：可信前缀绑定、只追加 suffix、元数据跨 clear/eviction 持有、整请求未来页准入与 sticky dense fallback。P11057/B10816 的不同后缀、双游标、取消、小池竞争及跨 context 交接通过，133组完整状态/16093 BF16张量记录一致；无observer warm ABBA/BAAB没有稳定吞吐收益。它仍保留dense快照和prefill复制，HTTP/SSD promotion/长上下文/耐久尚待独立验证，默认未改变。K07整项和K08均未完成。
 
 ## 四、九项关键能力
 

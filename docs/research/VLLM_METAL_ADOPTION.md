@@ -124,3 +124,7 @@ P11057 完整模型探针包含 A/B 不同续写、保留旧 seed、显式 archi
 另补齐未完成 prefill/decode 游标的 generator 身份绑定，避免同模型的另一 generator 误用原 cache producer 或 decode 配置；完成的 `QwenPrefillResult` 仍允许同模型 PD 交接。`results/paged-model-v3/` 在 runner `9be879c9b96fc8b7c7ca4e448c3076af99e749f644f937b05422cb37142445f7` 上复过完整模型及新增 prefill 归属检查：拒绝外部 step 后 host、预算与 native counters 未变，原 generator 按原 chunk 网格完成，再成功交接。CPU45项和554/102 postflight通过。独立模型分析单独归属 v3；将 v2 机制与 v3 模型误传入要求相同 binary 的综合分析曾被正确拒绝，原记录保留，不把两版本合称同次验证。
 
 复跑入口是 `probe-gpu-paged-kv-model` 与 `benchmark-gpu-paged-kv`；参数见 CLI help，需通过唯一 GPU 控制器及新输出目录运行。第二个入口必须分别运行 ABBA/BAAB，不能拿状态探针的同步导出时间当作吞吐结果。跨请求页缓存接入后必须重新验证，不能继承本节的 cache-off 证据。
+
+## 第四增量：真实缓存请求复用物理页
+
+完整模型页池随后接入 RAM cache 的可选附件、精确 token/namespace/context 绑定、suffix-only 导入和全请求物理页准入。已通过独立冷 oracle、不同后缀、双游标清缓存后继续、取消、小池竞争的固定 dense 回退及跨 context 交接。该路径继续保留 dense 快照和 chunk prefill；133组完整状态、16093个BF16张量记录通过，warm ABBA/BAAB 未建立稳定吞吐收益，默认不变。结果、容量口径与复跑入口见[跨请求页复用](KV_PAGED_PREFIX_RESULTS.md)。HTTP、增量 SSD 和完整长上下文的验收仍独立推进。

@@ -2,6 +2,10 @@
 
 ## 2026-09-13 夜间窗口：完整模型共享 KV 页池
 
+00:57 更新：M2 实际cached all/O8和warm ABBA/BAAB已完成。133完整state/16093 BF16张量、114token观察、14完整生成+1取消通过；不同后缀各自oracle、小池347页第二cursor唯一claim拒绝后sticky dense、clear后metadata保持和最终零预算通过。独立combined151845检查通过。warm decode A/B：ABBA15.38/15.59(+1.37%)、BAAB17.05/16.53(-3.04%)；不据此改默认。559文件/102model stat postflight通过，参考54317 exactargv/idle/MTPdrafter关闭，最新ledger results/paged-prefix-model-v1/run-ledger.json。root正准备M2 commit/push；冻结解除。后续先提升M2HTTP opt-in候选并短验收，再独立长context参数/profile验证（现serve-gpu硬16K、body1MiB、连接300s及budget不足等真障碍已查明）。262K dense RAM本身可表示，SSD整archive2GiB上限不扩大；长contextreference QSA激活工作集需先测，不能只改配置称完成。
+
+00:42 更新：M1 已提交并推送 `b5680d1`，远程 SHA 核对一致，GitHub 默认分支仍是 `codex/runner-baseline`。M2 runtime lowlevel/cache/generator/admission 已提升，附带先同步再归还错误路径预算和 poisoned pool 明确标不可用两项修复；两轮 release/142 CPU通过。当前唯一GPU控制器 `results/paged-prefix-mechanism-v1/plan.json`、exec session19396，557文件/102model stat冻结，原参考50749由controller暂停属正常；新增bulk suffix/equal-offset测试在内的Attention6项GPU已通过，M1整模型回归正在运行。结束后仍需postflight，不改active源码/Tests/scripts/native/binary。新真实cached probe、无observer warmcache benchmark、后续HTTP显式接入均仅ignored候选，尚未验收；先过库验证并阶段commit，才提升HTTP。
+
 00:29 更新：M1 完整模型页池已完成两轮受控验证。v2 的29组混合状态/3509 BF16张量、机制sync/async各1448检查和71476224元素通过，独立模型+机制58720检查通过；ABBA/BAAB的1088输出IDs与历史参考一致，独立计数/phase分析2562检查通过。decode均速stock/paged为16.48/14.69、18.06/15.95tok/s，无提速结论，默认不变。未完成prefill/decode游标已绑定generator，完成handoff保留model级PD；v3 CPU45及完整模型/ownership复跑通过。v3模型单独分析，误混v2机制的综合分析因binary不同被拒绝并保留原记录。两轮554冻结文件/102model stat postflight均通过；当前参考50749 exact argv、idle、MTP/drafter关闭，当前ledger见experiment-status.json。源码冻结已解除，root准备阶段commit/push。
 
 M2候选在 results/paged-prefix-candidate/{lowlevel,cache,generation,admission,probe} 准备，尚未编译/运行：dense缓存附带可信namespace/token/context绑定的paged KV，实际decode只追加suffix；常量物理page claim保护全部未来decode，额度不足整个cursor走dense，不按token反复尝试。仍保留dense缓存和prefill复制，不能声称已经fullypagedprefill。root唯一build/GPU/Git，阶段截止与04:40收尾不变。以下本夜较早条目为历史过程。

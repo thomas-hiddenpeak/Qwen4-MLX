@@ -164,6 +164,35 @@ public final class GPUAttention {
             self = converted
         }
 
+        /// Internal cache handoff after the caller proves token-prefix identity.
+        /// Dense chunk prefill has already computed the complete current state;
+        /// append only its suffix and preserve the attachment's physical pages.
+        /// Equal offsets share the immutable page state without exporting data.
+        mutating func usePagedKV(prefix: GPUPagedKVPool.State) throws {
+            try GPUAttention.validate(self)
+            guard pagedKV == nil, let storedKeys, let storedValues,
+                  prefix.logicalTokens > 0, prefix.logicalTokens <= offset,
+                  prefix.pageCount == (prefix.logicalTokens + 31) / 32 else {
+                throw GPUAttentionError.invalid("Paged prefix handoff requires complete dense state at or beyond its prefix offset")
+            }
+            let appended: GPUPagedKVPool.State
+            if prefix.logicalTokens == offset {
+                appended = try prefix.fork()
+            } else {
+                let start = prefix.logicalTokens
+                let suffixKeys = try MX.slice(storedKeys, starts: [0,0,start,0], ends: [1,2,offset,256])
+                let suffixValues = try MX.slice(storedValues, starts: [0,0,start,0], ends: [1,2,offset,256])
+                appended = try prefix.appendRows(keys: suffixKeys, values: suffixValues)
+            }
+            var converted = self
+            converted.storedKeys = nil; converted.storedValues = nil
+            converted.kvCapacity = nil; converted.kvKeyIdentity = nil; converted.kvValueIdentity = nil
+            converted.pagedKV = appended
+            converted.retainedKVRowCount = offset
+            try GPUAttention.validate(converted)
+            self = converted
+        }
+
         /// Install an immutable fork beside its matching QSA state. This is an
         /// internal whole-state operation; partial public setters never do this.
         mutating func installPagedKV(_ paged: GPUPagedKVPool.State) throws {

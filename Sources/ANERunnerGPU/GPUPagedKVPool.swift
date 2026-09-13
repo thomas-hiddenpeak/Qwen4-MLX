@@ -228,6 +228,9 @@ public final class GPUPagedKVPool {
         }
         deinit { pool.destroyStateNative(context) }
 
+        /// Internal attachment validation; no pointer/readback metadata export.
+        func belongs(to expectedPool: GPUPagedKVPool) -> Bool { pool === expectedPool }
+
         /// Diagnostic host metadata only; allocating this array is intentionally
         /// excluded from the O(1) fork and steady-state reader measurement.
         public var pageIDs: [Int32] {
@@ -250,6 +253,20 @@ public final class GPUPagedKVPool {
             guard logicalTokens < pool.maximumTokens, keys.shape == [1,2,1,256], values.shape == keys.shape,
                   keys.dtype == MLX_BFLOAT16, values.dtype == MLX_BFLOAT16 else {
                 throw GPUError.invalid("Physical KV append requires BF16 [1,2,1,256] within the initialized context")
+            }
+            return try appendRows(keys: keys, values: values)
+        }
+
+        /// Explicit prefill/cache handoff: append only newly computed dense
+        /// rows while preserving the immutable physical prefix. Native bulk
+        /// append already supports this shape and copies at most its old tail.
+        /// This does not enable multi-query paged attention in forward().
+        public func appendRows(keys: Tensor, values: Tensor) throws -> State {
+            let shape = keys.shape
+            guard shape.count == 4, shape[0] == 1, shape[1] == 2, shape[3] == 256,
+                  shape[2] > 0, shape[2] <= pool.maximumTokens - logicalTokens,
+                  values.shape == shape, keys.dtype == MLX_BFLOAT16, values.dtype == MLX_BFLOAT16 else {
+                throw GPUError.invalid("Physical KV bulk append requires bounded nonempty BF16 [1,2,S,256]")
             }
             return try pool.createState(operation: "append") { pool.appendNative(&$0, UnsafeRawPointer(context), keys.handle, values.handle) }
         }

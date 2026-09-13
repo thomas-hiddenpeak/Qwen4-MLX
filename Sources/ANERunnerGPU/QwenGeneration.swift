@@ -273,6 +273,13 @@ public struct QwenGenerationPhases: Codable, Sendable {
     /// Explicit compact-to-page import is included in decode round/service time.
     public var pagedKVImportSeconds: Double? = nil
     public var pagedKVTokenSteps: Int? = nil
+    /// Logical per-layer prefix rows actually reused and dense rows imported
+    /// at the first decode handoff. Zero when the cursor stays dense.
+    public var pagedKVReusedPrefixTokens: Int? = nil
+    public var pagedKVImportedSuffixRows: Int? = nil
+    /// One sticky capacity decision per cursor; no repeated per-token retry.
+    public var pagedKVCapacityFallbacks: Int? = nil
+    public var pagedKVReservedPagesPerLayer: Int? = nil
 }
 
 /// A single-use payload, confined to the model's inference executor. An invalid
@@ -308,12 +315,14 @@ public final class QwenPrefillResult {
     fileprivate init(model: QwenModel, request: QwenGenerationRequest, state: QwenModel.State,
                      decoder: QwenMTPDecoder?, requestLease: QwenStateBudget.Lease,
                      firstToken: Int32, statistics: QwenPrefillStatistics,
-                     preparationSeconds: Double, requestStartedAt: UInt64) {
+                     preparationSeconds: Double, requestStartedAt: UInt64,
+                     pagedAttachment: QwenPrefixPagedAttachment? = nil) {
         self.model = model; self.request = request; self.firstToken = firstToken
         self.statistics = statistics; self.preparationSeconds = preparationSeconds
         readyAt = DispatchTime.now().uptimeNanoseconds
         self.requestStartedAt = requestStartedAt
-        payload = QwenSingleUseHandoff(QwenPrefillPayload(requestLease: requestLease, state: state, decoder: decoder))
+        payload = QwenSingleUseHandoff(QwenPrefillPayload(requestLease: requestLease, state: state,
+            decoder: decoder, pagedAttachment: pagedAttachment))
     }
     /// Release an unused, completed job on the same inference executor.
     public func discard() { payload.discard() }
@@ -323,6 +332,7 @@ fileprivate struct QwenPrefillPayload {
     let requestLease: QwenStateBudget.Lease
     var state: QwenModel.State
     let decoder: QwenMTPDecoder?
+    var pagedAttachment: QwenPrefixPagedAttachment?
 }
 
 /// A request-local prefill cursor on the model's inference executor. One step
@@ -371,6 +381,7 @@ fileprivate final class QwenPrefillProgress {
     var cacheBoundaries: [Int] = []
     var cachedTokens = 0, actualForwardTokens = 0
     var cacheFlight: QwenPrefixCacheFlight?
+    var pagedAttachment: QwenPrefixPagedAttachment?
     var cacheResolved = true
     var cacheSource = "cold"
     var cacheWaitSeconds = 0.0
@@ -403,9 +414,19 @@ public final class QwenDecodeSession {
     }
     public func discard() throws {
         guard !isActive else { throw QwenGenerationError.busy }
+        do { try progress?.finishPagedOwnership() }
+        catch {
+            model.failGenerationRecovery(String(describing: error))
+            progress = nil
+            throw error
+        }
         progress = nil
     }
     fileprivate func recordGenerated(_ count: Int) { generatedTokenCount = count }
+}
+
+fileprivate enum QwenPagedKVDecodeDecision: Equatable {
+    case pending, paged, denseFallback
 }
 
 fileprivate final class QwenDecodeProgress {
@@ -423,13 +444,41 @@ fileprivate final class QwenDecodeProgress {
     var kvCapacityTokenSteps = 0, kvCapacityWorkspaceFallbacks = 0
     var kvCapacityWorkspacePeakBytes = 0
     var pagedKVImportSeconds = 0.0, pagedKVTokenSteps = 0
+    var pagedKVReusedPrefixTokens = 0, pagedKVImportedSuffixRows = 0
+    var pagedKVCapacityFallbacks = 0, pagedKVReservedPagesPerLayer = 0
+    var pagedKVDecision = QwenPagedKVDecodeDecision.pending
+    var pagedKVPageLease: QwenPagedDecodePageLease?
+    var pagedAttachment: QwenPrefixPagedAttachment?
     var ssdWait = 0.0
     init(payload: QwenPrefillPayload, prepared: QwenPrefillResult,
          handoffWaitSeconds: Double, handoffConsumeSeconds: Double, now: UInt64) {
         requestLease = payload.requestLease
         state = payload.state; decoder = payload.decoder; self.prepared = prepared
+        pagedAttachment = payload.pagedAttachment
         self.handoffWaitSeconds = handoffWaitSeconds; self.handoffConsumeSeconds = handoffConsumeSeconds
         next = prepared.firstToken; lastYieldAt = now
+    }
+    /// Called on the same inference executor. Success/discard propagate device
+    /// failures; deinit supplies the nonthrowing abandoned-cursor cleanup only.
+    func finishPagedOwnership() throws {
+        guard pagedKVPageLease != nil else { return }
+        try MX.synchronize()
+        state.reset()
+        pagedAttachment = nil
+        pagedKVPageLease?.release()
+        pagedKVPageLease = nil
+    }
+    deinit {
+        // A paused cursor can be discarded without another decode step. Keep
+        // its future-page claim and attachment admission until device work is
+        // joined and all request-owned physical state has been dropped.
+        if pagedKVPageLease != nil {
+            do { try MX.synchronize() }
+            catch { prepared.model.failGenerationRecovery(String(describing: error)) }
+            state.reset()
+            pagedAttachment = nil
+            pagedKVPageLease?.release()
+        }
     }
 }
 
@@ -445,6 +494,9 @@ public final class QwenGenerator {
     private let memoryPressure: QwenMemoryPressurePolicy?
     /// Explicit per-generator AR experiment; never changes shared model defaults.
     private let pagedSDPAReader: GPUPagedSDPAReader?
+    /// A serving context is exclusive to admitted generator/cache paths. Do
+    /// not mix manual model import/fork/forward operations into these arenas;
+    /// those low-level experiment APIs do not participate in future-page claims.
     private let pagedKVContext: QwenPagedKVContext?
     private let generatorIdentity = UUID()
     /// Diagnostics only: readback here perturbs execution and is excluded from
@@ -454,6 +506,10 @@ public final class QwenGenerator {
     /// after each synchronous selected-token/state evaluation. Readback perturbs
     /// timings. Do not mutate tensors, reenter generation or retain unbudgeted
     /// state aliases. MTP never invokes this observer.
+    /// With physical pages, synchronously copy hashes/bytes or raw page-ID
+    /// arrays only. Never retain State or native page aliases after the callback:
+    /// future-page admission assumes one current decode state. Additional
+    /// logical-byte reservation does not reserve historical physical tails.
     public var decodeStateObserver: ((String, QwenModel.State) throws -> Void)?
     /// Read only on the owning inference executor, like other model statistics.
     public var prefixCacheStatistics: QwenPrefixCacheStatistics? { prefixCache?.statistics }
@@ -494,7 +550,8 @@ public final class QwenGenerator {
             throw QwenGenerationError.invalidRequest("SSD prefix cache requires prefix cache limits")
         }
         prefixCache = try prefixCacheLimits.map {
-            try QwenPrefixCache(limits: $0, disk: prefixDiskStore, model: model, memoryPressure: memoryPressurePolicy)
+            try QwenPrefixCache(limits: $0, disk: prefixDiskStore, model: model,
+                memoryPressure: memoryPressurePolicy, pagedKVContext: pagedKVContext)
         }
         let stops = try QwenTokenizer(modelDirectory: model.configuration.modelDirectory).eosTokenIDs
         guard !stops.isEmpty, stops.allSatisfy({ $0 >= 0 && Int($0) < model.configuration.vocabularySize }) else {
@@ -515,17 +572,13 @@ public final class QwenGenerator {
     /// capacity. Device health and exclusive access are checked at stage entry.
     public func validateRequest(_ request: QwenGenerationRequest) throws {
         try request.validate(configuration: model.configuration)
-        if let pagedKVContext {
+        if pagedKVContext != nil {
             guard request.mtpDepth == 0, request.kvAppendMode == .reference else {
                 throw QwenGenerationError.invalidRequest("Physical paged KV requires ordinary AR without capacity256")
             }
-            // Leave one physical slot for immutable partial-tail COW even for
-            // a single session. More live branches can still produce bounded OOM.
-            let rows = request.tokens.count + max(0, request.maxTokens - 1)
-            guard rows <= pagedKVContext.maximumTokens,
-                  (rows + 31) / 32 < pagedKVContext.maximumPagesPerLayer else {
-                throw QwenGenerationError.invalidRequest("Physical paged KV request exceeds initialized arena capacity")
-            }
+            // Physical capacity is optional. A first-decode admission covers
+            // the complete remaining request, or this cursor stays dense. The
+            // ordinary model context limit remains the request's hard bound.
         }
         if let pagedSDPAReader {
             guard request.mtpDepth == 0 else {
@@ -647,6 +700,39 @@ public final class QwenGenerator {
     private func checkCancellation(_ original: QwenCancellation?, _ supplied: QwenCancellation?) throws {
         try original?.check(); try supplied?.check()
     }
+    private func compatiblePagedAttachment(_ attachment: QwenPrefixPagedAttachment?,
+                                           request: QwenGenerationRequest) -> QwenPrefixPagedAttachment? {
+        guard let pagedKVContext, let attachment,
+              attachment.matches(tokens: request.tokens,
+                executionNamespace: request.prefixCacheNamespace(accumulation: model.prefillAccumulation.rawValue,
+                    fusedPrefill: model.fusedPrefillEnabled), context: pagedKVContext) else { return nil }
+        return attachment
+    }
+    /// Final defense against delayed pins or manual alias misuse. Claims still
+    /// protect future capacity; this checks actual immediate tail availability
+    /// before any layer can mutate. Failed/poisoned pools are device failures,
+    /// not ordinary capacity denial. Statistics/join costs stay in decode time.
+    private func requirePagedAppendSlot(_ context: QwenPagedKVContext) throws {
+        func available() throws -> Bool {
+            let statistics = try context.layerStatistics
+            if statistics.values.contains(where: { $0.failedOperations > 0 }) {
+                model.failGenerationRecovery("Paged decode observed a failed physical KV operation")
+                throw GPUError.invalid("Paged decode physical KV arena is poisoned")
+            }
+            guard Set(statistics.keys) == Set(context.pools.keys), !statistics.isEmpty,
+                  statistics.values.allSatisfy({ $0.failedOperations == 0 &&
+                    $0.physicalPages == UInt64(context.maximumPagesPerLayer) &&
+                    $0.freePages + $0.livePages == $0.physicalPages }) else {
+                throw GPUError.invalid("Paged decode requires healthy complete physical pools")
+            }
+            return statistics.values.allSatisfy { $0.freePages >= 1 }
+        }
+        if try available() { return }
+        try MX.synchronize()
+        guard try available() else {
+            throw QwenGenerationError.resourceLimit("Paged decode tail slots remain pinned; cursor cannot advance")
+        }
+    }
     private func validatePrepared(_ prepared: QwenPrefillResult, cancellation: QwenCancellation?) throws {
         guard prepared.model === model else {
             throw QwenGenerationError.invalidRequest("prefill handoff belongs to another model instance")
@@ -712,7 +798,7 @@ public final class QwenGenerator {
                     allowWaitingForLeader: allowPrefixWait)
                 p.cacheResolved = false
                 beganDeviceWork = true
-                try resolvePrefix(p, checkCancellation: { try cancellation?.check() })
+                try resolvePrefix(p, request: request, checkCancellation: { try cancellation?.check() })
             }
             try cancellation?.check()
             p.activeSeconds = elapsed(p.startedAt)
@@ -727,10 +813,12 @@ public final class QwenGenerator {
         }
     }
 
-    private func resolvePrefix(_ p: QwenPrefillProgress, checkCancellation: () throws -> Void) throws {
+    private func resolvePrefix(_ p: QwenPrefillProgress, request: QwenGenerationRequest,
+                               checkCancellation: () throws -> Void) throws {
         guard !p.cacheResolved, let prefixCache, let flight = p.cacheFlight,
               let result = try prefixCache.resolve(flight, model: model, checkCancellation: checkCancellation) else { return }
         p.cacheResolved = true; p.cacheSource = result.source
+        p.pagedAttachment = compatiblePagedAttachment(result.pagedAttachment, request: request)
         p.cacheLookupSeconds += result.lookupSeconds; p.cacheRestoreSeconds += result.restoreSeconds
         p.cacheWaitSeconds = max(0, Double(now() - flight.startedAt) * 1e-9 - result.lookupSeconds - result.restoreSeconds)
         if let state = result.state {
@@ -751,7 +839,8 @@ public final class QwenGenerator {
             try checkCancellation(session.cancellation, cancellation)
             if !p.cacheResolved {
                 beganDeviceWork = true
-                try resolvePrefix(p, checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
+                try resolvePrefix(p, request: request,
+                    checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
                 session.recordProcessed(p.offset)
                 guard p.cacheResolved else {
                     p.activeSeconds += elapsed(start); p.lastYieldAt = now()
@@ -804,10 +893,15 @@ public final class QwenGenerator {
                 try prefixStateObserver?("coldBoundary", p.state)
                 if let prefixCache, let flight = p.cacheFlight {
                     let saveStart = now()
-                    try prefixCache.publish(flight, at: end,
+                    let attachment = try prefixCache.publish(flight, at: end,
                         state: p.state, model: model,
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) },
-                        observer: prefixStateObserver)
+                        observer: prefixStateObserver,
+                        extending: compatiblePagedAttachment(p.pagedAttachment, request: request))
+                    if let attachment = compatiblePagedAttachment(attachment, request: request),
+                       attachment.prefix.offset >= (p.pagedAttachment?.prefix.offset ?? 0) {
+                        p.pagedAttachment = attachment
+                    }
                     p.cacheSaveSeconds += elapsed(saveStart)
                 }
             }
@@ -834,7 +928,7 @@ public final class QwenGenerator {
             }
             let result = QwenPrefillResult(model: model, request: request, state: p.state, decoder: p.decoder,
                 requestLease: p.requestLease, firstToken: next, statistics: stats, preparationSeconds: p.preparationSeconds,
-                requestStartedAt: p.startedAt)
+                requestStartedAt: p.startedAt, pagedAttachment: p.pagedAttachment)
             session.invalidate()
             return result
         } catch {
@@ -867,7 +961,7 @@ public final class QwenGenerator {
                 let payload = try result.payload.take()
                 return QwenPrefillResult(model: model, request: request, state: payload.state, decoder: payload.decoder,
                     requestLease: payload.requestLease, firstToken: result.firstToken, statistics: stats, preparationSeconds: result.preparationSeconds,
-                    requestStartedAt: result.requestStartedAt)
+                    requestStartedAt: result.requestStartedAt, pagedAttachment: payload.pagedAttachment)
             }
             if session.isWaitingForPrefixCache { Thread.sleep(forTimeInterval: 0.001) }
         }
@@ -879,7 +973,11 @@ public final class QwenGenerator {
         let wait = Double(start - prepared.readyAt) * 1e-9
         // Every subsequent failure burns this payload; callback error cases do
         // not distinguish pre-admission busy from a busy error thrown by user code.
-        let payload = try prepared.payload.take()
+        var payload = try prepared.payload.take()
+        // Completed PD handoffs remain model-level. The destination generator
+        // rechecks its own context and execution policy before retaining pages;
+        // incompatible optional pages are dropped while dense state survives.
+        payload.pagedAttachment = compatiblePagedAttachment(payload.pagedAttachment, request: prepared.request)
         let consumed = elapsed(start)
         return QwenDecodeSession(model: model, generatorIdentity: generatorIdentity, request: prepared.request, cancellation: cancellation,
             progress: QwenDecodeProgress(payload: payload, prepared: prepared,
@@ -926,20 +1024,67 @@ public final class QwenGenerator {
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
                     tokens = round.tokens; p.ssdWait += round.ssdWaitSeconds; p.ssdBytes += round.ssdLogicalBytes
                 } else {
-                    if let pagedKVContext, !p.state.hasPagedKV {
-                        let importStart = now()
-                        try model.usePagedKV(state: &p.state, context: pagedKVContext)
-                        p.pagedKVImportSeconds += elapsed(importStart)
+                    if let pagedKVContext, p.pagedKVDecision == .pending {
+                        try checkCancellation(session.cancellation, cancellation)
+                        let attachment = compatiblePagedAttachment(p.pagedAttachment, request: request)
+                        p.pagedAttachment = attachment
+                        let reused = attachment?.prefix.offset ?? 0
+                        let finalRows = request.tokens.count + request.maxTokens - 1
+                        let requiredPages = try QwenPagedPageAdmission.requiredDecodePages(
+                            promptTokens: request.tokens.count, maximumOutputTokens: request.maxTokens,
+                            reusedPrefixTokens: reused)
+                        // Constant claims conservatively remain charged while
+                        // their physical pages materialize. Other request/cache
+                        // admissions cannot borrow those future append slots.
+                        let claim: QwenPagedDecodePageLease?
+                        do {
+                            claim = finalRows <= pagedKVContext.maximumTokens
+                                ? try pagedKVContext.reserveDecodePages(pagesPerLayer: requiredPages) : nil
+                        } catch {
+                            // Admission reads pool health before any import. A
+                            // poisoned pool must make later requests fail before
+                            // prefill even if the recovery join itself succeeds.
+                            if let statistics = try? pagedKVContext.layerStatistics,
+                               statistics.values.contains(where: { $0.failedOperations > 0 }) {
+                                model.failGenerationRecovery("Paged admission observed a failed physical KV operation")
+                            }
+                            throw error
+                        }
+                        if let claim {
+                            p.pagedKVPageLease = claim
+                            p.pagedKVReservedPagesPerLayer = requiredPages
+                            let importStart = now()
+                            if let attachment {
+                                try model.usePagedKV(state: &p.state, context: pagedKVContext,
+                                    prefix: attachment.prefix)
+                            } else {
+                                try model.usePagedKV(state: &p.state, context: pagedKVContext)
+                            }
+                            p.pagedKVImportSeconds += elapsed(importStart)
+                            p.pagedKVReusedPrefixTokens = reused
+                            p.pagedKVImportedSuffixRows = request.tokens.count - reused
+                            p.pagedKVDecision = .paged
+                        } else {
+                            // This is the only capacity fallback decision for
+                            // the cursor. No speculative import failed, no
+                            // model state changed, and later tokens stay dense.
+                            p.pagedKVDecision = .denseFallback
+                            p.pagedKVCapacityFallbacks = 1
+                            p.pagedAttachment = nil
+                        }
                     }
                     if request.kvAppendMode == .capacity256 {
                         kvCapacityPermit = try model.reserveKVCapacityAppend(state: p.state,
                             rowLimit: request.tokens.count + request.maxTokens)
                         if kvCapacityPermit == nil { p.kvCapacityWorkspaceFallbacks += 1 }
                     }
+                    if p.pagedKVDecision == .paged, let pagedKVContext {
+                        try requirePagedAppendSlot(pagedKVContext)
+                    }
                     let out = try model.forward(tokens: [p.next], state: &p.state,
                         decodeMode: request.decodeMode, phase: .decode,
                         kvCapacityPermit: kvCapacityPermit, pagedSDPAReader: pagedSDPAReader,
-                        allowPagedKV: pagedKVContext != nil)
+                        allowPagedKV: p.pagedKVDecision == .paged)
                     guard let logits = out.logits else { throw QwenGenerationError.unavailable("missing target logits") }
                     let selected = try model.greedyToken(logits)
                     try model.evaluate([selected], state: &p.state)
@@ -948,7 +1093,7 @@ public final class QwenGenerator {
                         p.kvCapacityWorkspacePeakBytes = max(p.kvCapacityWorkspacePeakBytes,
                             kvCapacityPermit.workspaceBytes)
                     }
-                    if pagedKVContext != nil { p.pagedKVTokenSteps += 1 }
+                    if p.pagedKVDecision == .paged { p.pagedKVTokenSteps += 1 }
                     try decodeStateObserver?("decode", p.state)
                     tokens = [try selected.uint32TokenID()]
                     p.ssdWait += out.ssdWaitSeconds; p.ssdBytes += out.ssdLogicalBytes
@@ -966,6 +1111,12 @@ public final class QwenGenerator {
             p.activeSeconds += elapsed(start)
             p.lastYieldAt = now()
             guard p.generated.count >= request.maxTokens || eosTokenIDs.contains(p.next) else { return nil }
+            let finalStateOffset = p.state.offset
+            let cleanupStarted = now()
+            try p.finishPagedOwnership()
+            let cleanupSeconds = elapsed(cleanupStarted)
+            p.activeSeconds += cleanupSeconds
+            if p.pagedKVDecision == .paged { p.decodeSeconds += cleanupSeconds }
             let prefill = p.prepared.statistics
             var phases = QwenGenerationPhases(prefill: prefill, handoffWaitSeconds: p.handoffWaitSeconds,
                 handoffConsumeSeconds: p.handoffConsumeSeconds, decodeServiceSeconds: p.activeSeconds,
@@ -973,10 +1124,14 @@ public final class QwenGenerator {
                 verificationEvaluateEveryLayers: request.verificationEvaluateEveryLayers,
                 decodeKernelMode: request.decodeMode.rawValue)
             phases.decodeSuspensionSeconds = p.suspensionSeconds
-            phases.kvAppendMode = pagedKVContext == nil ? request.kvAppendMode.rawValue : "paged32"
+            phases.kvAppendMode = p.pagedKVDecision == .paged ? "paged32" : request.kvAppendMode.rawValue
             if pagedKVContext != nil {
                 phases.pagedKVImportSeconds = p.pagedKVImportSeconds
                 phases.pagedKVTokenSteps = p.pagedKVTokenSteps
+                phases.pagedKVReusedPrefixTokens = p.pagedKVReusedPrefixTokens
+                phases.pagedKVImportedSuffixRows = p.pagedKVImportedSuffixRows
+                phases.pagedKVCapacityFallbacks = p.pagedKVCapacityFallbacks
+                phases.pagedKVReservedPagesPerLayer = p.pagedKVReservedPagesPerLayer
             }
             phases.kvCapacityTokenSteps = p.kvCapacityTokenSteps
             phases.kvCapacityWorkspaceFallbacks = p.kvCapacityWorkspaceFallbacks
@@ -989,7 +1144,7 @@ public final class QwenGenerator {
                 statistics: QwenGenerationStatistics(promptTokenCount: request.tokens.count,
                     generatedTokenCount: p.generated.count, decodeRounds: p.decodeRounds,
                     decodedTokenCount: max(0, p.generated.count - 1), prefillChunkCount: prefill.chunkCount,
-                    finalStateOffset: p.state.offset, ssdWaitSeconds: prefill.ssdWaitSeconds + p.ssdWait,
+                    finalStateOffset: finalStateOffset, ssdWaitSeconds: prefill.ssdWaitSeconds + p.ssdWait,
                     ssdLogicalBytes: prefill.ssdLogicalBytes + p.ssdBytes, callbackSeconds: p.callbackSeconds,
                     prefillAccumulation: model.prefillAccumulation.rawValue, mtpDepth: request.mtpDepth,
                     mtpVerification: p.decoder?.verification.rawValue, mtp: p.decoder?.statistics), phases: phases)
@@ -1021,7 +1176,11 @@ public final class QwenGenerator {
                     kvCapacityWorkspaceFallbacks: phases.kvCapacityWorkspaceFallbacks,
                     kvCapacityWorkspacePeakBytes: phases.kvCapacityWorkspacePeakBytes,
                     pagedKVImportSeconds: phases.pagedKVImportSeconds,
-                    pagedKVTokenSteps: phases.pagedKVTokenSteps)
+                    pagedKVTokenSteps: phases.pagedKVTokenSteps,
+                    pagedKVReusedPrefixTokens: phases.pagedKVReusedPrefixTokens,
+                    pagedKVImportedSuffixRows: phases.pagedKVImportedSuffixRows,
+                    pagedKVCapacityFallbacks: phases.pagedKVCapacityFallbacks,
+                    pagedKVReservedPagesPerLayer: phases.pagedKVReservedPagesPerLayer)
                 return QwenGenerationResult(tokens: result.tokens, finishReason: result.finishReason,
                     preparationSeconds: result.preparationSeconds,
                     timeToFirstTokenSeconds: result.timeToFirstTokenSeconds,

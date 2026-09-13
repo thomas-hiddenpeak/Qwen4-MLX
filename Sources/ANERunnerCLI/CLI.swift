@@ -92,6 +92,10 @@ struct RunnerCLI {
                 try benchmarkGPUPagedAttention(arguments)
             case "benchmark-gpu-paged-kv":
                 try benchmarkGPUPagedKV(arguments)
+            case "benchmark-gpu-paged-prefix-cache":
+                try benchmarkGPUPagedPrefixCache(arguments)
+            case "probe-gpu-paged-prefix-cache":
+                try probeGPUPagedPrefixCache(arguments)
             case "probe-gpu-paged-kv-model":
                 try probeGPUPagedKVModel(arguments)
             case "probe-gpu-paged-kv-pool":
@@ -362,6 +366,12 @@ struct RunnerCLI {
     probe-gpu-paged-kv-model --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
         [--max-tokens 16] [--maximum-pages-per-layer 1024]
         Full-model mixed-state, shared branch, archive and generator correctness; diagnostic timings only.
+    probe-gpu-paged-prefix-cache --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--suite basic|all] [--max-tokens 8] [--maximum-pages-per-layer 512]
+        Cached requests, mixed-state isolation, shared pages, cancellation and capacity fallback; diagnostic timings only.
+    benchmark-gpu-paged-prefix-cache --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--order both|abba|baab]
+        Warm RAM-cache capacity256 versus paged32, with cold population recorded separately and no state observers.
     probe-gpu-paged-kv-pool --library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
         Model-free physical page sharing, immutable tails, direct SDPA and GPU lifetime checks; diagnostic timing only.
     probe-gpu-kv-capacity-model --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON

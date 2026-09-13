@@ -252,7 +252,7 @@ public final class QwenModel {
             pools[i] = try GPUPagedKVPool(libraryPath: libraryPath,
                 maximumPages: maximumPagesPerLayer, stateBudget: stateBudget)
         }
-        return QwenPagedKVContext(modelOwner: identity, pools: pools,
+        return try QwenPagedKVContext(modelOwner: identity, pools: pools,
             maximumPagesPerLayer: maximumPagesPerLayer)
     }
 
@@ -276,6 +276,112 @@ public final class QwenModel {
         }
         try evaluate([], state: &converted)
         state = converted
+    }
+
+    /// Internal cache attachment creation. The caller admits metadata first
+    /// and proves that an optional ancestor represents the same token prefix.
+    /// Only the first checkpoint imports its full dense K/V; later checkpoints
+    /// append newly computed rows and preserve every complete ancestor page.
+    func makePagedKVPrefix(state: State, context: QwenPagedKVContext,
+                           extending prefix: QwenPagedKVPrefix? = nil) throws -> QwenPagedKVPrefix {
+        let indices = try validateDensePagedPrefixSource(state, context: context)
+        if let prefix {
+            try prefix.validate(modelOwner: identity, context: context, layerIndices: indices)
+            guard prefix.offset <= state.offset else {
+                throw GPUError.invalid("Paged attachment ancestor extends past the completed dense prefix")
+            }
+        }
+        // Join the dense producer before borrowing its suffix. A later native
+        // writer owns that slice and its parent array until its write completes.
+        var ready = state
+        _ = try checkpoint(state: &ready)
+        var pages: [Int: GPUPagedKVPool.State] = [:]
+        for layer in indices {
+            var attention = ready.attention[layer]
+            if let prefix {
+                guard let ancestor = prefix.attentionStates[layer] else {
+                    throw GPUError.invalid("Missing paged attachment ancestor layer")
+                }
+                try attention.usePagedKV(prefix: ancestor)
+            } else {
+                guard let pool = context.pools[layer] else {
+                    throw GPUError.invalid("Missing paged attachment arena")
+                }
+                try attention.usePagedKV(pool: pool)
+            }
+            guard let paged = attention.pagedKV else {
+                throw GPUError.invalid("Paged attachment conversion produced no page state")
+            }
+            pages[layer] = paged
+        }
+        let attachment = try QwenPagedKVPrefix(modelOwner: identity, context: context,
+            offset: state.offset, attentionStates: pages)
+        try MX.eval(attachment.evaluationTensors)
+        return attachment
+    }
+
+    /// Internal prefill-to-decode handoff from a proven cache attachment.
+    /// Keep current GDN/QSA/PLE state; the only new physical K/V rows are the
+    /// dense suffix following prefix.offset. No paged K/V is materialized.
+    /// Publish only after every layer's write completes successfully.
+    func usePagedKV(state: inout State, context: QwenPagedKVContext,
+                    prefix: QwenPagedKVPrefix) throws {
+        let indices = try validateDensePagedPrefixSource(state, context: context)
+        try prefix.validate(modelOwner: identity, context: context, layerIndices: indices)
+        guard prefix.offset <= state.offset else {
+            throw GPUError.invalid("Paged cache attachment is longer than the request state")
+        }
+        var converted = try checkpoint(state: &state)
+        for layer in indices {
+            guard let ancestor = prefix.attentionStates[layer] else {
+                throw GPUError.invalid("Missing paged cache attachment layer")
+            }
+            try converted.attention[layer].usePagedKV(prefix: ancestor)
+        }
+        try evaluate([], state: &converted)
+        state = converted
+    }
+
+    /// CPU/shape validation before any attachment slice/import/append is built.
+    /// This intentionally uses the dense logical inventory, which cannot export
+    /// or silently omit physical pages. Whole-state validation protects the
+    /// cache boundary, including inactive layers and PLE token history.
+    private func validateDensePagedPrefixSource(_ state: State,
+                                                context: QwenPagedKVContext) throws -> [Int] {
+        guard layerCount == configuration.layerCount, layerCount == 48,
+              state.owner == identity, state.valid, context.modelOwner == identity,
+              state.gdn.count == layerCount, state.attention.count == layerCount, state.ple.count == layerCount,
+              !state.hasPagedKV, state.offset > 0, state.offset <= context.maximumTokens,
+              state.gdn.allSatisfy({ $0.verificationCapture == nil }),
+              state.ple.allSatisfy({ $0.verificationCapture == nil }) else {
+            throw GPUError.invalid("Paged prefix requires this model's complete committed dense AR state")
+        }
+        let indices = layers.indices.filter { layers[$0].attention != nil }
+        guard Set(context.pools.keys) == Set(indices) else {
+            throw GPUError.invalid("Paged prefix context does not contain exactly the attention layers")
+        }
+        for layer in layers.indices {
+            let gdnOffset = layers[layer].gdn == nil ? 0 : state.offset
+            let attentionOffset = layers[layer].attention == nil ? 0 : state.offset
+            let history = state.ple[layer].history
+            guard state.gdn[layer].offset == gdnOffset, state.attention[layer].offset == attentionOffset,
+                  history.count == (layers[layer].ple == nil ? 0 : configuration.ngramSize - 1),
+                  history.allSatisfy({ $0 < UInt32(configuration.vocabularySize) }) else {
+                throw GPUError.invalid("Paged prefix source has inconsistent offsets or PLE history")
+            }
+        }
+        let expected = try QwenPrefixStateArchiveDescriptor.expectedTensors(layout: prefixArchiveLayout, offset: state.offset)
+        let named = try state.namedTensors
+        guard named.count == expected.count else {
+            throw GPUError.invalid("Paged prefix source has an incomplete mixed-state tensor set")
+        }
+        for descriptor in expected {
+            guard let tensor = named[descriptor.name], tensor.shape == descriptor.shape,
+                  tensor.dtype == MLX_BFLOAT16, tensor.nbytes == descriptor.byteCount else {
+                throw GPUError.invalid("Paged prefix source has invalid tensor \(descriptor.name)")
+            }
+        }
+        return indices
     }
 
     /// Immutable MLX handles retain the entire recurrent/PLE/KV/QSA state.
