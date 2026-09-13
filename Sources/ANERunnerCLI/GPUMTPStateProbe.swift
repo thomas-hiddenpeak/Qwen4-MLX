@@ -146,7 +146,7 @@ extension RunnerCLI {
             do {
                 let candidate = try decoder(base, verification: cancellationVerification)
                 var state = base.state, calls = 0
-                let before = GPUMTPStateIdentity(state)
+                let before = try GPUMTPStateIdentity(state)
                 var capturedError: Error?
                 do {
                     _ = try candidate.next(pending: base.pending, state: &state, depth: 1, remaining: 3, eos: [],
@@ -156,7 +156,7 @@ extension RunnerCLI {
                     })
                 } catch { capturedError = error }
                 try MX.synchronize()
-                let after = GPUMTPStateIdentity(state)
+                let after = try GPUMTPStateIdentity(state)
                 let verified = candidate.statistics.verifiedTokens > 0
                 let passed = capturedError as? QwenGenerationError == .cancelled && calls == 4 && verified && before == after
                 record("cancel_after_verify_preserves_caller_state", passed ? "passed" : "failed", [
@@ -166,8 +166,9 @@ extension RunnerCLI {
                     "statistics": try json(candidate.statistics)
                 ])
                 let reuse = refused(candidate, state: &state, pending: base.pending)
-                record("cancelled_decoder_refuses_reuse", reuse.passed && GPUMTPStateIdentity(state) == before ? "passed" : "failed",
-                       ["error": reuse.error, "caller_state_still_exact": GPUMTPStateIdentity(state) == before])
+                let unchanged = try GPUMTPStateIdentity(state) == before
+                record("cancelled_decoder_refuses_reuse", reuse.passed && unchanged ? "passed" : "failed",
+                       ["error": reuse.error, "caller_state_still_exact": unchanged])
             } catch { record("cancel_after_verify_preserves_caller_state", "failed", ["error": String(describing: error)]) }
 
             // Observe cancellation again at the final publication boundary,
@@ -179,7 +180,7 @@ extension RunnerCLI {
                 do {
                     let candidate = try decoder(base, verification: mode)
                     var state = base.state, calls = 0
-                    let before = GPUMTPStateIdentity(state)
+                    let before = try GPUMTPStateIdentity(state)
                     var captured: Error?
                     do {
                         _ = try candidate.next(pending: base.pending, state: &state, depth: 1,
@@ -192,10 +193,11 @@ extension RunnerCLI {
                     let reachedPublication = candidate.statistics.verifiedTokens > 0 &&
                         (remaining == 1 || candidate.statistics.rounds == 1)
                     let reuse = refused(candidate, state: &state, pending: base.pending)
+                    let unchanged = try GPUMTPStateIdentity(state) == before
                     record(name, captured as? QwenGenerationError == .cancelled && calls == cancelAt &&
-                        reachedPublication && GPUMTPStateIdentity(state) == before && reuse.passed ? "passed" : "failed",
+                        reachedPublication && unchanged && reuse.passed ? "passed" : "failed",
                         ["check_calls": calls, "publication_boundary_reached": reachedPublication,
-                         "caller_identity_exact": GPUMTPStateIdentity(state) == before,
+                         "caller_identity_exact": unchanged,
                          "decoder_refuses_reuse": reuse.passed, "statistics": try json(candidate.statistics)])
                 } catch { record(name, "failed", ["error": String(describing: error)]) }
             }
@@ -222,11 +224,12 @@ extension RunnerCLI {
                                            "state_offset": state.offset])
                         }
                         let expected = Array(reference.dropFirst().prefix(budget))
-                        let finalIdentity = GPUMTPStateIdentity(state)
+                        let finalIdentity = try GPUMTPStateIdentity(state)
                         let reuse = refused(candidate, state: &state, pending: pending)
+                        let unchanged = try GPUMTPStateIdentity(state) == finalIdentity
                         let passed = emitted == expected && emitted.count == budget &&
                             state.offset == base.state.offset + budget && reuse.passed &&
-                            GPUMTPStateIdentity(state) == finalIdentity
+                            unchanged
                         record(name, passed ? "passed" : "failed", [
                             "expected_ids": expected, "emitted_ids": emitted, "rounds": rounds,
                             "final_state_offset": state.offset, "exhausted_decoder_refuses_reuse": reuse.passed,
@@ -261,10 +264,11 @@ extension RunnerCLI {
                                                         depth: 1, remaining: 3, eos: [stop])
                         let branchMatches = branch == "accepted_draft_eos"
                             ? stopping.statistics.acceptedDraftTokens == 1 : stopping.statistics.acceptedDraftTokens == 0
-                        let terminal = GPUMTPStateIdentity(state)
+                        let terminal = try GPUMTPStateIdentity(state)
                         let reuse = refused(stopping, state: &state, pending: stop)
+                        let unchanged = try GPUMTPStateIdentity(state) == terminal
                         let passed = stopped.tokens == [stop] && branchMatches && reuse.passed &&
-                            GPUMTPStateIdentity(state) == terminal
+                            unchanged
                         record(branch, passed ? "passed" : "failed", [
                             "ar_position": position, "test_stop_token_id": stop, "emitted_ids": stopped.tokens,
                             "natural_eos_generation_test": false, "stop_policy": "synthetic_known_target_token",
@@ -320,8 +324,8 @@ private struct GPUMTPStateIdentity: Codable, Equatable {
     let mlxHandles: [String]
     let shapes: [[Int]]
     let dtypes: [String]
-    init(_ state: QwenModel.State) {
-        let tensors = state.tensors
+    init(_ state: QwenModel.State) throws {
+        let tensors = try state.tensors
         offset = state.offset; valid = state.valid; qsaActiveLayers = state.qsaActiveLayers
         tensorWrappers = tensors.map { String(describing: ObjectIdentifier($0)) }
         mlxHandles = tensors.map { String(describing: $0.handle.ctx) }

@@ -51,6 +51,23 @@ ANEMLX_EXPORT int32_t anemlx_paged_kv_pool_create(void** output, int32_t pages, 
     *output = value.release();
   });
 }
+ANEMLX_EXPORT int32_t anemlx_paged_kv_pool_create_owned(void** output, int32_t pages,
+    mlx_stream stream, void* owner, void (*release_owner)(void*)) {
+  return checked([&] {
+    // shared_ptr invokes the deleter even if allocating its control block
+    // throws. Adopt before validation so the bridge always consumes ownership.
+    std::shared_ptr<const void> lifetime(owner, [release_owner](const void* value) noexcept {
+      if (release_owner) release_owner(const_cast<void*>(value));
+    });
+    if (!owner || !release_owner) throw std::invalid_argument("missing physical KV lifetime owner/release");
+    empty_output(output);
+    if (!stream.ctx || pages < 1 || pages > 4096)
+      throw std::invalid_argument("physical KV pool requires GPU stream and 1...4096 pages");
+    auto value = std::make_unique<PoolHandle>(pool::Pool::create(
+        pages, mlx_stream_get_(stream), std::move(lifetime)));
+    *output = value.release();
+  });
+}
 ANEMLX_EXPORT void anemlx_paged_kv_pool_free(void* value) { delete static_cast<PoolHandle*>(value); }
 ANEMLX_EXPORT void anemlx_paged_kv_pool_state_free(void* value) { delete static_cast<State*>(value); }
 ANEMLX_EXPORT int32_t anemlx_paged_kv_pool_import(void** output, const void* value, mlx_array k, mlx_array v) {

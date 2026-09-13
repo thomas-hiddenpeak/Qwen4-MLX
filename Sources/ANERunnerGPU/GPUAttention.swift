@@ -54,19 +54,24 @@ public final class GPUAttention {
         }
     }
     public struct State {
-        // Public setters invalidate a private capacity owner immediately when
-        // a caller replaces either logical Tensor. Pointer/shape similarity
-        // is insufficient: only the exact wrapper identities are our views.
+        // Public setters invalidate physical-page storage and a stale private
+        // capacity owner immediately. Replacing one half of paged K/V leaves
+        // an incomplete dense pair which validation rejects until repaired.
+        // Pointer/shape similarity is insufficient for capacity storage: only
+        // the exact wrapper identities are our views.
         private var storedKeys: Tensor?
         private var storedValues: Tensor?
         public var keys: Tensor? {
             get { storedKeys }
-            set { storedKeys = newValue; discardStaleCapacity() }
+            set { storedKeys = newValue; pagedKV = nil; discardStaleCapacity() }
         }
         public var values: Tensor? {
             get { storedValues }
-            set { storedValues = newValue; discardStaleCapacity() }
+            set { storedValues = newValue; pagedKV = nil; discardStaleCapacity() }
         }
+        /// Immutable physical-page state. Dense K/V getters remain nil while
+        /// this is present; archive/export callers must explicitly materialize.
+        public fileprivate(set) var pagedKV: GPUPagedKVPool.State?
         public var rawIndexerKeys: Tensor?
         public var pooledIndexerKeys: Tensor?
         public var offset: Int
@@ -78,6 +83,10 @@ public final class GPUAttention {
         private var kvCapacity: GPUKVCapacityStorage?
         private var kvKeyIdentity: ObjectIdentifier?
         private var kvValueIdentity: ObjectIdentifier?
+        fileprivate var pagedStorageIsExclusive: Bool {
+            storedKeys == nil && storedValues == nil && kvCapacity == nil &&
+                kvKeyIdentity == nil && kvValueIdentity == nil
+        }
         /// Diagnostic allocation bookkeeping; values, not buffer identities.
         /// Preserve the existing host-oracle schema: raw extent, pooled extent.
         /// Capacity padding is private and never becomes archive payload.
@@ -97,8 +106,76 @@ public final class GPUAttention {
         }
 
         public mutating func reset() { self = State() }
+        /// Complete logical tensor inventory for dense storage only. Silently
+        /// omitting physical K/V would corrupt archive and allocation callers.
         public var tensors: [Tensor] {
-            [keys,values,rawIndexerKeys,pooledIndexerKeys].compactMap { $0 }
+            get throws {
+                guard pagedKV == nil else {
+                    throw GPUAttentionError.invalid("Paged attention state requires evaluationTensors or explicit materializedKV()")
+                }
+                return [storedKeys,storedValues,rawIndexerKeys,pooledIndexerKeys].compactMap { $0 }
+            }
+        }
+
+        /// Evaluation roots join pending page writes without exporting K/V.
+        /// A ready ticket is a dependency, not the arena allocation inventory.
+        public var evaluationTensors: [Tensor] {
+            get throws {
+                // Preserve the dense path's cheap root collection. Forward and
+                // explicit export validate full state; no repeated shape walk
+                // is needed at each partial-model evaluation boundary.
+                let empty = offset == 0 && storedKeys == nil && storedValues == nil &&
+                    rawIndexerKeys == nil && pooledIndexerKeys == nil && pagedKV == nil
+                let complete = offset > 0 && rawIndexerKeys != nil &&
+                    (pagedKV != nil || (storedKeys != nil && storedValues != nil))
+                guard empty || complete else {
+                    throw GPUAttentionError.invalid("Cannot evaluate incomplete attention storage; repair or reset the state")
+                }
+                var roots = [storedKeys,storedValues,rawIndexerKeys,pooledIndexerKeys].compactMap { $0 }
+                if let pagedKV { roots.append(try pagedKV.ready()) }
+                return roots
+            }
+        }
+
+        /// Explicit archive/diagnostic boundary. Paged export allocates logical
+        /// compact K/V when evaluated; dense storage returns existing views.
+        public func materializedKV() throws -> (keys: Tensor, values: Tensor)? {
+            try GPUAttention.validate(self)
+            if let pagedKV { return try pagedKV.materialize() }
+            guard let storedKeys, let storedValues else { return nil }
+            return (storedKeys,storedValues)
+        }
+
+        /// Import a completed nonempty dense prefix. All fallible work happens
+        /// before installing the page state and releasing dense/capacity owners.
+        /// The import graph retains its source tensors until evaluation.
+        public mutating func usePagedKV(pool: GPUPagedKVPool) throws {
+            try GPUAttention.validate(self)
+            guard pagedKV == nil, let storedKeys, let storedValues else {
+                throw GPUAttentionError.invalid("Paged attention conversion requires nonempty dense K/V")
+            }
+            let imported = try pool.importState(keys: storedKeys, values: storedValues)
+            var converted = self
+            converted.storedKeys = nil; converted.storedValues = nil
+            converted.kvCapacity = nil; converted.kvKeyIdentity = nil; converted.kvValueIdentity = nil
+            converted.pagedKV = imported
+            converted.retainedKVRowCount = offset
+            try GPUAttention.validate(converted)
+            self = converted
+        }
+
+        /// Install an immutable fork beside its matching QSA state. This is an
+        /// internal whole-state operation; partial public setters never do this.
+        mutating func installPagedKV(_ paged: GPUPagedKVPool.State) throws {
+            guard pagedKV == nil, storedKeys == nil, storedValues == nil, kvCapacity == nil,
+                  kvKeyIdentity == nil, kvValueIdentity == nil, paged.logicalTokens == offset else {
+                throw GPUAttentionError.invalid("Paged attention installation requires exclusive storage and matching offset")
+            }
+            var installed = self
+            installed.pagedKV = paged
+            installed.retainedKVRowCount = offset
+            try GPUAttention.validate(installed)
+            self = installed
         }
 
         private var capacityViewsMatch: Bool {
@@ -129,7 +206,7 @@ public final class GPUAttention {
         /// state. Each buffer includes page rounding and two pages of allocator
         /// allowance. This is a conservative logical permit, never an RSS cap.
         func kvCapacityWorkspaceBytesForNextRow(rowLimit: Int) throws -> Int {
-            guard offset >= 0, offset < rowLimit, rowLimit <= GPUKVCapacityStorage.maximumRows else {
+            guard pagedKV == nil, offset >= 0, offset < rowLimit, rowLimit <= GPUKVCapacityStorage.maximumRows else {
                 throw GPUAttentionError.invalid("KV capacity workspace exceeds the admitted row limit")
             }
             if capacityViewsMatch, let kvCapacity, kvCapacity.rowLimit == rowLimit,
@@ -155,6 +232,9 @@ public final class GPUAttention {
         /// may evaluate its result. External copies remain live and force COW.
         mutating func appendCapacity(keys newKeys: Tensor, values newValues: Tensor,
                                                   rowLimit: Int) throws -> (keys: Tensor, values: Tensor) {
+            guard pagedKV == nil else {
+                throw GPUAttentionError.invalid("Capacity append cannot consume physical-page attention state")
+            }
             var storage: GPUKVCapacityStorage
             if capacityViewsMatch, let current = kvCapacity, current.rowLimit == rowLimit {
                 storage = current
@@ -230,7 +310,8 @@ public final class GPUAttention {
                         prefillMode: PrefillMode = .reference,
                         profiler: GPUProfiler? = nil,
                         kvCapacityRowLimit: Int? = nil,
-                        pagedSDPAReader: GPUPagedSDPAReader? = nil) throws -> Tensor {
+                        pagedSDPAReader: GPUPagedSDPAReader? = nil,
+                        allowPagedKV: Bool = false) throws -> Tensor {
         guard x.shape.count == 3, x.shape[0] == 1, x.shape[1] > 0,
               x.shape[2] == 2560, x.dtype == MLX_BFLOAT16,
               state.offset >= 0, state.offset <= 262144 - x.shape[1],
@@ -239,6 +320,15 @@ public final class GPUAttention {
         }
         guard prefillMode == .reference || verificationLinear == nil else {
             throw GPUAttentionError.invalid("QSA prefill fusion cannot select verification kernels")
+        }
+        if allowPagedKV {
+            guard state.pagedKV != nil, x.shape[1] == 1, positionBase == 0,
+                  verificationLinear == nil, prefillMode == .reference,
+                  kvCapacityRowLimit == nil, pagedSDPAReader == nil else {
+                throw GPUAttentionError.invalid("Physical-page KV requires existing paged state and ordinary S1 AR without other KV policies")
+            }
+        } else if state.pagedKV != nil {
+            throw GPUAttentionError.invalid("Physical-page attention state requires explicit allowPagedKV")
         }
         if let pagedSDPAReader {
             guard x.shape[1] == 1, positionBase == 0, verificationLinear == nil,
@@ -280,18 +370,22 @@ public final class GPUAttention {
             return (queries: queries,gate: gate,newKeys: newKeys,newValues: newValues)
         }
         let queries = qkv.queries, gate = qkv.gate
-        let kv: (keys: Tensor,values: Tensor) = try measure("attention.kv_append",profiler: profiler,sequence: sequence,
-                             outputs: { [$0.keys,$0.values] }) {
+        let kv: (keys: Tensor?,values: Tensor?,paged: GPUPagedKVPool.State?,ready: Tensor?) = try measure(
+                             "attention.kv_append",profiler: profiler,sequence: sequence,
+                             outputs: { [$0.keys,$0.values,$0.ready].compactMap { $0 } }) {
+            if let paged = state.pagedKV {
+                let appended = try paged.append(keys: qkv.newKeys, values: qkv.newValues)
+                return (nil,nil,appended,try appended.ready())
+            }
             if let rowLimit = kvCapacityRowLimit {
                 let result = try state.appendCapacity(keys: qkv.newKeys, values: qkv.newValues, rowLimit: rowLimit)
                 capacityAppended = true
-                return result
+                return (result.keys,result.values,nil,nil)
             }
             let keys = try state.keys.map { try MX.concat([$0,qkv.newKeys],axis: 2) } ?? qkv.newKeys
             let values = try state.values.map { try MX.concat([$0,qkv.newValues],axis: 2) } ?? qkv.newValues
-            return (keys: keys,values: values)
+            return (keys,values,nil,nil)
         }
-        let keys = kv.keys, values = kv.values
         // In capacity mode state already owns the new complete backing and
         // logical views. This copy cannot retain an old request-owned KV root.
         var next = state
@@ -302,6 +396,12 @@ public final class GPUAttention {
         let sparseMask = try qsaMask(projectedIndex,state: &next,sequence: sequence,
                                      positionBase: positionBase,profiler: profiler)
         let attention = try measure("attention.sdpa",profiler: profiler,sequence: sequence,outputs: { [$0] }) {
+            if let paged = kv.paged {
+                return try paged.read(queries: queries, mask: sparseMask)
+            }
+            guard let keys = kv.keys, let values = kv.values else {
+                throw GPUAttentionError.invalid("Missing dense K/V for attention read")
+            }
             if let pagedSDPAReader {
                 return try pagedSDPAReader.apply(queries: queries, keys: keys, values: values, mask: sparseMask)
             }
@@ -341,9 +441,12 @@ public final class GPUAttention {
             let gated = try MX.mul(heads,MX.sigmoid(gate))
             return try MX.linear(MX.reshape(gated,[1,sequence,6144]),outWeight, verification: verificationLinear)
         }
-        if kvCapacityRowLimit == nil {
-            next.keys = keys
-            next.values = values
+        if let paged = kv.paged {
+            next.pagedKV = paged
+            next.retainedKVRowCount = offset + sequence
+        } else if kvCapacityRowLimit == nil {
+            next.keys = kv.keys
+            next.values = kv.values
             next.retainedKVRowCount = offset + sequence
         }
         next.finishForward(offset: offset + sequence)
@@ -374,12 +477,18 @@ public final class GPUAttention {
             throw GPUAttentionError.invalid("Attention prefix count is outside the existing cache")
         }
         try Self.validate(state)
+        // A complete immutable page list already is the requested prefix;
+        // preserve its sharing instead of allocating an archive export.
+        if count == state.offset, state.pagedKV != nil { return state }
         if count == state.offset, state.retainedKVRowCount - count <= 4,
            state.retainedRowCount - count <= 4 { return state }
         if count == 0 { return State() }
-        guard let keys = state.keys, let values = state.values, let raw = state.rawIndexerKeys else {
+        // Trimming remains an explicit archive/MTP boundary. Paged decode never
+        // calls this path; a smaller prefix returns ordinary compact K/V.
+        guard let kv = try state.materializedKV(), let raw = state.rawIndexerKeys else {
             throw GPUAttentionError.invalid("Missing attention state for prefix commit")
         }
+        let keys = kv.keys, values = kv.values
         let prefixKeys = try Self.retainedPrefix(keys, axis: 2, count: count, extent: state.retainedKVRowCount, maximumTail: 4)
         let prefixValues = try Self.retainedPrefix(values, axis: 2, count: count, extent: state.retainedKVRowCount, maximumTail: 4)
         let prefixRaw = try Self.retainedPrefix(raw, axis: 1, count: count, extent: state.retainedRowCount, maximumTail: 4)
@@ -418,18 +527,37 @@ public final class GPUAttention {
     }
 
     private static func validate(_ state: State) throws {
+        guard state.offset >= 0, state.offset <= 262144 else {
+            throw GPUAttentionError.invalid("Attention state offset exceeds the model context")
+        }
         if state.offset == 0 {
             guard state.keys == nil, state.values == nil, state.rawIndexerKeys == nil,
-                  state.pooledIndexerKeys == nil else {
+                  state.pooledIndexerKeys == nil, state.pagedKV == nil else {
                 throw GPUAttentionError.invalid("Zero-offset attention state must be empty; use reset()")
             }
             return
         }
-        guard let keys = state.keys, let values = state.values, let raw = state.rawIndexerKeys,
-              keys.shape == [1,2,state.offset,256], values.shape == keys.shape,
-              keys.dtype == MLX_BFLOAT16, values.dtype == MLX_BFLOAT16,
+        guard let raw = state.rawIndexerKeys,
               raw.shape == [1,state.offset,128], raw.dtype == MLX_BFLOAT16 else {
             throw GPUAttentionError.invalid("Attention KV/indexer state shape or dtype mismatch")
+        }
+        if let paged = state.pagedKV {
+            guard state.pagedStorageIsExclusive, paged.logicalTokens == state.offset,
+                  paged.pageCount == (state.offset + 31) / 32,
+                  state.retainedKVRowCount == state.offset else {
+                throw GPUAttentionError.invalid("Physical-page attention state storage or offset mismatch")
+            }
+            guard state.offset > 2051
+                ? state.pooledIndexerKeys?.shape == [1,state.offset / 4,128]
+                : state.pooledIndexerKeys == nil else {
+                throw GPUAttentionError.invalid("Physical-page attention state requires complete matching QSA history")
+            }
+        } else {
+            guard let keys = state.keys, let values = state.values,
+                  keys.shape == [1,2,state.offset,256], values.shape == keys.shape,
+                  keys.dtype == MLX_BFLOAT16, values.dtype == MLX_BFLOAT16 else {
+                throw GPUAttentionError.invalid("Attention KV/indexer state shape or dtype mismatch")
+            }
         }
         if let pooled = state.pooledIndexerKeys {
             guard pooled.shape.count == 3, pooled.shape[0] == 1,

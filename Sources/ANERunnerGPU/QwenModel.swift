@@ -38,16 +38,44 @@ public final class QwenModel {
                 gdnCapturePresent: gdn.map { $0.verificationCapture != nil },
                 pleCapturePresent: ple.map { $0.verificationCapture != nil })
         }
-        public var tensors: [Tensor] { gdn.flatMap(\.tensors) + attention.flatMap(\.tensors) + ple.flatMap(\.tensors) }
+        public var hasPagedKV: Bool { attention.contains { $0.pagedKV != nil } }
+        /// Dense logical tensors only. Paged callers must explicitly choose
+        /// evaluation roots or compact materialization; incomplete state is an error.
+        public var tensors: [Tensor] {
+            get throws { try gdn.flatMap(\.tensors) + attention.flatMap { try $0.tensors } + ple.flatMap(\.tensors) }
+        }
+        public var evaluationTensors: [Tensor] {
+            get throws { try gdn.flatMap(\.tensors) + attention.flatMap { try $0.evaluationTensors } + ple.flatMap(\.tensors) }
+        }
+        public var diagnosticPageIDs: [Int: [Int32]] {
+            get throws {
+                var result: [Int: [Int32]] = [:]
+                for i in attention.indices {
+                    if let paged = attention[i].pagedKV { result[i] = try paged.pageIDs }
+                }
+                return result
+            }
+        }
         public var qsaActiveLayers: Int { attention.filter { $0.pooledIndexerKeys != nil }.count }
         /// Diagnostic names only; graph handles remain read-only to callers.
         public var namedTensors: [String: Tensor] {
+            get throws {
+                guard !hasPagedKV else {
+                    throw GPUError.invalid("Paged state requires explicit materializedNamedTensors() for logical export")
+                }
+                return try materializedNamedTensors()
+            }
+        }
+        /// Explicit full logical export. This may allocate complete compact K/V
+        /// arrays and is intended only for diagnostics/archive boundaries.
+        public func materializedNamedTensors() throws -> [String: Tensor] {
             var values: [String: Tensor] = [:]
             for i in gdn.indices {
                 values["layer.\(i).gdn.recurrent"] = gdn[i].recurrent
                 values["layer.\(i).gdn.conv"] = gdn[i].convHistory
-                values["layer.\(i).attention.keys"] = attention[i].keys
-                values["layer.\(i).attention.values"] = attention[i].values
+                let kv = try attention[i].materializedKV()
+                values["layer.\(i).attention.keys"] = kv?.keys
+                values["layer.\(i).attention.values"] = kv?.values
                 values["layer.\(i).attention.raw_index"] = attention[i].rawIndexerKeys
                 values["layer.\(i).attention.pooled_index"] = attention[i].pooledIndexerKeys
                 values["layer.\(i).ple.conv"] = ple[i].convolution
@@ -199,6 +227,57 @@ public final class QwenModel {
     }
     public func makeState() -> State { State(layers: layerCount, owner: identity) }
 
+    func validatePagedKVContext(_ context: QwenPagedKVContext) throws {
+        guard context.modelOwner == identity else {
+            throw QwenGenerationError.invalidRequest("Physical KV context belongs to another model")
+        }
+    }
+
+    /// Allocate on the inference executor before importing any states. Fixed
+    /// arenas are separately admitted once; normal request/cache reservations
+    /// still cover logical mixed state, page metadata and export workspace.
+    public func makePagedKVContext(libraryPath: String, maximumPagesPerLayer: Int) throws -> QwenPagedKVContext {
+        guard layerCount == configuration.layerCount else {
+            throw GPUError.invalid("Paged model context requires all layers")
+        }
+        let indices = layers.indices.filter { layers[$0].attention != nil }
+        let each = try GPUPagedKVPool.reservedBytes(maximumPages: maximumPagesPerLayer)
+        let (total, overflow) = each.multipliedReportingOverflow(by: indices.count)
+        let budget = stateBudget.statistics
+        guard !overflow, total > 0, total <= budget.maxBytes - budget.totalBytes else {
+            throw QwenGenerationError.resourceLimit("Physical KV arenas exceed available state budget")
+        }
+        var pools: [Int: GPUPagedKVPool] = [:]
+        for i in indices {
+            pools[i] = try GPUPagedKVPool(libraryPath: libraryPath,
+                maximumPages: maximumPagesPerLayer, stateBudget: stateBudget)
+        }
+        return QwenPagedKVContext(modelOwner: identity, pools: pools,
+            maximumPagesPerLayer: maximumPagesPerLayer)
+    }
+
+    /// Explicit dense-to-paged handoff at a committed AR boundary. Conversion
+    /// uses fresh immutable pages and publishes the new state only after eval.
+    /// The caller's existing state/temporary reservation must cover the import.
+    public func usePagedKV(state: inout State, context: QwenPagedKVContext) throws {
+        guard context.modelOwner == identity, state.owner == identity, state.valid,
+              !state.hasPagedKV, state.offset > 0, state.offset <= context.maximumTokens,
+              state.gdn.allSatisfy({ $0.verificationCapture == nil }),
+              state.ple.allSatisfy({ $0.verificationCapture == nil }),
+              context.pools.count == layers.filter({ $0.attention != nil }).count else {
+            throw GPUError.invalid("Paged import requires this model's complete committed dense AR state")
+        }
+        var converted = try checkpoint(state: &state)
+        for i in context.pools.keys.sorted() {
+            guard converted.attention[i].offset == converted.offset, let pool = context.pools[i] else {
+                throw GPUError.invalid("Paged import has inconsistent attention offsets")
+            }
+            try converted.attention[i].usePagedKV(pool: pool)
+        }
+        try evaluate([], state: &converted)
+        state = converted
+    }
+
     /// Immutable MLX handles retain the entire recurrent/PLE/KV/QSA state.
     /// Evaluate before publishing a checkpoint so delayed device errors cannot
     /// turn a speculative state into a reusable committed state.
@@ -216,6 +295,16 @@ public final class QwenModel {
     /// caller owns the inference gate. This is deliberately not State assignment
     /// or MX.copy, both of which can retain the source's backing allocations.
     func privatePrefixStateCopy(_ source: State) throws -> State {
+        try copyPrefixState(source, sharePagedKV: false)
+    }
+
+    /// New session identity and private recurrent/QSA/PLE state; immutable
+    /// physical K/V pages may be shared. Caller must admit the new branch first.
+    public func forkPrefixState(_ source: State) throws -> State {
+        try copyPrefixState(source, sharePagedKV: true)
+    }
+
+    private func copyPrefixState(_ source: State, sharePagedKV: Bool) throws -> State {
         guard source.owner == identity, source.valid,
               source.gdn.allSatisfy({ $0.verificationCapture == nil }),
               source.ple.allSatisfy({ $0.verificationCapture == nil }) else {
@@ -238,11 +327,17 @@ public final class QwenModel {
             result.gdn[i] = GPUGatedDeltaNet.State(convHistory: try clone(source.gdn[i].convHistory),
                 recurrent: try clone(source.gdn[i].recurrent), offset: source.gdn[i].offset)
             let attention = source.attention[i]
-            // Gather creates compact allocations; initializer derives retained
-            // extents from the copied logical offset/pooled shape.
-            result.attention[i] = GPUAttention.State(keys: try clone(attention.keys),
-                values: try clone(attention.values), rawIndexerKeys: try clone(attention.rawIndexerKeys),
+            var copied = GPUAttention.State(rawIndexerKeys: try clone(attention.rawIndexerKeys),
                 pooledIndexerKeys: try clone(attention.pooledIndexerKeys), offset: attention.offset)
+            if sharePagedKV, let paged = attention.pagedKV {
+                try copied.installPagedKV(paged.fork())
+            } else if let kv = try attention.materializedKV() {
+                // A paged export is already an independent compact allocation.
+                // Dense sources need the existing gather copy to sever aliases.
+                copied.keys = attention.pagedKV == nil ? try clone(kv.keys) : kv.keys
+                copied.values = attention.pagedKV == nil ? try clone(kv.values) : kv.values
+            }
+            result.attention[i] = copied
             result.ple[i].history = source.ple[i].history
             result.ple[i].convolution = try clone(source.ple[i].convolution)
         }
@@ -255,7 +350,13 @@ public final class QwenModel {
     func prefixStatePayloadBytes(_ state: State) throws -> Int {
         guard state.owner == identity, state.valid else { throw GPUError.invalid("Invalid prefix state") }
         var total = 0
-        for bytes in state.tensors.map(\.nbytes) + state.ple.map({ $0.history.count * MemoryLayout<UInt32>.stride }) {
+        var sizes = state.gdn.flatMap(\.tensors).map(\.nbytes) + state.ple.flatMap(\.tensors).map(\.nbytes)
+        for attention in state.attention {
+            sizes += [attention.rawIndexerKeys, attention.pooledIndexerKeys].compactMap { $0?.nbytes }
+            if let paged = attention.pagedKV { sizes.append(paged.logicalKVBytes) }
+            else { sizes += [attention.keys, attention.values].compactMap { $0?.nbytes } }
+        }
+        for bytes in sizes + state.ple.map({ $0.history.count * MemoryLayout<UInt32>.stride }) {
             let (sum, overflow) = total.addingReportingOverflow(bytes)
             guard bytes >= 0, !overflow else { throw GPUError.invalid("Prefix state size overflow") }
             total = sum
@@ -298,7 +399,10 @@ public final class QwenModel {
             layout: prefixArchiveLayout, offset: source.offset)
         guard let final = expected.last else { throw GPUError.invalid("Empty prefix archive layout") }
         let payloadBytes = final.byteOffset + final.byteCount
-        let named = source.namedTensors
+        guard maxPayloadBytes > 0, payloadBytes <= maxPayloadBytes else {
+            throw GPUError.invalid("Prefix archive exceeds the admitted payload limit")
+        }
+        let named = try source.materializedNamedTensors()
         guard named.count == expected.count else { throw GPUError.invalid("Incomplete prefix tensor set") }
         for descriptor in expected {
             guard let tensor = named[descriptor.name], tensor.dtype == MLX_BFLOAT16,
@@ -386,7 +490,7 @@ public final class QwenModel {
                                          tokens: [Int32], count: Int) throws -> State {
         guard verified.owner == identity, checkpoint.owner == identity,
               verified.sessionIdentity == checkpoint.sessionIdentity,
-              verified.valid, checkpoint.valid, (1...5).contains(tokens.count),
+              verified.valid, checkpoint.valid, !verified.hasPagedKV, !checkpoint.hasPagedKV, (1...5).contains(tokens.count),
               (1...tokens.count).contains(count), verified.offset == checkpoint.offset + tokens.count else {
             throw GPUError.invalid("Invalid verification checkpoint or accepted prefix")
         }
@@ -515,7 +619,7 @@ public final class QwenModel {
     /// Invalidate the session in that case; reset is required before reuse.
     public func evaluate(_ outputs: [Tensor], state: inout State) throws {
         guard state.owner == identity, state.valid else { throw GPUError.invalid("Invalid model owner or failed session; reset before evaluation") }
-        do { try MX.eval(outputs + state.tensors) }
+        do { try MX.eval(outputs + state.evaluationTensors) }
         catch { state.valid = false; throw error }
     }
     /// Per single-token decode, count each selected expert once, each dense
@@ -550,7 +654,8 @@ public final class QwenModel {
                         profileLogits: Bool = true,
                         prefillMoEConfiguration: GPUMoEPrefillConfiguration? = nil,
                         kvCapacityPermit: QwenKVCapacityAppendPermit? = nil,
-                        pagedSDPAReader: GPUPagedSDPAReader? = nil) throws -> Output {
+                        pagedSDPAReader: GPUPagedSDPAReader? = nil,
+                        allowPagedKV: Bool = false) throws -> Output {
         guard state.owner == identity, state.valid, state.gdn.count == layerCount, !tokens.isEmpty, evaluateEveryLayers > 0,
               !captureVerification || tokens.count <= 5,
               !verifyScalarLinear || (tokens.count <= 5 && decodeMode == .reference),
@@ -573,6 +678,16 @@ public final class QwenModel {
                   prefillPrefetch == nil, prefillMoEConfiguration == nil,
                   state.offset < pagedSDPAReader.maximumTokens else {
                 throw GPUError.invalid("Paged SDPA requires explicit bounded S1 AR decode without captures or verification")
+            }
+        }
+        if allowPagedKV || state.hasPagedKV {
+            guard allowPagedKV, phase == .decode, tokens.count == 1,
+                  !captureTrace, !captureVerification, !verifyScalarBoundaries,
+                  !verifyScalarMoE, !verifyScalarLinear, !verifyTokenMoE,
+                  prefillPrefetch == nil, prefillMoEConfiguration == nil,
+                  pagedSDPAReader == nil, kvCapacityPermit == nil,
+                  layers.indices.allSatisfy({ layers[$0].attention == nil || state.attention[$0].pagedKV != nil }) else {
+                throw GPUError.invalid("Physical paged KV requires explicit ordinary S1 AR decode in every attention layer")
             }
         }
         let kvCapacityRowLimit: Int?
@@ -653,12 +768,12 @@ public final class QwenModel {
                         // double-count attention or nest synchronized measures.
                         attnOut = try attention.forward(pre.mixed, state: &state.attention[i],
                             verificationLinear: linear, prefillMode: prefillAttention, profiler: profiler,
-                            kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader)
+                            kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader, allowPagedKV: allowPagedKV)
                     } else {
                         attnOut = try profiler.measure("attention", layer: i, tokenCount: n, outputs: { [$0.0] + $0.1 }) {
                             let y = try attention.forward(pre.mixed, state: &state.attention[i],
                                 verificationLinear: linear, prefillMode: prefillAttention,
-                                kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader); return (y, state.attention[i].tensors)
+                                kvCapacityRowLimit: kvCapacityRowLimit, pagedSDPAReader: pagedSDPAReader, allowPagedKV: allowPagedKV); return (y, try state.attention[i].evaluationTensors)
                         }.0
                     }
                 }
@@ -721,13 +836,13 @@ public final class QwenModel {
                 // MTP's scalar verify/replay and target-only calls opt out explicitly.
                 if decodeAsyncSchedule.shouldSubmit(phase: phase, tokenCount: n,
                     completedLayers: i + 1, layerCount: layerCount, allowed: allowExperimentalDecodeAsync) {
-                    try MX.asyncEval([h] + state.tensors)
+                    try MX.asyncEval([h] + state.evaluationTensors)
                     experimentalDecodeAsyncSubmissions += 1
                 }
                 // Each business phase owns its evaluation interval. Defaults
                 // preserve the previous multi-token schedule and S1 behavior.
                 if executionPhase.shouldEvaluate(completedLayers: i + 1, tokenCount: n, every: evaluateEveryLayers) {
-                    try MX.eval([h] + state.tensors)
+                    try MX.eval([h] + state.evaluationTensors)
                 }
             }
             let logits: Tensor?

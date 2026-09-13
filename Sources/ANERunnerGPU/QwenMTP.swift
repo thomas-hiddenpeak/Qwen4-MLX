@@ -37,7 +37,7 @@ public final class QwenMTP {
 
         public init(positionBase: Int = 1) { self.positionBase = positionBase }
         public var offset: Int { attention.offset }
-        public var tensors: [Tensor] { attention.tensors }
+        public var tensors: [Tensor] { get throws { try attention.tensors } }
         public mutating func reset(positionBase: Int = 1) { self = State(positionBase: positionBase) }
     }
 

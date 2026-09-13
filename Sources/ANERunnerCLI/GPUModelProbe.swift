@@ -86,7 +86,7 @@ extension RunnerCLI {
                 "prefix": prefix, "phase": phase, "token_ids": ids, "sequence_offset": before,
                 "sequence_offset_after": state.offset, "forward_and_eval_milliseconds": milliseconds,
                 "ssd_wait_seconds": output.ssdWaitSeconds, "ssd_logical_row_bytes": output.ssdLogicalBytes,
-                "trace_names": output.trace.keys.sorted(), "state_tensor_count": state.tensors.count,
+                "trace_names": output.trace.keys.sorted(), "state_tensor_count": try state.tensors.count,
             ])
         }
         var offset = 0, chunkIndex = 0

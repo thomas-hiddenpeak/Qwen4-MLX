@@ -11,7 +11,7 @@
 - C ABI 版本为 1，见 [paged_sdpa_bridge.h](paged_sdpa_bridge.h)：create/free、read、dispatch_info、metadata_bytes、encoded_reads 和错误查询。原生输入由输出图持有；Swift 销毁 context 后不卸载已校验 DSO，避免待执行图的 C++ vtable 失效。
 - `encoded_reads` 是 DSO 内成功编码完整 reader 的累计次数，不是图创建次数、GPU 完成次数或带宽。scratch 字节仅含 BF16 partial 与 FP32 sums/maxs，不含输出、allocator 缓存和并存图。
 
-完整模型的 reader 实验仍使用原有 capacity 状态及完整混合状态 RAM/SSD 快照，默认 reader 是 stock MLX；prefill、MTP 和 verification 不走实验 reader。以下单层物理页池是独立机制入口，尚未替换完整模型或 HTTP 的状态存储。
+完整模型保留 identity reader 实验，并新增显式 `QwenPagedKVContext` 物理页池路径：dense prefill 后导入十二层 Attention，普通单 token decode 直接追加和读页。默认仍用 stock MLX；HTTP 尚未接入该页池，MTP 和 verification 不支持此路径。已有 RAM/SSD cache 继续保存完整混合状态，跨请求页级缓存另行推进。
 
 ## 单层物理 KV 页池
 
@@ -22,6 +22,8 @@
 槽位预留、提交和回滚由 CPU 元数据管理，页号复用带 generation 检查。写入 primitive 固定源/目标页租约，并通过前一写入 ticket 建立 MLX 图依赖；读取和显式导出固定对应状态。GPU dispatch 前注册完成回调持有这些引用，避免图 detach 或 Swift wrapper 提前释放后复用活动页。元数据提交不代表 GPU 已完成。容量须同时容纳各分支、旧尾页版本和在途引用，不能仅按一个分支的 token 长度配置。
 
 Swift 入口提供导入、分叉、单行追加、读取、ready ticket、显式 `materialize()` 和统计。`materialize()` 在求值时导出完整连续 K/V，仅供内容对照及后续归档边界使用；稳态 decode 不调用它。成功加载的 DSO 保持驻留，因为 native 图可能比 Swift wrapper 活得更久。调用和状态 handle 限于所属推理执行器。
+
+预算入口在创建 arena 前申请每层一次 workspace lease；新增兼容 ABI 1 的 `create_owned` 接受 opaque owner 和释放回调，所有失败路径也恰好消费一次。native pool、惰性图和在途命令共同持有 owner，直到 arena 真正释放才归还额度。预算包括 VM 页对齐的 K/V arena、分配余量与静态元数据；动态页表、导出和计算暂存另计。该账本不等于 RSS 硬上限。同步/异步机制已覆盖 Swift wrapper 消失后预算仍保留、原生 owner 最终归还及创建失败回调。
 
 统计分别报告完整 arena 分配、唯一活动页、单状态逻辑 K/V、已编码复制/写入/导出字节和操作完成/失败。活动页释放后可在 arena 内复用，整个 arena 的分配仍存在；逻辑字节跨分支求和会重复计算共享页。编码字节是 kernel 描述的 payload，不是测得的 DRAM 流量、RSS 降幅或成功完成证明。
 

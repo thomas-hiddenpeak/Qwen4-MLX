@@ -160,7 +160,7 @@ extension RunnerCLI {
             // verify that the initial output is exactly reproducible.
             gdnState.reset(); attentionState.reset()
             guard gdnState.offset == 0, gdnState.tensors.isEmpty,
-                  attentionState.offset == 0, attentionState.tensors.isEmpty,
+                  attentionState.offset == 0, try attentionState.tensors.isEmpty,
                   let firstInput else { throw CLIError.usage("Sequence reset failed") }
             let resetOutput: Tensor
             if let gdn { resetOutput = try gdn.forward(firstInput,state: &gdnState) }

@@ -1,4 +1,6 @@
+import ANERunnerCore
 import CMLX
+import Darwin
 import Foundation
 
 /// Model-free, single-layer physical-sharing and immutable-state diagnostic.
@@ -195,12 +197,111 @@ private final class PagePoolRun {
         let next = try seed.append(keys:row.keys,values:row.values)
         return try next.read(queries:query)
     }
+    func deferredBudgetedRead(_ query: Tensor, _ witness: WeakPool,
+                              _ budget: QwenStateBudget) throws -> Tensor {
+        let pool = try GPUPagedKVPool(libraryPath:library,maximumPages:4,stateBudget:budget)
+        witness.value = pool
+        try require(pool.admittedBytes == GPUPagedKVPool.reservedBytes(maximumPages:4),
+                    "native pool reports exactly the admitted arena bytes")
+        let source = try pair(count:33), row = try pair(start:33,count:1)
+        let seed = try pool.importState(keys:source.keys,values:source.values)
+        return try seed.append(keys:row.keys,values:row.values).read(queries:query)
+    }
+    func completedBudgetedWork(_ pool: GPUPagedKVPool, _ query: Tensor) throws {
+        let source = try pair(count:33)
+        let state = try pool.importState(keys:source.keys,values:source.values)
+        try ready([try state.read(queries:query)])
+    }
+    func emptyBudgetedPool(_ query: Tensor, _ budget: QwenStateBudget,
+                           _ expectedCharge: Int) throws -> StatisticsSnapshot {
+        let pool = try GPUPagedKVPool(libraryPath:library,maximumPages:4,stateBudget:budget)
+        return try withExtendedLifetime(pool) {
+            try completedBudgetedWork(pool,query)
+            try drained(pool,"budgeted completed state")
+            try require(budget.statistics.workspaceBytes == expectedCharge,
+                        "held empty pool keeps fixed arena charged")
+            return StatisticsSnapshot(pool: try pool.statistics, budget: budget.statistics)
+        }
+    }
+    struct StatisticsSnapshot: Encodable {
+        let pool: GPUPagedKVPool.Statistics
+        let budget: QwenStateBudget.Statistics
+    }
+    func budgetLifetime(_ query: Tensor) throws {
+        let admitted = try GPUPagedKVPool.reservedBytes(maximumPages:4)
+        // Two compact states conservatively cover this small diagnostic's
+        // dynamic lists/tables/source rows; the pool lease covers arenas only.
+        let dynamicBytes = 2 * 34 * 2048
+        let budget = try QwenStateBudget(maxBytes:admitted+dynamicBytes)
+        guard let dynamic = budget.reserve(bytes:dynamicBytes,kind:.workspace) else {
+            throw GPUError.invalid("Physical page pool probe could not reserve diagnostic graph workspace")
+        }
+        let witness = WeakPool()
+        var output: Tensor? = try deferredBudgetedRead(query,witness,budget)
+        try require(witness.value == nil,"budgeted Swift pool/state wrappers gone before evaluation")
+        try require(budget.statistics.workspaceBytes == admitted+dynamicBytes &&
+                    budget.statistics.currentLeases == 2,
+                    "lazy native graph retains arena reservation after Swift wrappers disappear")
+        let lazy = budget.statistics
+        let source = try pair(count:33), row = try pair(start:33,count:1)
+        let expected = try concatenate(source,row)
+        let oracle = try MX.sdpa(query,expected.keys,expected.values,scale:1/16)
+        try equal(output!,oracle,"budgeted deferred graph remains valid")
+        output = nil; try MX.synchronize()
+        try require(budget.statistics.workspaceBytes == dynamicBytes &&
+                    budget.statistics.currentLeases == 1,
+                    "last native graph/completion releases arena reservation")
+        let releasedGraph = budget.statistics
+        let empty = try emptyBudgetedPool(query,budget,admitted+dynamicBytes)
+        try require(budget.statistics.workspaceBytes == dynamicBytes,
+                    "empty pool destruction returns arena reservation")
+        dynamic.release()
+        try require(budget.statistics.totalBytes == 0 && budget.statistics.currentLeases == 0,
+                    "completed diagnostic returns all state reservations")
+        try emit(["event":"budget_lifetime","passed":true,
+            "fixed_arena_admitted_bytes":admitted,"dynamic_graph_workspace_bytes":dynamicBytes,
+            "lazy_without_swift_wrappers":try object(lazy),"graph_released":try object(releasedGraph),
+            "held_empty_pool":try object(empty),"final_budget":try object(budget.statistics),
+            "rss_limit_verified":false])
+    }
+    final class ReleaseWitness { var calls = 0 }
+    func ownedFailurePaths() throws {
+        typealias Release = @convention(c) (UnsafeMutableRawPointer?) -> Void
+        typealias CreateOwned = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, Int32,
+            mlx_stream, UnsafeMutableRawPointer?, Release?) -> Int32
+        guard let handle = dlopen(library,RTLD_NOW|RTLD_LOCAL) else {
+            throw GPUError.invalid("Cannot reopen pool ABI for owner failure-path probe")
+        }
+        defer { dlclose(handle) } // The successful pool initializer already pins this DSO.
+        guard let symbol = dlsym(handle,"anemlx_paged_kv_pool_create_owned") else {
+            throw GPUError.invalid("Missing owned pool ABI in failure-path probe")
+        }
+        let create = unsafeBitCast(symbol,to:CreateOwned.self)
+        for invalidOutput in [false,true] {
+            let witness = ReleaseWitness()
+            // Keep a separate observable object alive while native consumes its
+            // retained reference, including the rejected output-pointer path.
+            let retained = Unmanaged.passRetained(witness).toOpaque()
+            var output: UnsafeMutableRawPointer?
+            let release: Release = { value in
+                if let value { Unmanaged<ReleaseWitness>.fromOpaque(value).takeRetainedValue().calls += 1 }
+            }
+            let status: Int32
+            if invalidOutput { status = create(nil,4,mlx_stream(ctx:nil),retained,release) }
+            else { status = create(&output,4,mlx_stream(ctx:nil),retained,release) }
+            try require(status != 0 && output == nil && witness.calls == 1,
+                        "rejected native pool consumes owner exactly once")
+        }
+        try emit(["event":"owned_create_failures","passed":true,"cases":2,"gpu_work_submitted":false])
+    }
     func run() throws {
         // First callback occurs after the DSO loads, before any GPU dispatch,
         // so the CLI can verify that it did not load a second MLX runtime.
         let large = try GPUPagedKVPool(libraryPath:library,maximumPages:384)
         try emit(["event":"start","async_eval":asynchronous,"model_loaded":false,"page_tokens":32])
+        try ownedFailurePaths()
         let query = try pattern(start:0,count:1,salt:7,heads:24)
+        try budgetLifetime(query)
         try boundaries(query)
         try longWork(large,query); try drained(large,"four branches released")
         try emit(["event":"long_drained","statistics":try object(large.statistics)])

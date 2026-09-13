@@ -127,8 +127,8 @@ extension RunnerCLI {
                 // State comparisons read all retained buffers only in diagnostics.
                 // At long context this is deliberately not a timing benchmark.
                 var states: [[String: Any]] = []
-                for (name, a) in state.namedTensors.sorted(by: { $0.key < $1.key }) {
-                    guard let b = candidate.namedTensors[name], a.shape == b.shape else {
+                for (name, a) in try state.namedTensors.sorted(by: { $0.key < $1.key }) {
+                    guard let b = try candidate.namedTensors[name], a.shape == b.shape else {
                         throw GPUError.invalid("Committed state shape mismatch: \(name)")
                     }
                     // Full KV prefixes are unchanged handles/values except the

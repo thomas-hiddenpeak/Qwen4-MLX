@@ -11,6 +11,12 @@ extern "C" {
 int32_t anemlx_paged_kv_pool_version(void);
 const char* anemlx_paged_kv_pool_last_error(void);
 int32_t anemlx_paged_kv_pool_create(void** pool, int32_t physical_pages, mlx_stream stream);
+// Consumes owner exactly once on every success/failure path when release_owner
+// is non-null. Successful creation retains it through the final native graph /
+// Metal completion and frees it after arena storage. The callback may execute
+// on a Metal completion thread; it must not throw or call thread-confined MLX.
+int32_t anemlx_paged_kv_pool_create_owned(void** pool, int32_t physical_pages,
+    mlx_stream stream, void* owner, void (*release_owner)(void*));
 void anemlx_paged_kv_pool_free(void* pool);
 int32_t anemlx_paged_kv_pool_import(void** state, const void* pool, mlx_array keys, mlx_array values);
 int32_t anemlx_paged_kv_pool_fork(void** state, const void* source);

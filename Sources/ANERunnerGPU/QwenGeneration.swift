@@ -270,6 +270,9 @@ public struct QwenGenerationPhases: Codable, Sendable {
     /// Largest extra K/V workspace reservation held for one successful step.
     /// Logical admission allowance, not observed MLX/RSS peak memory.
     public var kvCapacityWorkspacePeakBytes: Int? = nil
+    /// Explicit compact-to-page import is included in decode round/service time.
+    public var pagedKVImportSeconds: Double? = nil
+    public var pagedKVTokenSteps: Int? = nil
 }
 
 /// A single-use payload, confined to the model's inference executor. An invalid
@@ -329,6 +332,7 @@ fileprivate struct QwenPrefillPayload {
 /// This class deliberately does not conform to Sendable.
 public final class QwenPrefillSession {
     fileprivate let model: QwenModel
+    fileprivate let generatorIdentity: UUID
     fileprivate let request: QwenGenerationRequest
     fileprivate let cancellation: QwenCancellation?
     fileprivate var progress: QwenPrefillProgress?
@@ -336,9 +340,10 @@ public final class QwenPrefillSession {
     public fileprivate(set) var isActive = false
     public var isFinished: Bool { progress == nil }
     public var isWaitingForPrefixCache: Bool { progress?.cacheResolved == false }
-    fileprivate init(model: QwenModel, request: QwenGenerationRequest,
+    fileprivate init(model: QwenModel, generatorIdentity: UUID, request: QwenGenerationRequest,
                      cancellation: QwenCancellation?, progress: QwenPrefillProgress) {
-        self.model = model; self.request = request; self.cancellation = cancellation
+        self.model = model; self.generatorIdentity = generatorIdentity
+        self.request = request; self.cancellation = cancellation
         self.progress = progress
     }
     /// Discard only at a yielded boundary. Active-step/callback mutation is rejected.
@@ -383,15 +388,17 @@ fileprivate final class QwenPrefillProgress {
 /// error or cancellation after admission invalidates the whole cursor.
 public final class QwenDecodeSession {
     fileprivate let model: QwenModel
+    fileprivate let generatorIdentity: UUID
     fileprivate let request: QwenGenerationRequest
     fileprivate let cancellation: QwenCancellation?
     fileprivate var progress: QwenDecodeProgress?
     public private(set) var generatedTokenCount = 0
     public fileprivate(set) var isActive = false
     public var isFinished: Bool { progress == nil }
-    fileprivate init(model: QwenModel, request: QwenGenerationRequest,
+    fileprivate init(model: QwenModel, generatorIdentity: UUID, request: QwenGenerationRequest,
                      cancellation: QwenCancellation?, progress: QwenDecodeProgress) {
-        self.model = model; self.request = request; self.cancellation = cancellation
+        self.model = model; self.generatorIdentity = generatorIdentity
+        self.request = request; self.cancellation = cancellation
         self.progress = progress
     }
     public func discard() throws {
@@ -415,6 +422,7 @@ fileprivate final class QwenDecodeProgress {
     var decodeRounds = 0, ssdBytes = 0
     var kvCapacityTokenSteps = 0, kvCapacityWorkspaceFallbacks = 0
     var kvCapacityWorkspacePeakBytes = 0
+    var pagedKVImportSeconds = 0.0, pagedKVTokenSteps = 0
     var ssdWait = 0.0
     init(payload: QwenPrefillPayload, prepared: QwenPrefillResult,
          handoffWaitSeconds: Double, handoffConsumeSeconds: Double, now: UInt64) {
@@ -437,6 +445,8 @@ public final class QwenGenerator {
     private let memoryPressure: QwenMemoryPressurePolicy?
     /// Explicit per-generator AR experiment; never changes shared model defaults.
     private let pagedSDPAReader: GPUPagedSDPAReader?
+    private let pagedKVContext: QwenPagedKVContext?
+    private let generatorIdentity = UUID()
     /// Diagnostics only: readback here perturbs execution and is excluded from
     /// production timing trials. Do not mutate tensors or reenter generation.
     public var prefixStateObserver: ((String, QwenModel.State) throws -> Void)?
@@ -470,9 +480,15 @@ public final class QwenGenerator {
     public init(model: QwenModel, prefixCacheLimits: QwenPrefixCacheLimits? = nil,
                 prefixDiskStore: QwenPrefixDiskStore? = nil,
                 memoryPressurePolicy: QwenMemoryPressurePolicy? = nil,
-                pagedSDPAReader: GPUPagedSDPAReader? = nil) throws {
+                pagedSDPAReader: GPUPagedSDPAReader? = nil,
+                pagedKVContext: QwenPagedKVContext? = nil) throws {
         self.model = model
         self.pagedSDPAReader = pagedSDPAReader
+        self.pagedKVContext = pagedKVContext
+        guard pagedSDPAReader == nil || pagedKVContext == nil else {
+            throw QwenGenerationError.invalidRequest("Choose one experimental paged KV backend")
+        }
+        if let pagedKVContext { try model.validatePagedKVContext(pagedKVContext) }
         memoryPressure = memoryPressurePolicy
         guard prefixDiskStore == nil || prefixCacheLimits != nil else {
             throw QwenGenerationError.invalidRequest("SSD prefix cache requires prefix cache limits")
@@ -499,6 +515,18 @@ public final class QwenGenerator {
     /// capacity. Device health and exclusive access are checked at stage entry.
     public func validateRequest(_ request: QwenGenerationRequest) throws {
         try request.validate(configuration: model.configuration)
+        if let pagedKVContext {
+            guard request.mtpDepth == 0, request.kvAppendMode == .reference else {
+                throw QwenGenerationError.invalidRequest("Physical paged KV requires ordinary AR without capacity256")
+            }
+            // Leave one physical slot for immutable partial-tail COW even for
+            // a single session. More live branches can still produce bounded OOM.
+            let rows = request.tokens.count + max(0, request.maxTokens - 1)
+            guard rows <= pagedKVContext.maximumTokens,
+                  (rows + 31) / 32 < pagedKVContext.maximumPagesPerLayer else {
+                throw QwenGenerationError.invalidRequest("Physical paged KV request exceeds initialized arena capacity")
+            }
+        }
         if let pagedSDPAReader {
             guard request.mtpDepth == 0 else {
                 throw QwenGenerationError.invalidRequest("Paged SDPA reader supports ordinary AR only; MTP is unavailable")
@@ -626,8 +654,8 @@ public final class QwenGenerator {
         try validate(prepared.request, cancellation: cancellation)
     }
     private func validatePrefillSession(_ session: QwenPrefillSession, cancellation: QwenCancellation?) throws {
-        guard session.model === model else {
-            throw QwenGenerationError.invalidRequest("prefill cursor belongs to another model instance")
+        guard session.model === model, session.generatorIdentity == generatorIdentity else {
+            throw QwenGenerationError.invalidRequest("prefill cursor belongs to another generator or model instance")
         }
         guard !session.isActive else { throw QwenGenerationError.busy }
         guard !session.isFinished else { throw QwenGenerationError.invalidRequest("prefill cursor is finished or discarded") }
@@ -635,8 +663,8 @@ public final class QwenGenerator {
         // The immutable request was fully validated when the cursor was made.
     }
     private func validateDecodeSession(_ session: QwenDecodeSession, cancellation: QwenCancellation?) throws {
-        guard session.model === model else {
-            throw QwenGenerationError.invalidRequest("decode cursor belongs to another model instance")
+        guard session.model === model, session.generatorIdentity == generatorIdentity else {
+            throw QwenGenerationError.invalidRequest("decode cursor belongs to another generator or model instance")
         }
         guard !session.isActive else { throw QwenGenerationError.busy }
         guard !session.isFinished else { throw QwenGenerationError.invalidRequest("decode cursor is finished or discarded") }
@@ -689,7 +717,8 @@ public final class QwenGenerator {
             try cancellation?.check()
             p.activeSeconds = elapsed(p.startedAt)
             p.lastYieldAt = now()
-            let session = QwenPrefillSession(model: model, request: request, cancellation: cancellation, progress: p)
+            let session = QwenPrefillSession(model: model, generatorIdentity: generatorIdentity,
+                request: request, cancellation: cancellation, progress: p)
             session.recordProcessed(p.offset)
             return session
         } catch {
@@ -852,7 +881,7 @@ public final class QwenGenerator {
         // not distinguish pre-admission busy from a busy error thrown by user code.
         let payload = try prepared.payload.take()
         let consumed = elapsed(start)
-        return QwenDecodeSession(model: model, request: prepared.request, cancellation: cancellation,
+        return QwenDecodeSession(model: model, generatorIdentity: generatorIdentity, request: prepared.request, cancellation: cancellation,
             progress: QwenDecodeProgress(payload: payload, prepared: prepared,
                 handoffWaitSeconds: wait, handoffConsumeSeconds: consumed, now: now()))
     }
@@ -897,6 +926,11 @@ public final class QwenGenerator {
                         checkCancellation: { try self.checkCancellation(session.cancellation, cancellation) })
                     tokens = round.tokens; p.ssdWait += round.ssdWaitSeconds; p.ssdBytes += round.ssdLogicalBytes
                 } else {
+                    if let pagedKVContext, !p.state.hasPagedKV {
+                        let importStart = now()
+                        try model.usePagedKV(state: &p.state, context: pagedKVContext)
+                        p.pagedKVImportSeconds += elapsed(importStart)
+                    }
                     if request.kvAppendMode == .capacity256 {
                         kvCapacityPermit = try model.reserveKVCapacityAppend(state: p.state,
                             rowLimit: request.tokens.count + request.maxTokens)
@@ -904,7 +938,8 @@ public final class QwenGenerator {
                     }
                     let out = try model.forward(tokens: [p.next], state: &p.state,
                         decodeMode: request.decodeMode, phase: .decode,
-                        kvCapacityPermit: kvCapacityPermit, pagedSDPAReader: pagedSDPAReader)
+                        kvCapacityPermit: kvCapacityPermit, pagedSDPAReader: pagedSDPAReader,
+                        allowPagedKV: pagedKVContext != nil)
                     guard let logits = out.logits else { throw QwenGenerationError.unavailable("missing target logits") }
                     let selected = try model.greedyToken(logits)
                     try model.evaluate([selected], state: &p.state)
@@ -913,6 +948,7 @@ public final class QwenGenerator {
                         p.kvCapacityWorkspacePeakBytes = max(p.kvCapacityWorkspacePeakBytes,
                             kvCapacityPermit.workspaceBytes)
                     }
+                    if pagedKVContext != nil { p.pagedKVTokenSteps += 1 }
                     try decodeStateObserver?("decode", p.state)
                     tokens = [try selected.uint32TokenID()]
                     p.ssdWait += out.ssdWaitSeconds; p.ssdBytes += out.ssdLogicalBytes
@@ -937,7 +973,11 @@ public final class QwenGenerator {
                 verificationEvaluateEveryLayers: request.verificationEvaluateEveryLayers,
                 decodeKernelMode: request.decodeMode.rawValue)
             phases.decodeSuspensionSeconds = p.suspensionSeconds
-            phases.kvAppendMode = request.kvAppendMode.rawValue
+            phases.kvAppendMode = pagedKVContext == nil ? request.kvAppendMode.rawValue : "paged32"
+            if pagedKVContext != nil {
+                phases.pagedKVImportSeconds = p.pagedKVImportSeconds
+                phases.pagedKVTokenSteps = p.pagedKVTokenSteps
+            }
             phases.kvCapacityTokenSteps = p.kvCapacityTokenSteps
             phases.kvCapacityWorkspaceFallbacks = p.kvCapacityWorkspaceFallbacks
             phases.kvCapacityWorkspacePeakBytes = p.kvCapacityWorkspacePeakBytes
@@ -979,7 +1019,9 @@ public final class QwenGenerator {
                     decodeKernelMode: phases.decodeKernelMode, decodeSuspensionSeconds: 0,
                     kvAppendMode: phases.kvAppendMode, kvCapacityTokenSteps: phases.kvCapacityTokenSteps,
                     kvCapacityWorkspaceFallbacks: phases.kvCapacityWorkspaceFallbacks,
-                    kvCapacityWorkspacePeakBytes: phases.kvCapacityWorkspacePeakBytes)
+                    kvCapacityWorkspacePeakBytes: phases.kvCapacityWorkspacePeakBytes,
+                    pagedKVImportSeconds: phases.pagedKVImportSeconds,
+                    pagedKVTokenSteps: phases.pagedKVTokenSteps)
                 return QwenGenerationResult(tokens: result.tokens, finishReason: result.finishReason,
                     preparationSeconds: result.preparationSeconds,
                     timeToFirstTokenSeconds: result.timeToFirstTokenSeconds,

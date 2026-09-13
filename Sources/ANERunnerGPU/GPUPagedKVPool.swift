@@ -1,3 +1,4 @@
+import ANERunnerCore
 import CMLX
 import Darwin
 import Foundation
@@ -11,6 +12,30 @@ public final class GPUPagedKVPool {
     public let abiVersion: Int
     public let maximumPages: Int
     public var maximumTokens: Int { maximumPages * 32 }
+    /// Fixed arena + static metadata reservation, or zero for an unbudgeted
+    /// mechanism probe. This is admission accounting, not process RSS.
+    public let admittedBytes: Int
+
+    /// Host-only estimate used before constructing any pool. Includes both
+    /// arenas, VM-page rounding, the pinned MLX allocator's cached-buffer size
+    /// allowance, and bounded static pool metadata. Dynamic page lists/tables,
+    /// read scratch and explicit exports need their own request/cache/workspace
+    /// reservation; they are not covered by this fixed pool reservation.
+    public static func reservedBytes(maximumPages: Int) throws -> Int {
+        try arenaReservationBytes(maximumPages: maximumPages) + 65_536 + maximumPages * 128
+    }
+
+    private static func arenaReservationBytes(maximumPages: Int) throws -> Int {
+        guard (1...4096).contains(maximumPages) else {
+            throw GPUError.invalid("Physical KV pool maximumPages must be in 1...4096")
+        }
+        let page = Int(getpagesize())
+        guard page > 0 else { throw GPUError.invalid("Cannot determine physical KV allocation page size") }
+        let oneArena = maximumPages * 32_768
+        // MLX BufferCache may return a larger buffer, strictly less than the
+        // rounded request plus two VM pages. Retain the full allowance.
+        return 2 * (((oneArena + page - 1) / page) * page + 2 * page)
+    }
 
     public struct Statistics: Codable, Equatable, Sendable {
         public let physicalPages, arenaLogicalBytes, arenaAllocatedBytes: UInt64
@@ -26,6 +51,9 @@ public final class GPUPagedKVPool {
     }
 
     private typealias Create = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, Int32, mlx_stream) -> Int32
+    private typealias ReleaseOwner = @convention(c) (UnsafeMutableRawPointer?) -> Void
+    private typealias CreateOwned = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, Int32, mlx_stream,
+        UnsafeMutableRawPointer?, ReleaseOwner?) -> Int32
     private typealias Destroy = @convention(c) (UnsafeMutableRawPointer?) -> Void
     private typealias Import = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, UnsafeRawPointer?, mlx_array, mlx_array) -> Int32
     private typealias Fork = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, UnsafeRawPointer?) -> Int32
@@ -45,9 +73,18 @@ public final class GPUPagedKVPool {
     private let materializeNative: Materialize
     private let errorNative: @convention(c) () -> UnsafePointer<CChar>?
 
-    public init(libraryPath: String, maximumPages: Int) throws {
+    public init(libraryPath: String, maximumPages: Int, stateBudget: QwenStateBudget? = nil) throws {
         guard libraryPath.hasPrefix("/"), (1...4096).contains(maximumPages) else {
             throw GPUError.invalid("Physical KV pool requires absolute library path and maximumPages 1...4096")
+        }
+        let reservationBytes = try Self.reservedBytes(maximumPages: maximumPages)
+        let arenaAllowance = try Self.arenaReservationBytes(maximumPages: maximumPages)
+        var reservation: QwenStateBudget.Lease?
+        if let stateBudget {
+            guard let lease = stateBudget.reserve(bytes: reservationBytes, kind: .workspace) else {
+                throw GPUError.invalid("Physical KV pool state budget denied \(reservationBytes) fixed arena bytes")
+            }
+            reservation = lease
         }
         let path = URL(fileURLWithPath: libraryPath).resolvingSymlinksInPath().path
         guard let handle = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
@@ -68,18 +105,47 @@ public final class GPUPagedKVPool {
             dlclose(handle)
             throw GPUError.invalid("Physical KV pool requires ABI 1")
         }
+        let createOwned: CreateOwned?
+        if reservation != nil {
+            guard let symbol = dlsym(handle, "anemlx_paged_kv_pool_create_owned") else {
+                dlclose(handle)
+                throw GPUError.invalid("Budgeted physical KV pool requires native create_owned lifetime support")
+            }
+            createOwned = unsafeBitCast(symbol, to: CreateOwned.self)
+        } else { createOwned = nil }
         // Pin the successful DSO before constructing any native graph. Even a
         // constructor failure may leave a submitted graph using its vtables.
         let create = unsafeBitCast(symbols[1], to: Create.self)
         let destroy = unsafeBitCast(symbols[2], to: Destroy.self)
         let error = unsafeBitCast(symbols[13], to: (@convention(c) () -> UnsafePointer<CChar>?).self)
         var native: UnsafeMutableRawPointer?
-        let status = create(&native, Int32(maximumPages), MX.stream)
+        let status: Int32
+        if let reservation, let createOwned {
+            let owner = Unmanaged.passRetained(reservation).toOpaque()
+            // The native call consumes this +1 even on failure. The local
+            // reference is separate and drops normally at initializer exit.
+            status = createOwned(&native, Int32(maximumPages), MX.stream, owner, { value in
+                if let value { Unmanaged<QwenStateBudget.Lease>.fromOpaque(value).release() }
+            })
+        } else { status = create(&native, Int32(maximumPages), MX.stream) }
         guard status == 0, let native else {
             if let native { destroy(native) }
             throw GPUError.invalid("Physical KV pool initialization: \(error().map { String(cString: $0) } ?? "empty pool (\(status))")")
         }
+        let statistics = unsafeBitCast(symbols[12], to: Scalars.self)
+        if reservation != nil {
+            var values = [UInt64](repeating: 0, count: 17)
+            let checked = values.withUnsafeMutableBufferPointer {
+                statistics(UnsafeRawPointer(native), $0.baseAddress, $0.count)
+            }
+            guard checked == 0, values[1] == UInt64(maximumPages) * 65_536,
+                  values[2] >= values[1], values[2] <= UInt64(arenaAllowance) else {
+                destroy(native)
+                throw GPUError.invalid("Physical KV arena allocation exceeded its pre-admitted allowance")
+            }
+        }
         self.libraryPath = path; self.maximumPages = maximumPages; abiVersion = version
+        admittedBytes = reservation == nil ? 0 : reservationBytes
         context = native; destroyNative = destroy
         importNative = unsafeBitCast(symbols[3], to: Import.self)
         forkNative = unsafeBitCast(symbols[4], to: Fork.self)
@@ -90,7 +156,7 @@ public final class GPUPagedKVPool {
         readyNative = unsafeBitCast(symbols[9], to: Ready.self)
         readNative = unsafeBitCast(symbols[10], to: Read.self)
         materializeNative = unsafeBitCast(symbols[11], to: Materialize.self)
-        statisticsNative = unsafeBitCast(symbols[12], to: Scalars.self)
+        statisticsNative = statistics
         errorNative = error
     }
 

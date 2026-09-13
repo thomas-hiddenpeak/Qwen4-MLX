@@ -51,9 +51,12 @@ MTL::ComputePipelineState* kernel(mx::Stream stream, const char* name) {
 }  // namespace
 
 struct PoolImpl {
-  explicit PoolImpl(int count, mx::Stream s)
-      : physical_pages(count), stream(s), metadata(count),
+  explicit PoolImpl(int count, mx::Stream s, std::shared_ptr<const void> owner)
+      : lifetime(std::move(owner)), physical_pages(count), stream(s), metadata(count),
         keys(allocate_arena(count)), values(allocate_arena(count)) {}
+  // First member is destroyed last: a reservation must outlive arena storage,
+  // including when a primitive or completion outlives every public Pool/State.
+  const std::shared_ptr<const void> lifetime;
   const int physical_pages;
   const mx::Stream stream;
   meta::PagePool metadata;
@@ -211,10 +214,12 @@ std::shared_ptr<const StateImpl> append_impl(const std::shared_ptr<PoolImpl>& po
 }
 }  // namespace
 
-std::shared_ptr<Pool> Pool::create(int physical_pages, mx::Stream stream) {
+std::shared_ptr<Pool> Pool::create(int physical_pages, mx::Stream stream,
+    std::shared_ptr<const void> lifetime) {
   require(physical_pages > 0 && physical_pages <= 4096, "Physical pages must be in 1...4096");
   require(stream.device.type == mx::Device::gpu, "Paged KV pool requires explicit GPU stream");
-  return std::shared_ptr<Pool>(new Pool(std::make_shared<PoolImpl>(physical_pages, stream)));
+  return std::shared_ptr<Pool>(new Pool(std::make_shared<PoolImpl>(
+      physical_pages, stream, std::move(lifetime))));
 }
 State Pool::import_kv(const mx::array& k, const mx::array& v) {
   return State(append_impl(impl_, impl_->metadata.empty(), std::nullopt, k, v));

@@ -7,7 +7,7 @@
 
 | 上游机制 | 本项目的处理 |
 | --- | --- |
-| [物理页表与尾页 COW](https://github.com/vllm-project/vllm-metal/blob/023e544fec59f872f65f66e23232706e4e17ff2e/vllm_metal/attention/caches/kv_cache.py) | 已实现保留本机算术的 Metal 页表 reader；新增独立单层物理 arena、不可变分支页表与尾页 COW。整模型共享缓存和跨请求调度尚未接入。 |
+| [物理页表与尾页 COW](https://github.com/vllm-project/vllm-metal/blob/023e544fec59f872f65f66e23232706e4e17ff2e/vllm_metal/attention/caches/kv_cache.py) | 已实现保留本机算术的 Metal 页表 reader、物理 arena、不可变分支页表与尾页 COW，并接入完整模型的显式 AR 实验。跨请求页级缓存与 HTTP 尚未接入。 |
 | [Hybrid 状态边界对齐](https://github.com/vllm-project/vllm-metal/blob/023e544fec59f872f65f66e23232706e4e17ff2e/vllm_metal/attention/state/align.py) | 页共享仍必须绑定同一位置的 GDN、QSA、PLE 状态。32-token 页可以整除现有 416-token 检查点；不把可裁切 KV 当成整个模型都可任意裁切。 |
 | [MLX 读写依赖](https://github.com/vllm-project/vllm-metal/blob/023e544fec59f872f65f66e23232706e4e17ff2e/vllm_metal/attention/impls/sdpa.py) | Q/K/V、页表和掩码是 reader 输入；写入 ticket 串接前次写入。图持有与实际命令完成持有共同覆盖页租约，临时归约数组继续由 encoder 管理。 |
 | Prefill/decode 专用 kernel | 保持现有阶段分离。NAX prefill 后续独立评估；上游 NAX 不直接覆盖本模型学习型 QSA 布尔掩码，不能直接替换。 |
@@ -99,3 +99,28 @@ CPU 元数据 2,257 项检查已通过。覆盖初始 11,057 行导入、31/32/3
 postflight 核对 498 个固定文件与 102 个模型 payload stat，均无变化；参考服务 PID 8290 按原参数恢复为 idle，MTP/drafter 关闭。同步报告 SHA 为 `23b5bb2aa492d54ebe31377da87dc974ab3485959a2dc47dcbcfb3a454fa7e9e`，异步为 `15f7527f01561058442d12d070834e430365c51a6ef02cbfbbeb6f1ab8094b0a`，比较明细见同目录 `independent-comparison.json`。
 
 整模型接入仍需显式区分 dense/paged 状态存储：普通求值跟随 write ticket 和其他实际计算根，不能让 `tensors`/`namedTensors` 暗中逐 token gather。检查点与 SSD 需要明确的导出/导入边界，并保持 Attention/QSA、GDN、PLE 同一 offset。物理预算须按唯一 arena 分配计一次，并另计页表、导出和其他暂存；空闲槽数不能代替真实分配账本。本次未接入全模型前缀树、HTTP、增量 SSD 或生产默认，不据此声明整模型吞吐、RSS 或长时可靠性收益。
+
+## 第三增量：完整模型使用物理页池（2026-09-14）
+
+`QwenPagedKVContext` 为十二层 Attention 各建一个 arena，供同一模型执行器上的不可变分支使用。`QwenGenerator` 显式配置该 context 后，保留 chunk416/eval4 的 dense prefill；首次实际 decode 导入 K/V，以后直接追加并读页。导入计入 decode 时间，同时独立报告 `pagedKVImportSeconds`，真实步骤报告 `pagedKVTokenSteps`。该配置与 capacity256、identity reader、MTP 互斥，当前读页上限仍为 131072；HTTP 没有打开该入口，不能用参考业务服务的 262144 验证替代本路径验证。
+
+完整状态的 `evaluationTensors` 只返回真实计算根，paged K/V 由 ready ticket 表示；普通 `tensors`/`namedTensors` 在 paged 状态明确拒绝。归档、trim 和数值探针需要显式 materialize。`forkPrefixState` 共享 K/V 页，GDN/QSA/PLE 私有化，保留共同 offset。每层物理 arena 先申请预算，再由 native pool 的 owner 回调持有至最后一个惰性图或在途命令释放；Swift wrapper 释放不再提前归还额度。动态页表、诊断导出和其他 workspace 仍另计，这不是进程物理内存上限。
+
+P11057 完整模型探针包含 A/B 不同续写、保留旧 seed、显式 archive encode/decode 后重新分页续写，以及 completed prefill 跨 generator 交接。29 组完整混合状态、3,509 个 BF16 张量记录及对应 host 状态逐位一致，19 次普通分页 decode 的操作计数通过；诊断导出与普通 decode 的零隐式导出分开记录。独立分析核对 58,720 条条件通过。所有状态/context 释放后预算和活动页归零；本探针为每层 1024 页，共固定分配 768 MiB，不能拿活动页共享直接声称 RSS 降低。
+
+新寿命路径的同步与 async 机制各通过 1,448 项检查、71,476,224 个 BF16 元素对照；原 reader 的 260 项及新增 Attention 边界四项 GPU 测试通过。第一轮边界测试曾发现 `evaluationTensors` 漏拒绝只替换一半的 KV，已修复并独立复跑，原失败保留在 `results/paged-model-v1/`。相关 release CPU 测试 45 项通过。
+
+真实生成器的两组 P11057/O128 计时均关闭 cache 和 observer，分别预热 A/B O16，所有 1,088 个测量及 warmup IDs 匹配既有参考输出。独立分析另外核对 2,562 条条件，包括 phase 守恒、arena/lease 回收与实际 encoded row/tail bytes。
+
+| 顺序 | stock + capacity256 decode tok/s | physical paged32 decode tok/s | 观察变化 |
+| --- | ---: | ---: | ---: |
+| ABBA | 16.48 | 14.69 | −10.86% |
+| BAAB | 18.06 | 15.95 | −11.70% |
+
+速率仍为实际 decode tokens 除以 decode round 总秒数，首次输出属于 prefill，分页导入包含在 decode 中。ABBA baseline 两样本跨度 12.06%，BAAB paged 跨度 29.45%，各模式/顺序只有两样本。prefill 未改算法，各块速度也有漂移；不合并历史绝对速率、不归因于供电、不接受单请求吞吐收益。两模式都保留同一组固定 arena，故本计时也不证明容量节省。后续需要实际跨请求共享及多会话成本验证。
+
+结果目录 `results/paged-model-v2/`；固定 runner SHA `5f405f0bfb7e7c0a69dcf84a3dee8d99c768b86d0252718fee7e82000b6ff0c4`，独立原生库 SHA `0fea25725979db9605f33a18ae6461fc2c5c0c377e70738752f25bc1a607dbb7`。554 个冻结文件及 102 个模型 payload stat 的 postflight 通过，参考业务服务按原 argv 恢复。归档验证是进程内格式往返，尚未验证此路径的 SSD 持久化、重启、长测或 HTTP。
+
+另补齐未完成 prefill/decode 游标的 generator 身份绑定，避免同模型的另一 generator 误用原 cache producer 或 decode 配置；完成的 `QwenPrefillResult` 仍允许同模型 PD 交接。`results/paged-model-v3/` 在 runner `9be879c9b96fc8b7c7ca4e448c3076af99e749f644f937b05422cb37142445f7` 上复过完整模型及新增 prefill 归属检查：拒绝外部 step 后 host、预算与 native counters 未变，原 generator 按原 chunk 网格完成，再成功交接。CPU45项和554/102 postflight通过。独立模型分析单独归属 v3；将 v2 机制与 v3 模型误传入要求相同 binary 的综合分析曾被正确拒绝，原记录保留，不把两版本合称同次验证。
+
+复跑入口是 `probe-gpu-paged-kv-model` 与 `benchmark-gpu-paged-kv`；参数见 CLI help，需通过唯一 GPU 控制器及新输出目录运行。第二个入口必须分别运行 ABBA/BAAB，不能拿状态探针的同步导出时间当作吞吐结果。跨请求页缓存接入后必须重新验证，不能继承本节的 cache-off 证据。

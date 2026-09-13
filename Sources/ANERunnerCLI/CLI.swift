@@ -90,6 +90,10 @@ struct RunnerCLI {
                 try benchmarkGPUKVCapacity(arguments)
             case "benchmark-gpu-paged-attention":
                 try benchmarkGPUPagedAttention(arguments)
+            case "benchmark-gpu-paged-kv":
+                try benchmarkGPUPagedKV(arguments)
+            case "probe-gpu-paged-kv-model":
+                try probeGPUPagedKVModel(arguments)
             case "probe-gpu-paged-kv-pool":
                 try probeGPUPagedKVPoolMechanism(arguments)
             case "generate-gpu":
@@ -352,6 +356,12 @@ struct RunnerCLI {
         Diagnostic MLX build only: --gpu-command-timing-output NEW_JSON_PATH
     probe-gpu-kv-capacity --diagnostics-library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
         Model-free Swift capacity allocation/ARC diagnostic; default eval sync. Run in an exclusive GPU window.
+    benchmark-gpu-paged-kv --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--max-tokens 128] [--context 16384] [--maximum-pages-per-layer 512] [--order abba|baab] [--warmup true|false]
+        Stock capacity256 versus physical paged32; prefill/decode separate and page import included in decode.
+    probe-gpu-paged-kv-model --library ABSOLUTE_DYLIB --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON
+        [--max-tokens 16] [--maximum-pages-per-layer 1024]
+        Full-model mixed-state, shared branch, archive and generator correctness; diagnostic timings only.
     probe-gpu-paged-kv-pool --library ABSOLUTE_DYLIB --output NEW_NDJSON [--eval sync|async]
         Model-free physical page sharing, immutable tails, direct SDPA and GPU lifetime checks; diagnostic timing only.
     probe-gpu-kv-capacity-model --model-dir PATH --tokens-file AGENT_11K_JSON --output NEW_REPORT_JSON

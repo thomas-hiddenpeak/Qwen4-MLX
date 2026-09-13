@@ -17,7 +17,7 @@ private struct PrefixProbeSavedState {
     init(_ state: QwenModel.State) throws {
         host = state.diagnosticHostValues
         var values = [String: Value]()
-        for (name, tensor) in state.namedTensors {
+        for (name, tensor) in try state.materializedNamedTensors() {
             let floating = [MLX_BFLOAT16, MLX_FLOAT16, MLX_FLOAT32, MLX_FLOAT64].contains(tensor.dtype)
             let finite = floating ? try tensor.floats().allSatisfy(\.isFinite) : true
             values[name] = Value(shape: tensor.shape, dtype: Int(tensor.dtype.rawValue),

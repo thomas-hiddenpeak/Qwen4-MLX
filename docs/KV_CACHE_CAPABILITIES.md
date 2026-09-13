@@ -35,7 +35,7 @@
 | 来源 | 采用的机制 | 本机适配与取舍 |
 | --- | --- | --- |
 | [vLLM](research/KV_VLLM_REVIEW.md)：release v0.28.0 `2cf0a6915ce544dc493a0990f2ea38d81601128a`；main `1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d` | 物理页池/引用计数、尾页 COW、跨组共同恢复边界、先固定引用再分配、水位准入、传输完成契约 | KV 页与 recurrent 检查点分开；Metal 直接使用页表才形成完整分页路径。部分 main 新功能受 EAGLE/MTP 条件限制，不纳入当前前置条件 |
-| [vllm-metal](research/VLLM_METAL_ADOPTION.md)：`023e544fec59f872f65f66e23232706e4e17ff2e` | Metal 直接页表读取、MLX 图依赖与临时数组寿命、hybrid 对齐 | 保持独立 Swift runner；已落地保留本机 MLX 算术的 32-token reader 和独立单层物理页共享/COW 候选。整模型仍用 identity 页表验证路径；共享状态、物理预算及 HTTP 接入随后推进，NAX prefill 单独做 QSA 数值适配 |
+| [vllm-metal](research/VLLM_METAL_ADOPTION.md)：`023e544fec59f872f65f66e23232706e4e17ff2e` | Metal 直接页表读取、MLX 图依赖与临时数组寿命、hybrid 对齐 | 保持独立 Swift runner；32-token reader、不可变物理页池及完整模型显式 AR 路径已实现，包含原生寿命预算。跨请求页级缓存与 HTTP 尚未接入；NAX prefill 单独做 QSA 数值适配 |
 | [SGLang](research/KV_SGLANG_REVIEW.md)：main `30e7a3072d3f1e9bd70cd5e44146ca27c80522c4` | Unified Radix 混合组件、会话软保留、分层预取/写回、恢复期限、有效命中与浪费指标 | 保留本项目更严格的文件校验和耐久路径。统一内存不照搬 HBM→CPU 两个独立容量池；其 MLX 辅助状态代码不证明本模型已获支持 |
 | [LMCache](research/KV_TIERED_REVIEW.md)：`47da378cae7fce8efbd14a3cf5ab78e19e63ef3c` | 当前 MP 的查找/预取/读取结束、预留/提交分离，独立存储/预取/淘汰控制器及对象所有权 | 吸收协议和背压，先保持同进程 Swift 所有权；不引入 Python 缓存服务、CUDA IPC 或 RDMA 依赖 |
 | [DwarfStar / antirez/ds4](research/KV_TIERED_REVIEW.md)：`6289c516273979173abbc062209a81dd3706b804` | 专用 runner 的会话检查点、格式与状态 ABI 分层、衰减热度和每字节保留价值 | 继续使用准确 token 身份和严格数值配置；不复制文本键、跨量化恢复或其模型的边界常量 |
@@ -54,6 +54,8 @@ K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DES
 用户恢复后，`counter-witness` + `capacity256` 独立完成[608 秒 HTTP 预检](research/KV_CAPACITY_HTTP_RESULTS.md)。10 个冷输出可区分，74 唯一终态、2 段持续 SSD 替换、1020 实际容量步骤和最终回收全部通过。新测试补上旧 fixture 同输出的识别盲区；旧中断记录独立保留，新负载的两小时、24小时和真实系统压力验收仍待完成。
 
 K07 新增 [vllm-metal 吸收增量](research/VLLM_METAL_ADOPTION.md)：32-token Metal reader 已通过第一轮机制及 P11057 完整模型状态对照，显式 per-generator AR decode 仍读取 capacity view 的 identity 页表。第二增量实现独立单层固定物理 arena、不可变分支页表、完整页共享、尾页始终 COW、图/命令完成引用与显式导出；CPU 元数据 2,257 项检查通过，同步/异步 GPU 各通过 1,435 项检查。整模型/HTTP 尚未采用该页池，也未新增生产默认。
+
+2026-09-14 第三增量已把页池接入完整模型的显式实验配置：十二层 arena 各计一次原生寿命预算，求值根不导出连续 KV，分叉保留 KV 页并私有化 GDN/QSA/PLE。P11057 的 29 组完整混合状态与归档续写对照通过，3,509 个 BF16 张量记录一致；普通 decode 的直接页操作及零隐式导出通过。两组 O128 测量没有单请求吞吐收益，保留默认；现有前缀树仍保存 dense 快照，跨请求物理页复用、HTTP 与增量 SSD 尚未交付。具体口径见研究记录。
 
 ## 四、九项关键能力
 

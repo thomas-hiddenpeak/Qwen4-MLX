@@ -49,7 +49,10 @@ class State {
 
 class Pool {
  public:
-  static std::shared_ptr<Pool> create(int physical_pages, mlx::core::Stream stream);
+  // The optional owner follows PoolImpl, including lazy graphs and submitted
+  // Metal work, and is destroyed after both physical arena allocations.
+  static std::shared_ptr<Pool> create(int physical_pages, mlx::core::Stream stream,
+      std::shared_ptr<const void> lifetime = {});
   State import_kv(const mlx::core::array& keys, const mlx::core::array& values);
   Stats stats() const;
  private:

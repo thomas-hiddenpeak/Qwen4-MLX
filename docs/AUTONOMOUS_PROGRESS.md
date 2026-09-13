@@ -1,5 +1,19 @@
 # 自主研究与开发接续
 
+## 2026-09-13 夜间窗口：完整模型共享 KV 页池
+
+00:29 更新：M1 完整模型页池已完成两轮受控验证。v2 的29组混合状态/3509 BF16张量、机制sync/async各1448检查和71476224元素通过，独立模型+机制58720检查通过；ABBA/BAAB的1088输出IDs与历史参考一致，独立计数/phase分析2562检查通过。decode均速stock/paged为16.48/14.69、18.06/15.95tok/s，无提速结论，默认不变。未完成prefill/decode游标已绑定generator，完成handoff保留model级PD；v3 CPU45及完整模型/ownership复跑通过。v3模型单独分析，误混v2机制的综合分析因binary不同被拒绝并保留原记录。两轮554冻结文件/102model stat postflight均通过；当前参考50749 exact argv、idle、MTP/drafter关闭，当前ledger见experiment-status.json。源码冻结已解除，root准备阶段commit/push。
+
+M2候选在 results/paged-prefix-candidate/{lowlevel,cache,generation,admission,probe} 准备，尚未编译/运行：dense缓存附带可信namespace/token/context绑定的paged KV，实际decode只追加suffix；常量物理page claim保护全部未来decode，额度不足整个cursor走dense，不按token反复尝试。仍保留dense缓存和prefill复制，不能声称已经fullypagedprefill。root唯一build/GPU/Git，阶段截止与04:40收尾不变。以下本夜较早条目为历史过程。
+
+用户授权持续优化至北京时间 2026-09-14 05:00（UTC 2026-09-13 21:00）。`qwen4-mlx` heartbeat 已更新为 ACTIVE，20分钟接续，04:40开始收尾。根代理唯一 build/GPU/Git owner；当前尚未启动 GPU 测试，业务服务 PID19347、262144 context/8项10GiB prefix cache 原参数仍在。下一控制器参考 ledger 必须取 `../qwen38-ssd/results/experiment-status.json` 的当前 `reference_ledger`。
+
+00:08 更新：release/45项相关CPU通过；v1在新增边界测试发现 evaluationTensors 漏拒绝部分KV替换，保留原始失败，554文件/102模型stat postflight与业务恢复48215已通过。修正为轻量完整性检查后CPU45项复过。当前唯一控制器 `results/paged-model-v2/plan.json`，exec session1838；源码/二进制/原生库等554项冻结，禁止修改或build。Attention 4项GPU、reader260项、pool同步/async各1448checks与71476224 BF16元素均通过；当前真实模型PID48592正在运行，后续ABBA/BAAB O128尚待。结束后必须postflight并恢复业务精确argv。
+
+prefill-owner-candidate 正在ignored目录准备：同model但跨generator的未完成prefill游标可造成错误cache producer归属，需像本轮已修decode游标一样绑定generator身份；完整QwenPrefillResult仍允许PD跨generator交接。等当前控制器结束后才应用与复测。当前commit仍6ccfcac，尚未发布本增量。
+
+起点为已推送 `6ccfcac`。正在把 `f910703` 单层不可变页池接完整模型，显式区分 evaluation roots / materialized export、每层唯一 arena 原生寿命预算、QSA/GDN/PLE 私有分支。保持实验显式选择，MTP后置、生产默认不变。子任务：paged_attention_integration 仅 Attention；paged_budget_audit 原生寿命与 Swift pool；paged_cache_validation 新完整模型探针；root Model/Generator/上下文与集成验证。源码仍在编辑，尚无本增量编译、模型正确性或性能结论。
+
 ## 2026-09-09 用户恢复测试：可区分前缀的缓存回归
 
 用户已说“可以继续了”，恢复当前 KV cache 工作；旧八小时窗口已结束，原 heartbeat 保持 PAUSED，不创建新的八小时期限。先修复长测 fixture 的判别能力，再跑独立 600 秒 `counter-witness` + `capacity256` 预检。原 105 分钟计划因暂停只完成约 64.823 分钟工作段，保留为中断结果，不与新运行拼接。

@@ -16,7 +16,7 @@ struct CacheReliabilityAnchor: Codable, Equatable {
     init(_ state: QwenModel.State) throws {
         host = state.diagnosticHostValues
         var tensors = [String: Value]()
-        for (name, tensor) in state.namedTensors {
+        for (name, tensor) in try state.materializedNamedTensors() {
             let bytes = try MoETilingBytes.bytes(tensor)
             guard tensor.dtype == MLX_BFLOAT16, bytes.count % 2 == 0 else {
                 throw CLIError.usage("Reliability anchor expected native BF16 state")
