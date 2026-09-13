@@ -1,5 +1,9 @@
 # 自主研究与开发接续
 
+02:37 更新：显式长上下文容量配置与完整状态 probe 已通过182项相关CPU、9项CLI负控和真实262144上下文CLI检查。`results/long-context-reference262-v1` 的P262142/O2冷/热各1次实际decode、B262080恢复/62新输入、6组121张量及host精确一致；独立6579检查全过，最终全部状态预算/lease0。冷prefill2454.232s，warm3.115s（restore0.274s），MLX业务峰值95.511GB；这是带状态诊断的容量结果，不是稳定吞吐或质量验收。599文件/102模型stat postflight通过，参考服务66360按精确原argv恢复、idle且MTP/drafter关闭。32K fusedQSA跨模式仍有58/121误差超限，默认reference。详见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)。
+
+已接入公开长上下文启动/HTTP验证工具，4个--help、原始decode fixture再核对及新的32K真实CPU分词通过；**完整HTTP验证尚未执行**。下一步：RAM共享恢复和SSD导入限额修复→短实模回归→同输入262K跨版本状态/峰值对照→对该版本直接运行公开HTTP脚本（含32-token decode、取消后大缓存再用）。先前计划的旧版HTTP冷运行省略，以免多做一次约41分钟prefill；所有通过结论仍按实际二进制区分。
+
 ## 2026-09-13 夜间窗口：完整模型共享 KV 页池
 
 01:34 更新：M2库已commit/push `6ec4a27`，HTTP显式接入已完成 `results/paged-http-churn-v1` 的639.468秒实际混合工作段及独立审计；10oracle+23成功+2取消，23paged完成/345steps、4严格RAM物理复用、2成功SSD晋升续写、10dense回退，最终request/claims/inflight0、固定workspace405012480精确。35终态join、全部10profile、两SSD窗口、508health、33RSS/FD采样和server/client退出0通过。无周期性中途drain，不扩大耐久/压力/性能口径。561files/102model stats postflight无变动，参考59001 exactargv/idle、MTPdrafter关闭，最新reference ledger为results/paged-http-churn-v1/run-ledger.json；源码冻结已解除，root正在提交HTTP增量。长context7文件组合候选在results/long-context-integration-prep，已包括prompt-file与实际final_state_offset，下一步应用/release/CPU后先32K/64K数值+RAM检查，再262K真实decode和HTTP cold JSON/warm SSE。

@@ -6,9 +6,14 @@ private enum SSDPrefetchMode: String { case off, nextChunk }
 
 extension RunnerCLI {
     static func gpuTokenize(_ args: Arguments) throws {
-        try args.validate(["--model-dir", "--prompt", "--chat", "--output"])
+        try args.validate(["--model-dir", "--prompt", "--prompt-file", "--chat", "--output"])
+        let prompt: String
+        switch (args["--prompt"], args["--prompt-file"]) {
+        case (.some(let value), nil): prompt = value
+        case (nil, .some(let path)): prompt = try String(contentsOfFile: path, encoding: .utf8)
+        default: throw CLIError.usage("tokenize requires exactly one of --prompt or --prompt-file")
+        }
         let tokenizer = try QwenTokenizer(modelDirectory: URL(fileURLWithPath: args.require("--model-dir")))
-        let prompt = try args.require("--prompt")
         let rendered = args["--chat"] == "true" ? try tokenizer.renderChat(messages: [ChatMessage(role: "user", content: prompt)]) : prompt
         let tokens = try tokenizer.encode(rendered)
         try emit(["tokens": tokens, "rendered_prompt": rendered, "decoded": try tokenizer.decode(tokens)], to: args["--output"])

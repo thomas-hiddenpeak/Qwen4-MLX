@@ -24,7 +24,9 @@ extension RunnerCLI {
             "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes",
             "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds",
             "--prefix-cache-shutdown-timeout-seconds", "--kv-append-mode",
-            "--paged-kv-pool-library", "--paged-kv-pages-per-layer"])
+            "--paged-kv-pool-library", "--paged-kv-pages-per-layer",
+            "--context-limit", "--max-reserved-tokens", "--max-resident-sequences",
+            "--connection-deadline-seconds", "--prefill-attention"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
@@ -75,12 +77,22 @@ extension RunnerCLI {
             }
             prefixCacheDirectory = nil
         }
+        // Independent CPU quotas preserve their historical defaults. A large
+        // context does not implicitly expand cache/state bytes or body limits.
+        let capacity = try QwenHTTPServiceCapacity(
+            contextLimit: try number("--context-limit", 16_384, 1...QwenHTTPServiceCapacity.maximumContextLimit),
+            maxReservedTokens: try number("--max-reserved-tokens", 32_768, 1...Int.max),
+            maxResidentSequences: try number("--max-resident-sequences", 2, 1...2),
+            maxBodyBytes: try number("--max-body-bytes", 262_144, 1024...QwenHTTPServiceCapacity.maximumBodyBytes),
+            connectionDeadlineSeconds: try number("--connection-deadline-seconds", 300, 1...86_400))
+        guard let prefillAttention = GPUAttention.PrefillMode(rawValue: args["--prefill-attention"] ?? "reference") else {
+            throw CLIError.usage("--prefill-attention must be reference or fusedQSA")
+        }
         let config = GPUHTTPConfiguration(
             modelDirectory: URL(fileURLWithPath: try args.require("--model-dir"))
                 .standardizedFileURL.resolvingSymlinksInPath(),
             port: try number("--port", 11236, 1024...65535),
             maxConnections: try number("--max-connections", 8, 1...32),
-            maxBodyBytes: try number("--max-body-bytes", 262_144, 1024...1_048_576),
             outputBytes: try number("--output-buffer-bytes", 65_536, 8192...1_048_576),
             prefixCacheBytes: prefixCacheBytes,
             prefixCacheEntries: try number("--prefix-cache-entries", 8, 1...256),
@@ -93,7 +105,12 @@ extension RunnerCLI {
             prefixCacheShutdownTimeoutSeconds: try number("--prefix-cache-shutdown-timeout-seconds", 30, 1...300),
             stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max),
             kvAppendMode: kvAppendMode,
-            pagedKVLibrary: pagedKVLibrary, pagedKVPagesPerLayer: pagedKVPagesPerLayer)
+            pagedKVLibrary: pagedKVLibrary, pagedKVPagesPerLayer: pagedKVPagesPerLayer,
+            capacity: capacity, prefillAttention: prefillAttention)
+        // Read only config metadata before binding a listener/loading weights;
+        // the worker rechecks the actual loaded model before advertising ready.
+        let modelConfiguration = try QwenConfiguration(modelDirectory: config.modelDirectory)
+        try capacity.validateModelMaximumPositions(modelConfiguration.maximumPositions)
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
         // general CLI catch's synchronous stderr write after a sink failure.
@@ -103,7 +120,7 @@ extension RunnerCLI {
 
 private struct GPUHTTPConfiguration: Sendable {
     let modelDirectory: URL
-    let port, maxConnections, maxBodyBytes, outputBytes, prefixCacheBytes, prefixCacheEntries: Int
+    let port, maxConnections, outputBytes, prefixCacheBytes, prefixCacheEntries: Int
     let prefixCacheDirectory: URL?
     let prefixCacheDiskBytes, prefixCacheDiskEntries, prefixCacheTTLSeconds: Int
     let prefixCacheMinFreeBytes, prefixCacheRestoreTimeoutSeconds: Int
@@ -112,6 +129,12 @@ private struct GPUHTTPConfiguration: Sendable {
     let kvAppendMode: GPUAttention.KVAppendMode
     let pagedKVLibrary: String?
     let pagedKVPagesPerLayer: Int?
+    let capacity: QwenHTTPServiceCapacity
+    let prefillAttention: GPUAttention.PrefillMode
+    var maxBodyBytes: Int { capacity.maxBodyBytes }
+    // Larger service profiles have an AR-only acceptance envelope. Default
+    // short-context experimental MTP remains unchanged when pools are off.
+    var supportsMTP: Bool { pagedKVLibrary == nil && capacity.contextLimit <= 16_384 }
     var prefixDiskLimits: QwenPrefixDiskLimits {
         .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes,
               minAvailableBytes: prefixCacheMinFreeBytes)
@@ -167,6 +190,7 @@ private struct GPUHTTPHealth: Sendable {
     var prefills = 0, ready = 0, resident = 0, reserved = 0, waitingPrefix = 0
     var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?, pagedKVJSON: Data?
     var mlxMemory: [String: Int]?
+    var modelMaximumPositions: Int?
     var pressureMonitorRunning = false
 }
 
@@ -428,6 +452,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
             let body = try JSONSerialization.data(withJSONObject: [
                 "status": h.state, "ready": h.state == "ready", "model": configuration.modelID,
                 "pid": Int(getpid()), "experimental": true,
+                "service_capacity": try JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration.capacity)),
+                "prefill_attention": configuration.prefillAttention.rawValue,
+                "model_maximum_positions": h.modelMaximumPositions as Any? ?? NSNull(),
+                "maximum_mtp_depth": configuration.supportsMTP ? 2 : 0,
                 "logging": [
                     "accepting": logs.accepting, "writer_exited": logs.writerExited,
                     "max_bytes": logs.maxBytes, "max_events": logs.maxEvents, "max_event_bytes": logs.maxEventBytes,
@@ -488,6 +516,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 reject(client, status: 400, message: "Physical paged KV requires mtp_depth=0",
                        code: "invalid_request_error"); return
             }
+            guard configuration.supportsMTP || chat.mtpDepth == 0 else {
+                reject(client, status: 400, message: "HTTP context limits above 16384 require mtp_depth=0",
+                       code: "invalid_request_error"); return
+            }
             guard health.withLock({ $0.state == "ready" }) else {
                 reject(client, status: 503, message: "Model is not ready", code: "model_unavailable"); return
             }
@@ -545,6 +577,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
             }
         }
         emit("ready", "gauge", "Model ready to serve requests.", h.state == "ready" ? 1 : 0)
+        emit("service_context_tokens", "gauge", "Configured total prompt and output token limit for one request.", configuration.capacity.contextLimit)
+        emit("service_reserved_tokens_limit", "gauge", "Configured scheduler token reservation quota across admitted jobs.", configuration.capacity.maxReservedTokens)
+        emit("service_resident_sequences_limit", "gauge", "Configured maximum simultaneously resident model states.", configuration.capacity.maxResidentSequences)
         emit("queued_prefills", "gauge", "Queued prefill jobs including prefix waiters.", h.prefills)
         emit("ready_decodes", "gauge", "Decode jobs ready on the local scheduler.", h.ready)
         emit("waiting_prefix_sequences", "gauge", "Requests waiting for a producer or SSD prefix.", h.waitingPrefix)
@@ -730,7 +765,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
             // One periodic observer reads the current lease's start, rather
             // than scheduling uncancellable timers for past sends/requests.
             if let start = client.sendStartedAt, Double(now - start) * 1e-9 >= 15 { close(client, reason: .sendDeadline) }
-            else if age >= 300 { close(client, reason: .connectionDeadline) }
+            else if age >= Double(configuration.capacity.connectionDeadlineSeconds) { close(client, reason: .connectionDeadline) }
             else if !client.parsed && age >= 15 {
                 reject(client, status: 408, message: "Request receive deadline exceeded", code: "request_timeout")
             }
@@ -797,6 +832,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
             stateBudgetBytes: configuration.stateBudgetBytes) { count, total in
                 if count % 8 == 0 || count == total { self.log("HTTP model loaded \(count)/\(total)") }
             }
+        try configuration.capacity.validateModelMaximumPositions(model.configuration.maximumPositions)
+        health.withLock { $0.modelMaximumPositions = model.configuration.maximumPositions }
         // One context owns all fixed arenas for this service. The generator
         // passes it to its prefix cache and admission follows every cursor.
         // Pool capacity is an optional execution choice, not a context limit.
@@ -810,7 +847,9 @@ private final class GPUHTTPServer: @unchecked Sendable {
                   ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds),
                   diskRestoreTimeoutSeconds: TimeInterval(configuration.prefixCacheRestoreTimeoutSeconds)),
             prefixDiskStore: diskStore, memoryPressurePolicy: memoryPressure, pagedKVContext: pagedKVContext)
-        let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
+        let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(
+            maxResidentTokens: configuration.capacity.maxReservedTokens, executionMode: .cooperative,
+            maxResidentSequences: configuration.capacity.maxResidentSequences))
         var jobs: [UUID: GPUHTTPActive] = [:]
         defer {
             for job in jobs.values { job.work.cancellation.cancel() }
@@ -822,7 +861,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
             try? MX.synchronize()
         }
         health.withLock { $0.state = inbox.isStopping ? "stopping" : "ready"; $0.idle = true }
-        log("HTTP model state=ready default=AR experimental_mtp_depth=\(pagedKVContext == nil ? 2 : 0) context=16384 chunk=416 paged_kv_configured=\(pagedKVContext != nil) paged_kv_pages_per_layer=\(configuration.pagedKVPagesPerLayer ?? 0)")
+        log("HTTP model state=ready default=AR experimental_mtp_depth=\(configuration.supportsMTP ? 2 : 0) context=\(configuration.capacity.contextLimit) model_maximum_positions=\(model.configuration.maximumPositions) reserved_tokens_limit=\(configuration.capacity.maxReservedTokens) resident_sequences_limit=\(configuration.capacity.maxResidentSequences) connection_deadline_seconds=\(configuration.capacity.connectionDeadlineSeconds) chunk=416 prefill_attention=\(configuration.prefillAttention.rawValue) paged_kv_configured=\(pagedKVContext != nil) paged_kv_pages_per_layer=\(configuration.pagedKVPagesPerLayer ?? 0)")
         func snapshot(active: Int = 0) {
             let s = scheduler.snapshot()
             let cacheJSON = generator.prefixCacheStatistics.flatMap { try? JSONEncoder().encode($0) }
@@ -878,9 +917,10 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     }
                     try work.cancellation.check()
                     let request = QwenGenerationRequest(tokens: tokens, maxTokens: work.chat.maxTokens,
-                        contextLimit: 16_384, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
+                        contextLimit: configuration.capacity.contextLimit, prefillChunk: 416, mtpDepth: work.chat.mtpDepth,
                         verification: work.chat.mtpDepth == 2 ? .batchedScalarLinear : .scalar,
-                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil, prefixCachePlan: prefixPlan,
+                        draftHistoryTokens: work.chat.mtpDepth == 2 ? 1024 : nil,
+                        prefillAttention: configuration.prefillAttention, prefixCachePlan: prefixPlan,
                         kvAppendMode: work.chat.mtpDepth == 0 ? configuration.kvAppendMode : .reference)
                     let active = GPUHTTPActive(work, maxTextBytes: configuration.outputBytes - 2048)
                     let id = try scheduler.submit(request, cancellation: work.cancellation) { token in
@@ -1003,6 +1043,8 @@ private final class GPUHTTPServer: @unchecked Sendable {
         modelFields["paged_kv_imported_suffix_rows"] = terminalPhases?.pagedKVImportedSuffixRows as Any? ?? NSNull()
         modelFields["paged_kv_capacity_fallbacks"] = terminalPhases?.pagedKVCapacityFallbacks as Any? ?? NSNull()
         modelFields["paged_kv_reserved_pages_per_layer"] = terminalPhases?.pagedKVReservedPagesPerLayer as Any? ?? NSNull()
+        modelFields["prefill_attention"] = terminalPhases?.prefill.attentionMode as Any? ?? NSNull()
+        modelFields["final_state_offset"] = event.result?.statistics.finalStateOffset as Any? ?? NSNull()
         if let result = event.result {
             modelFields["model_finish_reason"] = result.finishReason.rawValue
             modelFields["prompt_tokens"] = result.statistics.promptTokenCount

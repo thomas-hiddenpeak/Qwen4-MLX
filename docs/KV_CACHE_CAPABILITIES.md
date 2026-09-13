@@ -193,3 +193,6 @@ P0 验收通过后可按上述限定范围发布；Paged KV/增量存储是提�
 - KV 有损量化、跨量化恢复：不能混入当前精确缓存合同。无损压缩也需先证明 CPU 成本、暂存空间与 I/O 收益。
 - RDMA、CUDA IPC、GDS、跨机器缓存控制面、通用多模型后端：待本机状态协议和 PD 服务成熟后按实际部署需求扩展。
 - 通过迁入 Core ML/ANE 解决缓存管理：硬件后端探索不替代身份、所有权、容量和 I/O 管理，当前保持 MLX 计算路径。
+
+
+2026-09-14 长上下文增量：`serve-gpu` 已可显式配置最大262144的prompt+output总额度、请求体、连接期限和常驻序列数；默认16K保持。完整262K CLI冷/热RAM路径通过全121状态和实际decode检查，warm仅计算62行，最终预算归零；真实HTTP、更多decode及取消后的长缓存复用尚待下一轮验证。32K fusedQSA跨模式数值筛选失败，长配置继续reference。完整证据及后续RAM复制、稀疏prefill、大SSD流式优先级见[长上下文结果](research/KV_LONG_CONTEXT_RESULTS.md)，复跑入口见[长上下文HTTP工具](HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)。当前没有262K SSD缓存恢复能力。

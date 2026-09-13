@@ -51,13 +51,13 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 
 仅监听 `127.0.0.1`。`GET /health` 提供服务及资源状态，`GET /v1/models` 返回实际模型ID，`POST /v1/chat/completions` 支持流式或非流式文字与工具调用。网络队列与固定推理线程分离；各版本分别实测取消恢复、非流式输出超限、真实AR SSE背压，以及日志管道堵塞时的服务活性。
 
-这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文固定16384；AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
+这是**实验服务及有限API子集**：支持字符串内容的 system / user / assistant / tool、function tools、`tool_choice: auto|none`，使用 no-thinking 模板；temperature只能省略或为0，未知字段会被拒绝。工具调用已完成真实非流式/SSE及结果续答验证，细节见[工具协议](docs/HTTP_TOOL_CALLING.md)；required/指定函数、strict=true、多模态与随机采样仍未支持。上下文默认16384；可显式选择更长的服务容量、资源与期限配置，见[长上下文复跑入口](docs/HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)。AR输出预算1…4096，工具请求使用AR。显式纯文本 `mtp_depth: 2` 使用 `batchedScalarLinear` / tail1024，输出预算仅1…256。
 
 完整请求经模板渲染后一次分词，系统、工具定义与 user/assistant/tool 历史均参与[准确前缀复用](docs/research/KV_CONVERSATION_VALIDATION.md)。检查点沿用416-token计算网格，每个请求最多发布系统与尾部两个检查点；编辑历史或分叉只恢复实际一致的完整状态。默认512 MiB放不下两份长状态时保留共享系统锚点，尾部可写入显式开启的SSD层。命中返回 `usage.prompt_tokens_details.cached_tokens`；`/health`提供详细统计，`GET /metrics`提供无请求标签的Prometheus文本指标。
 
 可用 `--prefix-cache-bytes 0` 关闭缓存，`--prefix-cache-directory` 启用持久化SSD，`--state-budget-bytes` 配置request/cache/workspace联合逻辑额度，`--prefix-cache-shutdown-timeout-seconds` 设置SSD关闭等待期限（默认30秒）。该期限约束SSD队列与回调排空，不能保证挂起的GPU或系统调用立即终止。实际范围和验证见[使用合同](docs/KV_CACHE_RELIABILITY.md)。缓存收益来自减少重复prefill；不代表基础decode吞吐提升。
 
-启动、诊断、停服与重启见[KV cache运维](docs/KV_CACHE_OPERATIONS.md)；持续SSD读写淘汰、取消与资源归还的公开复跑入口见[HTTP cache churn](docs/HTTP_CACHE_CHURN_REPRODUCIBILITY.md)。
+启动、诊断、停服与重启见[KV cache运维](docs/KV_CACHE_OPERATIONS.md)；持续SSD读写淘汰、取消与资源归还的公开复跑入口见[HTTP cache churn](docs/HTTP_CACHE_CHURN_REPRODUCIBILITY.md)。长上下文的真实分词、RAM冷热复用、解码及取消恢复验证见[HTTP长上下文复跑](docs/HTTP_LONG_CONTEXT_REPRODUCIBILITY.md)；该入口不扩大SSD归档限制。
 
 显式容量策略`--kv-append-mode capacity256`仅用于普通AR decode，默认`reference`。完整模型四组对照观察到约3.9%–7.6%的decode增幅，输出一致；prefill没有可信收益，HTTP持续负载另行验收。实现范围、样本和漂移见[KV容量追加](docs/research/KV_CAPACITY_MODEL_RESULTS.md)。
 

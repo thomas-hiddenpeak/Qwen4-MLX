@@ -104,6 +104,8 @@ struct RunnerCLI {
                 try generateGPU(arguments)
             case "probe-gpu-phase-handoff":
                 try probeGPUPhaseHandoff(arguments)
+            case "probe-gpu-long-context":
+                try probeGPULongContext(arguments)
             case "probe-gpu-prefill-attention":
                 try probeGPUPrefillAttention(arguments)
             case "probe-gpu-hotspots":
@@ -337,6 +339,11 @@ struct RunnerCLI {
             [--kv-append-mode reference|capacity256] (default reference; AR decode only)
             [--paged-kv-pool-library ABSOLUTE_DYLIB --paged-kv-pages-per-layer 512]
             (experimental; paired options; reference append and mtp_depth=0 required)
+            [--context-limit 16384 --max-reserved-tokens 32768 --max-resident-sequences 2]
+            [--connection-deadline-seconds 300 --prefill-attention reference|fusedQSA]
+            Context <=262144 and reserved tokens >=context; profiles above16384 require AR.
+            --max-body-bytes defaults to262144; explicit ceiling64MiB.
+            Long contexts need explicit state/cache budgets; full262K SSD snapshots remain unsupported.
             [--max-connections 8 --max-body-bytes 262144 --output-buffer-bytes 65536]
             [--prefix-cache-bytes 536870912 --prefix-cache-entries 8] (bytes 0 disables)
             [--prefix-cache-ttl-seconds 86400 --state-budget-bytes 4294967296]
@@ -392,7 +399,7 @@ struct RunnerCLI {
         Compare S1 and S2 from identical AR checkpoints; not a performance benchmark.
     probe-gpu-mtp-release --model-dir PATH --long-tokens-file PATH --output NEW_REPORT_JSON [--depth 1] [--verification batchedScalarLinear]
         Seven fixed short, QSA-edge and long inputs, with fresh AR/candidate/candidate/AR sessions.
-    tokenize --model-dir PATH --prompt TEXT [--chat true|false] [--output report.json]
+    tokenize --model-dir PATH (--prompt TEXT | --prompt-file UTF8_PATH) [--chat true|false] [--output report.json]
         Encode text with the model's native byte BPE tokenizer; --chat applies the no-thinking chat template.
     probe-telemetry --telemetry-dir NEW_PATH [--seconds 2] [--output report.json]
         Check the optional system sampler lifecycle while idle; no model or bandwidth benchmark.
@@ -406,6 +413,10 @@ struct RunnerCLI {
         Exploratory GEMM rounding check: --allow-rounding true (default false; records the measured error)
     probe-gpu-model --model-dir PATH --tokens-file PATH --capture-output PATH [--layers 1] [--output report.json]
         Capture real hidden states from the first few GPU layers for numerical validation.
+    probe-gpu-long-context --model-dir PATH --tokens-file PATH --output NEW_REPORT_JSON
+        --mode screen|full --context 32768|65536|262144 --max-tokens 2|8
+        screen compares reference/fusedQSA at32K/64K; full takes --prefill-attention reference|fusedQSA.
+        Full262K requires O2; checks RAM reuse and actual decode. State finiteness is not a quality evaluation.
     probe-gpu-prefill-attention --model-dir PATH --tokens-file PATH --output NEW_REPORT_JSON --golden-report PATH [--order reference,fusedQSA] [--max-tokens 128] [--mtp-depth 0|2]
     probe-gpu-hotspots --model-dir PATH --tokens-file PATH --golden-report PATH --output NEW_REPORT_JSON [--max-tokens 128] [--detail attention|moe|tiling|moe-fusion|moe-gateup|moe-expert|moe-composed] [--moe-config PATH] [--baseline-moe-config PATH] [--ab-order ABBA|BAAB]
     probe-gpu-prefix-cache --model-dir PATH --tokens-file AGENT_11K.json --output NEW.json
