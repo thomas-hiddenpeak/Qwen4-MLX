@@ -1,5 +1,11 @@
 # 自主研究与开发接续
 
+04:53 收尾：本轮已验证的最后代码与结果已提交并推送 `da8f42e2255dd434c7a50c3a86b9bc9a6c08ebca`，远端 `codex/runner-baseline` SHA已核对。没有继续启动模型实验；05:00授权上限前完成服务恢复与收尾，既有 `qwen4-mlx` heartbeat 已通过应用工具设为PAUSED并读回确认。新自主窗口从下述待办继续，不重复执行本轮已完成的长测试。
+
+04:52:09最后服务复核：原作者业务服务PID80349、`127.0.0.1:11235/v1`可访问，argv与本轮最新恢复ledger完全相等，running/waiting0，MTP/drafter关闭；本轮两个Swift测试进程已退出。原始结果 `results/night-final-small-v1/final-service-verification.json`，最新恢复ledger仍是该目录的`run-ledger.json`。用户业务服务保留262144总上下文、chunk512、并发1、8项/10GB RAM前缀缓存、SSD/MTP/drafter/PLD关闭。源码与测试在最后实模冻结后未再改动，仅补正文档的SSD优先级与单tensor暂存边界。
+
+当前成熟度边界保持：262K合成容量/全状态/RAM与有限HTTP路径通过，完整262K SSD、可区分真实业务长测、实际系统压力、24小时发布配置与设备故障恢复尚未完成；这些待办不会由本次阶段提交自动变成通过。以下按时间倒序保留各阶段证据。
+
 04:49 最后两项实机回归已结束，进入05:00前收尾。`results/night-final-small-v1`绑定最终binary `91d626264dbfdbbd40d5c22bc6c4292a9ead873ec0c89ac7a71f2d01e1861117`：80项选定CPU测试、2项profiling参数早拒绝通过；64K旧格式SSD正常恢复通过14055项独立审计及38项历史对照，实际约1.915GB文件的121个payload hash与先前cold oracle一致，最终state预算及lease归零。没有真实OOM/Metal故障注入。
 
 32K末段profile通过：1123条记录、288个attention子阶段完整，无失败/丢失；P32766输出IDs `[16,11]`、实际decode1、最终offset32767。两个bulk块中SDPA占attention子阶段elapsed约59.32%/57.67%，选块mask约8.21%/8.43%；不能当整模型或无观察器吞吐。详见[profiling结果与后续kernel方向](research/LONG_PREFILL_PROFILE.md)。两case及控制器均退出0，04:44:27 postflight核对577文件/102模型stat无变化；参考PID80349精确argv、ready/idle、MTP/drafter关闭。它是原作者11235业务服务，Swift测试进程均已退出。
