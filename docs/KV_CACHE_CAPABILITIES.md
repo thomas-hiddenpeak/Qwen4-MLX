@@ -35,7 +35,7 @@
 | 来源 | 采用的机制 | 本机适配与取舍 |
 | --- | --- | --- |
 | [vLLM](research/KV_VLLM_REVIEW.md)：release v0.28.0 `2cf0a6915ce544dc493a0990f2ea38d81601128a`；main `1b2c591cd0c3bb5a85ac7f3d6cbaa2fa7df6bc7d` | 物理页池/引用计数、尾页 COW、跨组共同恢复边界、先固定引用再分配、水位准入、传输完成契约 | KV 页与 recurrent 检查点分开；Metal 直接使用页表才形成完整分页路径。部分 main 新功能受 EAGLE/MTP 条件限制，不纳入当前前置条件 |
-| [vllm-metal](research/VLLM_METAL_ADOPTION.md)：`023e544fec59f872f65f66e23232706e4e17ff2e` | Metal 直接页表读取、MLX 图依赖与临时数组寿命、hybrid 对齐 | 保持独立 Swift runner；32-token reader、不可变物理页池及完整模型显式 AR 路径已实现，包含原生寿命预算。跨请求页级缓存与 HTTP 尚未接入；NAX prefill 单独做 QSA 数值适配 |
+| [vllm-metal](research/VLLM_METAL_ADOPTION.md)：`023e544fec59f872f65f66e23232706e4e17ff2e` | Metal 直接页表读取、MLX 图依赖与临时数组寿命、hybrid 对齐 | 保持独立 Swift runner；32-token reader、不可变物理页池及完整模型显式 AR 路径已实现，包含原生寿命预算。完整dense快照附加KV共享页及HTTP显式开关已接入并短期验证；NAX prefill 单独做 QSA 数值适配 |
 | [SGLang](research/KV_SGLANG_REVIEW.md)：main `30e7a3072d3f1e9bd70cd5e44146ca27c80522c4` | Unified Radix 混合组件、会话软保留、分层预取/写回、恢复期限、有效命中与浪费指标 | 保留本项目更严格的文件校验和耐久路径。统一内存不照搬 HBM→CPU 两个独立容量池；其 MLX 辅助状态代码不证明本模型已获支持 |
 | [LMCache](research/KV_TIERED_REVIEW.md)：`47da378cae7fce8efbd14a3cf5ab78e19e63ef3c` | 当前 MP 的查找/预取/读取结束、预留/提交分离，独立存储/预取/淘汰控制器及对象所有权 | 吸收协议和背压，先保持同进程 Swift 所有权；不引入 Python 缓存服务、CUDA IPC 或 RDMA 依赖 |
 | [DwarfStar / antirez/ds4](research/KV_TIERED_REVIEW.md)：`6289c516273979173abbc062209a81dd3706b804` | 专用 runner 的会话检查点、格式与状态 ABI 分层、衰减热度和每字节保留价值 | 继续使用准确 token 身份和严格数值配置；不复制文本键、跨量化恢复或其模型的边界常量 |
@@ -47,7 +47,7 @@
 
 批次C新增单个 metadata read intent，在旧 IO 忙时暂停新可选写入，待硬额度允许才申请读回 workspace；统一读取期限不随准入/读取阶段重置。C2的177项相关CPU、58项实模准入、51项已接收IO超时、71项会话及45个HTTP成功请求/3次取消对账通过。C3再增加暂停库游标的绝对期限隔离，187项CPU、70项准入、51项IO超时与36成功/3取消HTTP通过。截至2026-09-09 07:19，冻结C3完成7205.783秒工作段，677成功/68取消加10冷参考的755条唯一终态与新phase字段全部对账；24个300秒窗口持续SSD读写淘汰，最后资源回收及有限关闭通过。详见[两小时结果及边界](KV_CACHE_RELIABILITY.md)。真实系统压力、24小时发布配置及固定trace性能/公平门槛未完成。K07的后续容量追加进度另见下文。
 
-实际OS压力验收、SSD读写速率控制、成本选择、完整公平份额与长期性能门槛仍有缺口，不能将K03/K04/K05/K06整项标记完成。C3两小时终态、阶段与资源记录已独立核对；本轮OS压力通知为0、level为unknown，监听已运行不等于真实压力验收。libproc footprint只有82.048分钟部分窗口，不能补称全程。启动、观测及恢复步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)。当前整模型仍为整快照恢复；独立单层物理页池已实现分支共享与尾页 COW，但尚未接入完整混合状态、跨请求页级缓存或 HTTP，增量 SSD 也未实现。容量缓冲内部的 COW 与单层机制验证都不能代替这些服务能力。
+实际OS压力验收、SSD读写速率控制、成本选择、完整公平份额与长期性能门槛仍有缺口，不能将K03/K04/K05/K06整项标记完成。C3两小时终态、阶段与资源记录已独立核对；本轮OS压力通知为0、level为unknown，监听已运行不等于真实压力验收。libproc footprint只有82.048分钟部分窗口，不能补称全程。启动、观测及恢复步骤见[KV cache运维](KV_CACHE_OPERATIONS.md)。截至批次C，整模型仍为整快照恢复；当时独立单层物理页池尚未接入完整混合状态、跨请求缓存或HTTP。后续接入进度见下文各增量；增量SSD仍未实现。容量缓冲内部的 COW 与单层机制验证都不能代替这些服务能力。
 
 K07沿[容量追加设计与独立Metal机制](research/KV_ATTENTION_STORAGE_DESIGN.md)新增[完整模型容量追加候选](research/KV_CAPACITY_MODEL_RESULTS.md)：显式AR `capacity256`已有Swift物理机制、混合状态/RAM恢复/预算回退/取消，以及16/128/512输出交错对照；本块decode观察增幅3.85%–7.61%，prefill无可信改善。库与HTTP默认仍为reference；HTTP已接入`serve-gpu --kv-append-mode capacity256`，仅用于AR decode，尚非共享物理页池。原计划6300秒/105分钟的HTTP负载已按用户要求暂停，实际工作段3889.364秒，记录为未完成；自动接续已停、参考服务已恢复。HTTP和该新二进制的耐久结果不沿用C3。
 
@@ -58,6 +58,8 @@ K07 新增 [vllm-metal 吸收增量](research/VLLM_METAL_ADOPTION.md)：32-token
 2026-09-14 第三增量已把页池接入完整模型的显式实验配置：十二层 arena 各计一次原生寿命预算，求值根不导出连续 KV，分叉保留 KV 页并私有化 GDN/QSA/PLE。P11057 的 29 组完整混合状态与归档续写对照通过，3,509 个 BF16 张量记录一致；普通 decode 的直接页操作及零隐式导出通过。两组 O128 测量没有单请求吞吐收益，保留默认；现有前缀树仍保存 dense 快照，跨请求物理页复用、HTTP 与增量 SSD 尚未交付。具体口径见研究记录。
 
 同日第四增量已将[跨请求页附件](research/KV_PAGED_PREFIX_RESULTS.md)接入真实库生成器：可信前缀绑定、只追加 suffix、元数据跨 clear/eviction 持有、整请求未来页准入与 sticky dense fallback。P11057/B10816 的不同后缀、双游标、取消、小池竞争及跨 context 交接通过，133组完整状态/16093 BF16张量记录一致；无observer warm ABBA/BAAB没有稳定吞吐收益。它仍保留dense快照和prefill复制，HTTP/SSD promotion/长上下文/耐久尚待独立验证，默认未改变。K07整项和K08均未完成。
+
+同日第五增量完成[HTTP物理页接入短验收](research/KV_PAGED_HTTP_RESULTS.md)：639.468秒混合工作段、10冷参考+23成功+2取消完整对账；345个paged步骤、4次严格RAM跨请求复用、两次成功SSD恢复后分页续写、10次dense回退及最终清理通过。默认仍关闭；完整dense快照副本、262K、周期性中途drain、真实压力与耐久仍有明确边界。
 
 ## 四、九项关键能力
 

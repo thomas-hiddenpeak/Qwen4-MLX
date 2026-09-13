@@ -1,6 +1,6 @@
 """Own one server within the experiment controller's existing process group."""
 from pathlib import Path
-import argparse, http.client, json, signal, socket, subprocess, sys, threading, time
+import argparse, http.client, json, os, signal, socket, subprocess, sys, threading, time
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--output-directory', type=Path, required=True)
@@ -8,15 +8,31 @@ parser.add_argument('--duration-seconds', type=int, default=7200)
 parser.add_argument('--port', type=int, default=11248)
 parser.add_argument('--fixture-mode', choices=('legacy', 'counter-witness'), default='legacy')
 parser.add_argument('--kv-append-mode', choices=('reference', 'capacity256'), default='reference')
+parser.add_argument('--paged-kv-pool-library', type=Path)
+parser.add_argument('--paged-kv-pages-per-layer', type=int)
+parser.add_argument('--prefix-cache-bytes', type=int, default=167772160)
+parser.add_argument('--state-budget-bytes', type=int, default=4294967296)
 args = parser.parse_args()
 if not 1 <= args.duration_seconds <= 7200:
     parser.error('--duration-seconds must be in 1...7200')
 if not 1024 <= args.port <= 65535:
     parser.error('--port must be in 1024...65535')
+if not 1 <= args.prefix_cache_bytes <= 8589934592 or args.state_budget_bytes < 1:
+    parser.error('Explicit RAM cache/state budget must be positive and RAM cache <=8GiB')
+if (args.paged_kv_pool_library is None) != (args.paged_kv_pages_per_layer is None):
+    parser.error('--paged-kv-pool-library and --paged-kv-pages-per-layer must be supplied together')
+if args.paged_kv_pool_library is not None:
+    if (not args.paged_kv_pool_library.is_absolute() or not args.paged_kv_pool_library.is_file()
+            or not os.access(args.paged_kv_pool_library, os.R_OK) or not 1 <= args.paged_kv_pages_per_layer <= 4096):
+        parser.error('Paged pool requires a readable absolute library and pages 1...4096')
+    if args.kv_append_mode != 'reference': parser.error('Paged pool cannot use capacity256')
+    if args.prefix_cache_bytes < 805306368 or args.state_budget_bytes < 8589934592:
+        parser.error('Paged churn requires explicit --prefix-cache-bytes >=805306368 and --state-budget-bytes >=8589934592')
 root = Path.cwd(); out = args.output_directory.resolve()
 sys.path.insert(0, str(root / 'scripts'))
 from probe_http_cache_reliability import health_contract, fully_idle
 from capacity_http_validation import require_capacity_health, validate_capacity_terminals
+from paged_http_validation import require_paged_health, validate_paged_terminals
 
 port = args.port; child = None; churn = None; sample_thread = None
 sample_stop = threading.Event(); interrupted = threading.Event(); sample_failed = threading.Event()
@@ -24,6 +40,9 @@ sampling = {'completed': False, 'samples': 0, 'rss_samples': 0, 'fd_samples': 0,
             'errors': 0, 'error': None, 'max_samples': 1024, 'interval_seconds': 30}
 record = {'complete': False, 'passed': False, 'services': [],
           'fixture_mode': args.fixture_mode, 'kv_append_mode': args.kv_append_mode,
+          'paged_kv_pool_library': str(args.paged_kv_pool_library) if args.paged_kv_pool_library else None,
+          'paged_kv_pages_per_layer': args.paged_kv_pages_per_layer,
+          'prefix_cache_bytes': args.prefix_cache_bytes, 'state_budget_bytes': args.state_budget_bytes,
           'sampling': sampling, 'interrupted_by_signal': None,
           'process_observations': 'RSS and numeric FDs, not unique physical Metal memory or device I/O'}
 def save():
@@ -51,6 +70,7 @@ def idle():
         try:
             value = health_contract(json.loads(get('/health')))
             if args.kv_append_mode == 'capacity256': require_capacity_health(value)
+            if args.paged_kv_pool_library: require_paged_health(value, args.paged_kv_pages_per_layer)
             if value['pid'] != child.pid:
                 raise RuntimeError('Health PID does not match the owned server')
             if fully_idle(value): return value
@@ -89,6 +109,7 @@ def sample_process(proc):
                                  memory_pressure=health['memory_pressure'],
                                  memory_pressure_monitor_running=health['memory_pressure_monitor_running'],
                                  prefix_cache=health['prefix_cache'], prefix_disk_cache=health['prefix_disk_cache'])
+                    value['paged_kv_pool'] = health.get('paged_kv_pool')
                 except Exception:
                     # A sample already in progress may lose its process when
                     # cleanup starts. This is not a workload observation.
@@ -137,12 +158,15 @@ try:
     model = root.parent / 'qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream'
     command = [str(root / '.build/release/ane-runner'), 'serve-gpu', '--model-dir', str(model),
         '--port', str(port), '--prefix-cache-directory', str(out / 'cache'),
-        '--prefix-cache-bytes', '167772160', '--prefix-cache-disk-bytes', '1073741824',
+        '--prefix-cache-bytes', str(args.prefix_cache_bytes), '--prefix-cache-disk-bytes', '1073741824',
         '--prefix-cache-entries', '8', '--prefix-cache-disk-entries', '16',
         '--prefix-cache-ttl-seconds', '86400', '--prefix-cache-min-free-bytes', '1073741824',
         '--prefix-cache-restore-timeout-seconds', '5', '--prefix-cache-shutdown-timeout-seconds', '30',
-        '--state-budget-bytes', '4294967296', '--max-connections', '8']
+        '--state-budget-bytes', str(args.state_budget_bytes), '--max-connections', '8']
     if args.kv_append_mode == 'capacity256': command.extend(['--kv-append-mode', 'capacity256'])
+    if args.paged_kv_pool_library:
+        command.extend(['--paged-kv-pool-library', str(args.paged_kv_pool_library.resolve()),
+                        '--paged-kv-pages-per-layer', str(args.paged_kv_pages_per_layer)])
     with (out / 'server.log').open('x') as log:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     row = {'pid': child.pid, 'command': command}; record['services'].append(row); save()
@@ -214,10 +238,23 @@ finally:
         except (OSError, ValueError, TypeError) as error:
             record['capacity_terminal_validation'] = {'complete': False, 'passed': False,
                 'errors': [f'{type(error).__name__}: {error}'[:1500]]}
+    paged_passed = args.paged_kv_pool_library is None
+    record['paged_terminal_validation'] = {'complete': False, 'passed': False, 'skipped': True, 'required': not paged_passed}
+    if not paged_passed and workload_passed and not interrupted.is_set() and cleanup.get('server_exit_code') == 0:
+        try:
+            audit = validate_paged_terminals(out / 'churn.events.ndjson', out / 'server.log', child.pid,
+                row['initial_health'], row['final_health'], stop_requested=interrupted.is_set)
+            record['paged_terminal_validation'] = audit
+            with (out / 'paged-terminal-validation.json').open('x') as stream:
+                json.dump(audit, stream, indent=2); stream.write('\n')
+            paged_passed = audit['complete'] and audit['passed']
+        except (OSError, ValueError, TypeError) as error:
+            record['paged_terminal_validation'] = {'complete': False, 'passed': False,
+                'errors': [f'{type(error).__name__}: {error}'[:1500]]}
     record['complete'] = record['passed'] = bool(workload_passed and not interrupted.is_set()
         and cleanup.get('server_exit_code') == 0 and cleanup.get('client_exit_code') == 0
         and cleanup.get('sampler_completed') and sampling['samples'] > 0 and sampling['errors'] == 0
-        and row['close_completed_logged'] and capacity_passed)
+        and row['close_completed_logged'] and capacity_passed and paged_passed)
     if workload_passed and not record['passed']:
         record['error'] = 'Post-workload sampler/close/exit verification failed; inspect cleanup and service records'
     save()

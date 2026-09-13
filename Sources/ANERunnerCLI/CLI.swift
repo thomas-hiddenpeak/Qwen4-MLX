@@ -335,6 +335,8 @@ struct RunnerCLI {
             --pair-library ABSOLUTE_DYLIB --output NEW.json [--shared-elementwise reference|fused]
         Experimental loopback service: serve-gpu --model-dir PATH [--port 11236]
             [--kv-append-mode reference|capacity256] (default reference; AR decode only)
+            [--paged-kv-pool-library ABSOLUTE_DYLIB --paged-kv-pages-per-layer 512]
+            (experimental; paired options; reference append and mtp_depth=0 required)
             [--max-connections 8 --max-body-bytes 262144 --output-buffer-bytes 65536]
             [--prefix-cache-bytes 536870912 --prefix-cache-entries 8] (bytes 0 disables)
             [--prefix-cache-ttl-seconds 86400 --state-budget-bytes 4294967296]

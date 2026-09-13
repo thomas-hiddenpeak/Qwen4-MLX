@@ -11,7 +11,7 @@
 - C ABI 版本为 1，见 [paged_sdpa_bridge.h](paged_sdpa_bridge.h)：create/free、read、dispatch_info、metadata_bytes、encoded_reads 和错误查询。原生输入由输出图持有；Swift 销毁 context 后不卸载已校验 DSO，避免待执行图的 C++ vtable 失效。
 - `encoded_reads` 是 DSO 内成功编码完整 reader 的累计次数，不是图创建次数、GPU 完成次数或带宽。scratch 字节仅含 BF16 partial 与 FP32 sums/maxs，不含输出、allocator 缓存和并存图。
 
-完整模型保留 identity reader 实验，并新增显式 `QwenPagedKVContext` 物理页池路径：dense prefill 后导入十二层 Attention，普通单 token decode 直接追加和读页。默认仍用 stock MLX；HTTP 尚未接入该页池，MTP 和 verification 不支持此路径。已有 RAM/SSD cache 继续保存完整混合状态，跨请求页级缓存另行推进。
+完整模型保留 identity reader 实验，并新增显式 `QwenPagedKVContext` 物理页池路径：dense prefill 后导入十二层 Attention，普通单 token decode 直接追加和读页。默认仍用 stock MLX；完整dense前缀快照已可附加共享物理KV页，HTTP提供成对显式页池参数，MTP和verification不支持此路径。保留dense快照与原prefill流程；容量不足采用整游标dense回退。跨请求状态和HTTP短验收见[库验证](../../docs/research/KV_PAGED_PREFIX_RESULTS.md)及[HTTP验证](../../docs/research/KV_PAGED_HTTP_RESULTS.md)。
 
 ## 单层物理 KV 页池
 

@@ -61,6 +61,8 @@ chunk416改变过跨块状态舍入边界；固定输入的输出回归不代表
 
 显式容量策略`--kv-append-mode capacity256`仅用于普通AR decode，默认`reference`。完整模型四组对照观察到约3.9%–7.6%的decode增幅，输出一致；prefill没有可信收益，HTTP持续负载另行验收。实现范围、样本和漂移见[KV容量追加](docs/research/KV_CAPACITY_MODEL_RESULTS.md)。
 
+物理共享页可通过成对参数 `--paged-kv-pool-library ABSOLUTE_DYLIB --paged-kv-pages-per-layer 512` 显式启用，要求AR和reference追加。真实HTTP混合负载已验证RAM页复用、SSD恢复晋升、取消及整请求dense回退；默认保持关闭，尚无稳定吞吐优势。配置、固定arena预算与短期验收边界见[HTTP共享页实验](docs/research/KV_PAGED_HTTP_RESULTS.md)。
+
 各轮验证版本、请求示例、限额与剩余边界见 [HTTP/SSE服务](docs/HTTP_SERVER_EXPERIMENT.md)和[输出边界](docs/HTTP_OUTPUT_BOUNDARIES.md)。发送期限、连接期限及长时间稳定性仍有未覆盖范围，不把有限回归表述为生产验收完成。
 
 ## 阶段接口与性能依据

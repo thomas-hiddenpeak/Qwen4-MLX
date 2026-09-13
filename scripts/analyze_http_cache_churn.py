@@ -10,6 +10,8 @@ import sqlite3
 import tempfile
 
 from cache_churn_oracles import audit_oracle_discrimination
+from probe_http_cache_reliability import fully_idle, idle_workspace_bytes
+from paged_http_validation import validate_paged_terminals
 
 METRICS = ('wall_seconds', 'first_content_wall_seconds', 'scheduler_elapsed_seconds',
            'prefill_seconds', 'prefill_active_seconds', 'prefill_suspension_seconds',
@@ -209,6 +211,11 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
                     issue('oracle_discrimination_event_count', 'More than two aggregate events')
             elif kind == 'health':
                 resource(event.get('health') or {}, 'health', event.get('elapsed_seconds'))
+            elif kind == 'drain':
+                try:
+                    if not fully_idle(event.get('health') or {}): issue('recorded_drain_not_idle', event.get('label'))
+                except (ValueError, KeyError, TypeError) as error:
+                    issue('invalid_recorded_drain', str(error))
             elif kind == 'soak_started': soak_started = event.get('elapsed_seconds')
             elif kind == 'coverage_window':
                 if len(report['coverage_windows']) < 128: report['coverage_windows'].append(event)
@@ -363,11 +370,19 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
             final = summary.get('final_health') or {}
             report['final_drain'] = {key: final.get(key) for key in ('idle', 'active', 'active_jobs', 'pending_requests',
                 'queued_prefills', 'ready_decodes', 'resident_sequences', 'reserved_tokens', 'waiting_prefix_sequences',
-                'state_budget', 'prefix_cache', 'prefix_disk_cache')}
+                'state_budget', 'prefix_cache', 'prefix_disk_cache', 'paged_kv_pool')}
             for name in ('active', 'active_jobs', 'pending_requests', 'queued_prefills', 'ready_decodes',
                          'resident_sequences', 'reserved_tokens', 'waiting_prefix_sequences'):
                 if final.get(name) != 0: issue('final_not_drained', (name, final.get(name)))
-            for category, names in (('state_budget', ('requestBytes', 'workspaceBytes')),
+            try:
+                expected = idle_workspace_bytes(final)
+                report['final_drain']['expected_fixed_workspace_bytes'] = expected
+                if final.get('state_budget', {}).get('workspaceBytes') != expected:
+                    issue('final_workspace_not_drained', (final.get('state_budget'), expected))
+                if not fully_idle(final): issue('final_owned_state_not_idle', final.get('paged_kv_pool'))
+            except (ValueError, KeyError, TypeError) as error:
+                issue('invalid_final_paged_drain', str(error))
+            for category, names in (('state_budget', ('requestBytes',)),
                                     ('prefix_disk_cache', ('pendingJobs', 'pendingBytes'))):
                 for name in names:
                     if final.get(category, {}).get(name) != 0: issue('final_owner_not_drained', (category, name))
@@ -377,6 +392,11 @@ def analyze(events_path, server_path, process_path, summary_path, lifecycle_path
             lifecycle = json.loads(Path(lifecycle_path).read_text())
             lifecycle_ready = lifecycle.get('complete') is True and lifecycle.get('passed') is True
             report['wrapper_complete_passed'] = lifecycle_ready
+        if complete and (summary.get('initial_health', {}).get('paged_kv_pool') or {}).get('configured') is True:
+            audit = validate_paged_terminals(events_path, server_path, summary.get('server_pid'),
+                                            summary['initial_health'], summary.get('final_health') or {})
+            report['paged_terminal_validation'] = audit
+            if not audit['passed']: issue('paged_terminal_validation_failed', audit['errors'])
         report['passed'] = bool(complete and summary.get('passed') is True and lifecycle_ready and not report['issues'])
         db.close()
     return report

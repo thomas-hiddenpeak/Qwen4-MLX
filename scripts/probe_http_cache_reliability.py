@@ -107,6 +107,50 @@ def parse_completion(status, headers, raw, stream):
             "content_sha256": digest(text.encode("utf-8")), "cached_tokens": cached}
 
 
+def idle_workspace_bytes(value):
+    """Recompute the only permitted permanent workspace from published config.
+
+    reserved_bytes includes VM rounding/allocator allowance and static metadata;
+    it is not RSS. Missing paged config remains the legacy zero-workspace mode.
+    """
+    pool = value.get("paged_kv_pool")
+    if pool is None:
+        return 0
+    if not isinstance(pool, dict) or type(pool.get("configured")) is not bool:
+        raise ValueError("Invalid paged pool configuration")
+    if not pool["configured"]:
+        if pool.get("statistics") is not None:
+            raise ValueError("Disabled paged pool has live statistics")
+        return 0
+    s, pages = pool.get("statistics"), pool.get("maximum_pages_per_layer")
+    if not isinstance(s, dict) or type(pages) is not int or not 1 <= pages <= 4096 or pool.get("page_tokens") != 32:
+        raise ValueError("Missing configured physical pool statistics/geometry")
+    fields = ("vm_page_bytes", "layer_count", "physical_pages", "arena_logical_bytes", "arena_allocated_bytes",
+              "arena_reserved_bytes", "live_pages", "free_pages", "minimum_free_pages_per_layer", "high_water_pages",
+              "claimed_pages_per_layer", "active_decode_claims", "encoded_writes", "encoded_reads",
+              "encoded_materializations", "in_flight_operations", "completed_operations", "failed_operations")
+    if any(type(s.get(k)) is not int or s[k] < 0 for k in fields) or s.get("statistics_error") is not None:
+        raise ValueError("Unknown/invalid physical pool statistics")
+    vm, layers = s["vm_page_bytes"], s["layer_count"]
+    if layers != 12 or vm not in (4096, 16384, 65536):
+        raise ValueError("Unsupported explicit pool layer count/VM page size")
+    allocation = layers * 2 * (((pages * 32768 + vm - 1) // vm) * vm + 2 * vm)
+    expected = allocation + layers * (65536 + pages * 128)
+    if (s["arena_reserved_bytes"] != expected or s["physical_pages"] != layers * pages or
+            s["arena_logical_bytes"] != layers * pages * 65536 or
+            not s["arena_logical_bytes"] <= s["arena_allocated_bytes"] <= allocation or
+            s["live_pages"] + s["free_pages"] != s["physical_pages"] or
+            not 0 <= s["live_pages"] <= s["high_water_pages"] <= s["physical_pages"] or
+            not 0 <= s["minimum_free_pages_per_layer"] <= pages or
+            not 0 <= s["claimed_pages_per_layer"] <= pages or
+            (s["active_decode_claims"] == 0) != (s["claimed_pages_per_layer"] == 0) or
+            max(s["completed_operations"], s["in_flight_operations"]) >
+                sum(s[k] for k in ("encoded_writes", "encoded_reads", "encoded_materializations")) or
+            s["failed_operations"] != 0):
+        raise ValueError("Physical page/allocation/claim/completion accounting mismatch")
+    return expected
+
+
 def health_contract(value):
     """Strictly use published health fields, never infer configured limits."""
     if value.get("ready") is not True or value.get("status") != "ready":
@@ -139,15 +183,28 @@ def health_contract(value):
     for field in ("active_bytes", "peak_bytes", "cache_bytes", "limit_bytes"):
         if type(value["mlx_memory"].get(field)) is not int or value["mlx_memory"][field] < 0:
             raise ValueError(f"Missing MLX memory observation {field}")
+    idle_workspace_bytes(value)
     return value
 
 
 def fully_idle(value):
     names = ("active", "active_jobs", "pending_requests", "queued_prefills", "ready_decodes",
              "resident_sequences", "reserved_tokens", "waiting_prefix_sequences")
-    return value.get("idle") is True and all(value[name] == 0 for name in names) and (
-        value["state_budget"]["requestBytes"] == value["state_budget"]["workspaceBytes"] == 0
+    expected = idle_workspace_bytes(value)
+    pool = value.get("paged_kv_pool") or {}
+    physical = pool.get("statistics") if pool.get("configured") else None
+    paged_idle = physical is None or (
+        physical["claimed_pages_per_layer"] == physical["active_decode_claims"] == physical["in_flight_operations"] == 0
+        # Completion/inflight are separate atomics. Only a drained snapshot
+        # requires exact conservation; a live callback can transiently overlap.
+        and physical["completed_operations"] == sum(physical[k] for k in ("encoded_writes", "encoded_reads", "encoded_materializations"))
+        and value["state_budget"]["cacheBytes"] == value["prefix_cache"]["logicalPayloadBytes"]
+        and (value["prefix_cache"]["logicalPayloadBytes"] > 0 or physical["live_pages"] == 0))
+    return value.get("idle") is True and all(value[name] == 0 for name in names) and paged_idle and (
+        value["state_budget"]["requestBytes"] == 0 and value["state_budget"]["workspaceBytes"] == expected
         and value["prefix_disk_cache"]["pendingJobs"] == value["prefix_disk_cache"]["pendingBytes"] == 0
+        and value["prefix_cache"].get("liveFlights", 0) == 0
+        and value["prefix_disk_cache"].get("foregroundReadIntents", 0) == 0
     )
 
 

@@ -23,7 +23,8 @@ extension RunnerCLI {
             "--prefix-cache-bytes", "--prefix-cache-entries", "--prefix-cache-directory",
             "--prefix-cache-disk-bytes", "--prefix-cache-disk-entries", "--prefix-cache-ttl-seconds", "--state-budget-bytes",
             "--prefix-cache-min-free-bytes", "--prefix-cache-restore-timeout-seconds",
-            "--prefix-cache-shutdown-timeout-seconds", "--kv-append-mode"])
+            "--prefix-cache-shutdown-timeout-seconds", "--kv-append-mode",
+            "--paged-kv-pool-library", "--paged-kv-pages-per-layer"])
         func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
             guard let n = Int(args[key] ?? String(fallback)), range.contains(n) else {
                 throw CLIError.usage("\(key) must be in \(range)")
@@ -32,6 +33,31 @@ extension RunnerCLI {
         }
         guard let kvAppendMode = GPUAttention.KVAppendMode(rawValue: args["--kv-append-mode"] ?? "reference") else {
             throw CLIError.usage("--kv-append-mode must be reference or capacity256")
+        }
+        // Physical arenas are opt-in as a pair; reject configuration errors
+        // before constructing the server, tokenizer or model.
+        let pagedKVLibrary: String?
+        let pagedKVPagesPerLayer: Int?
+        switch (args["--paged-kv-pool-library"], args["--paged-kv-pages-per-layer"]) {
+        case (nil, nil):
+            pagedKVLibrary = nil; pagedKVPagesPerLayer = nil
+        case (.some(let path), .some(_)):
+            guard kvAppendMode == .reference else {
+                throw CLIError.usage("Physical paged KV cannot be combined with --kv-append-mode capacity256")
+            }
+            guard path.hasPrefix("/") else {
+                throw CLIError.usage("--paged-kv-pool-library requires an absolute path")
+            }
+            let resolved = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+            var isDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDirectory),
+                  !isDirectory.boolValue, FileManager.default.isReadableFile(atPath: resolved) else {
+                throw CLIError.usage("--paged-kv-pool-library requires a readable library file")
+            }
+            pagedKVLibrary = resolved
+            pagedKVPagesPerLayer = try number("--paged-kv-pages-per-layer", 0, 1...4096)
+        default:
+            throw CLIError.usage("--paged-kv-pool-library and --paged-kv-pages-per-layer must be provided together")
         }
         let prefixCacheBytes = try number("--prefix-cache-bytes", 536_870_912, 0...8_589_934_592)
         let prefixCacheDirectory: URL?
@@ -66,7 +92,8 @@ extension RunnerCLI {
             prefixCacheRestoreTimeoutSeconds: try number("--prefix-cache-restore-timeout-seconds", 5, 1...300),
             prefixCacheShutdownTimeoutSeconds: try number("--prefix-cache-shutdown-timeout-seconds", 30, 1...300),
             stateBudgetBytes: try number("--state-budget-bytes", 4_294_967_296, 1...Int.max),
-            kvAppendMode: kvAppendMode)
+            kvAppendMode: kvAppendMode,
+            pagedKVLibrary: pagedKVLibrary, pagedKVPagesPerLayer: pagedKVPagesPerLayer)
         let server = try GPUHTTPServer(configuration: config)
         // A running service has its own bounded logger. Do not re-enter the
         // general CLI catch's synchronous stderr write after a sink failure.
@@ -83,6 +110,8 @@ private struct GPUHTTPConfiguration: Sendable {
     let prefixCacheShutdownTimeoutSeconds: Int
     let stateBudgetBytes: Int
     let kvAppendMode: GPUAttention.KVAppendMode
+    let pagedKVLibrary: String?
+    let pagedKVPagesPerLayer: Int?
     var prefixDiskLimits: QwenPrefixDiskLimits {
         .init(maxEntries: prefixCacheDiskEntries, maxBytes: prefixCacheDiskBytes,
               minAvailableBytes: prefixCacheMinFreeBytes)
@@ -136,9 +165,74 @@ private struct GPUHTTPHealth: Sendable {
     var runningJob: String?
     var idle = false, active = 0, jobs = 0
     var prefills = 0, ready = 0, resident = 0, reserved = 0, waitingPrefix = 0
-    var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?
+    var prefixCacheJSON: Data?, prefixDiskJSON: Data?, stateBudgetJSON: Data?, pagedKVJSON: Data?
     var mlxMemory: [String: Int]?
     var pressureMonitorRunning = false
+}
+
+/// Terminal results only: failed/cancelled events may lack phase counts.
+/// This value and all native pool reads stay on the fixed inference thread.
+private struct GPUHTTPPagedKVCompletedCounters {
+    var results = 0, terminalEventsWithoutPhases = 0
+    var tokenSteps = 0, capacityFallbacks = 0, reusedPrefixTokens = 0, importedSuffixRows = 0
+
+    mutating func record(_ phases: QwenGenerationPhases?) {
+        guard let phases, let steps = phases.pagedKVTokenSteps,
+              let fallbacks = phases.pagedKVCapacityFallbacks,
+              let reused = phases.pagedKVReusedPrefixTokens,
+              let imported = phases.pagedKVImportedSuffixRows else {
+            terminalEventsWithoutPhases += 1
+            return
+        }
+        results += 1
+        tokenSteps += steps; capacityFallbacks += fallbacks
+        reusedPrefixTokens += reused; importedSuffixRows += imported
+    }
+
+    /// A copied JSON payload is the only pool information sent to networking.
+    /// Native counters include cache/import operations; phase counters count
+    /// evaluated decode steps in terminal results and exclude unknown events.
+    func snapshot(context: QwenPagedKVContext) -> Data? {
+        let admission = context.pageAdmissionStatistics
+        var values: [String: Any] = [
+            "arena_reserved_bytes": context.reservedArenaBytes,
+            "vm_page_bytes": Int(getpagesize()),
+            "claimed_pages_per_layer": admission.claimedPages,
+            "active_decode_claims": admission.activeClaims,
+            "admission_denials": admission.deniedClaims,
+            "terminal_results_with_phases": results,
+            "terminal_events_without_phases": terminalEventsWithoutPhases,
+            "completed_token_steps": tokenSteps,
+            "completed_capacity_fallbacks": capacityFallbacks,
+            "completed_reused_prefix_tokens": reusedPrefixTokens,
+            "completed_imported_suffix_rows": importedSuffixRows
+        ]
+        do {
+            let layers = Array(try context.layerStatistics.values)
+            func sum(_ keyPath: KeyPath<GPUPagedKVPool.Statistics, UInt64>) -> UInt64 {
+                layers.reduce(0) { $0 + $1[keyPath: keyPath] }
+            }
+            values["layer_count"] = layers.count
+            values["physical_pages"] = sum(\.physicalPages)
+            values["arena_logical_bytes"] = sum(\.arenaLogicalBytes)
+            values["arena_allocated_bytes"] = sum(\.arenaAllocatedBytes)
+            values["live_pages"] = sum(\.livePages)
+            values["free_pages"] = sum(\.freePages)
+            values["minimum_free_pages_per_layer"] = layers.map(\.freePages).min()
+            values["high_water_pages"] = sum(\.highWaterPages)
+            values["encoded_writes"] = sum(\.encodedWrites)
+            values["encoded_reads"] = sum(\.encodedReads)
+            values["encoded_materializations"] = sum(\.encodedMaterializations)
+            values["in_flight_operations"] = sum(\.inFlightOperations)
+            values["completed_operations"] = sum(\.completedOperations)
+            values["failed_operations"] = sum(\.failedOperations)
+            values["statistics_error"] = NSNull()
+        } catch {
+            // A failed observation stays unknown, never fabricated as zero.
+            values["statistics_error"] = String(error.localizedDescription.prefix(512))
+        }
+        return try? JSONSerialization.data(withJSONObject: values)
+    }
 }
 
 /// Mutable connection state is confined to GPUHTTPServer.network. The only
@@ -366,6 +460,15 @@ private final class GPUHTTPServer: @unchecked Sendable {
                     "kv_append_mode": configuration.kvAppendMode.rawValue,
                     "scope": "autoregressive_decode_only", "prefill_uses_capacity": false,
                     "mtp_kv_append_mode": "reference"],
+                "paged_kv_pool": [
+                    "configured": configuration.pagedKVLibrary != nil,
+                    "maximum_pages_per_layer": configuration.pagedKVPagesPerLayer as Any? ?? NSNull(),
+                    "maximum_paged_tokens": configuration.pagedKVPagesPerLayer.map { min($0 * 32, 131_072) } as Any? ?? NSNull(),
+                    "page_tokens": 32, "fallback_policy": "whole_cursor_dense",
+                    "claim_policy": "constant_remaining_request_plus_observed_live_pages",
+                    "completed_counter_scope": "terminal_results_with_phase_metrics",
+                    "statistics": h.pagedKVJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull()
+                ],
                 "prefix_cache_shutdown_timeout_seconds": configuration.prefixCacheShutdownTimeoutSeconds,
                 "state_budget": h.stateBudgetJSON.flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull(),
                 "mlx_memory": h.mlxMemory as Any? ?? NSNull(),
@@ -379,6 +482,12 @@ private final class GPUHTTPServer: @unchecked Sendable {
                 body: QwenHTTPFrames.models(model: configuration.modelID, created: created)))
         case ("POST", "/v1/chat/completions"):
             let chat = try QwenHTTPChatRequest.decode(request.body, expectedModel: configuration.modelID)
+            // HTTP MTP is per-request, not a startup switch. Reject the
+            // incompatible request before queueing, tokenization or GPU work.
+            guard configuration.pagedKVLibrary == nil || chat.mtpDepth == 0 else {
+                reject(client, status: 400, message: "Physical paged KV requires mtp_depth=0",
+                       code: "invalid_request_error"); return
+            }
             guard health.withLock({ $0.state == "ready" }) else {
                 reject(client, status: 503, message: "Model is not ready", code: "model_unavailable"); return
             }
@@ -448,6 +557,30 @@ private final class GPUHTTPServer: @unchecked Sendable {
         emit("memory_pressure_injected_events_total", "counter", "Explicitly injected pressure policy observations.", pressure.injectedEvents)
         emit("memory_pressure_request_denials_total", "counter", "New request admission checks denied by pressure policy.", pressure.newRequestDenials)
         emit("memory_pressure_optional_denials_total", "counter", "Optional cache admission checks denied by pressure policy.", pressure.optionalCacheDenials)
+        emit("paged_kv_configured", "gauge", "Explicit physical KV pool configuration is enabled.", configuration.pagedKVLibrary == nil ? 0 : 1)
+        if let pages = configuration.pagedKVPagesPerLayer {
+            emit("paged_kv_maximum_pages_per_layer", "gauge", "Fixed physical page capacity of each attention-layer arena.", pages)
+        }
+        counters(h.pagedKVJSON, [
+            ("arena_reserved_bytes", "paged_kv_arena_reserved_bytes", "gauge", "Fixed arena and metadata admission reservation; not RSS."),
+            ("arena_allocated_bytes", "paged_kv_arena_allocated_bytes", "gauge", "Observed fixed native arena buffer allocation summed across attention layers."),
+            ("live_pages", "paged_kv_live_pages", "gauge", "Occupied physical pages across all attention layers, including graph and completion pins."),
+            ("free_pages", "paged_kv_free_pages", "gauge", "Unoccupied pages summed across all attention layers; not unallocated memory."),
+            ("minimum_free_pages_per_layer", "paged_kv_minimum_free_pages_per_layer", "gauge", "Lowest observed free slot count among attention-layer arenas."),
+            ("claimed_pages_per_layer", "paged_kv_claimed_pages_per_layer", "gauge", "Constant future decode claims, conservatively additional to observed occupied pages."),
+            ("active_decode_claims", "paged_kv_active_decode_claims", "gauge", "Decode cursors retaining a physical-page forecast."),
+            ("admission_denials", "paged_kv_admission_denials_total", "counter", "Decode page claim denials; excludes oversized-context fallbacks and optional-cache prechecks."),
+            ("encoded_writes", "paged_kv_encoded_writes_total", "counter", "Native writes encoded including imports and cache attachments; not token steps."),
+            ("encoded_reads", "paged_kv_encoded_reads_total", "counter", "Native paged attention reads encoded across all attention layers."),
+            ("encoded_materializations", "paged_kv_encoded_materializations_total", "counter", "Native dense materializations encoded across all attention layers."),
+            ("in_flight_operations", "paged_kv_in_flight_operations", "gauge", "Native operations awaiting a completion callback."),
+            ("failed_operations", "paged_kv_failed_operations_total", "counter", "Failed native operations reported by fixed physical pools."),
+            ("terminal_results_with_phases", "paged_kv_terminal_results_with_phases_total", "counter", "Terminal results included in completed physical KV phase counters."),
+            ("terminal_events_without_phases", "paged_kv_terminal_events_without_phases_total", "counter", "Terminal events with unknown physical KV phase counts; excluded from completed counters."),
+            ("completed_token_steps", "paged_kv_completed_token_steps_total", "counter", "Evaluated paged decode steps from terminal results with phase metrics."),
+            ("completed_capacity_fallbacks", "paged_kv_completed_capacity_fallbacks_total", "counter", "Whole-cursor dense fallbacks from terminal results with phase metrics."),
+            ("completed_reused_prefix_tokens", "paged_kv_completed_reused_prefix_tokens_total", "counter", "Logical prefix tokens physically reused by terminal results; not multiplied by layer count."),
+            ("completed_imported_suffix_rows", "paged_kv_completed_imported_suffix_rows_total", "counter", "Logical dense rows imported by terminal results, including full imports; not multiplied by layer count.")])
         counters(h.stateBudgetJSON, [
             ("requestBytes", "state_request_bytes", "gauge", "Logical request state reservation; not RSS."),
             ("cacheBytes", "state_cache_bytes", "gauge", "Logical retained RAM snapshot reservation; not RSS."),
@@ -664,11 +797,19 @@ private final class GPUHTTPServer: @unchecked Sendable {
             stateBudgetBytes: configuration.stateBudgetBytes) { count, total in
                 if count % 8 == 0 || count == total { self.log("HTTP model loaded \(count)/\(total)") }
             }
+        // One context owns all fixed arenas for this service. The generator
+        // passes it to its prefix cache and admission follows every cursor.
+        // Pool capacity is an optional execution choice, not a context limit.
+        let pagedKVContext: QwenPagedKVContext?
+        if let library = configuration.pagedKVLibrary, let pages = configuration.pagedKVPagesPerLayer {
+            pagedKVContext = try model.makePagedKVContext(libraryPath: library, maximumPagesPerLayer: pages)
+        } else { pagedKVContext = nil }
+        var pagedKVCompleted = GPUHTTPPagedKVCompletedCounters()
         let generator = try QwenGenerator(model: model, prefixCacheLimits: configuration.prefixCacheBytes == 0 ? nil :
             .init(maxEntries: configuration.prefixCacheEntries, maxBytes: configuration.prefixCacheBytes,
                   ttlSeconds: TimeInterval(configuration.prefixCacheTTLSeconds),
                   diskRestoreTimeoutSeconds: TimeInterval(configuration.prefixCacheRestoreTimeoutSeconds)),
-            prefixDiskStore: diskStore, memoryPressurePolicy: memoryPressure)
+            prefixDiskStore: diskStore, memoryPressurePolicy: memoryPressure, pagedKVContext: pagedKVContext)
         let scheduler = try QwenLocalScheduler(generator: generator, limits: .init(executionMode: .cooperative))
         var jobs: [UUID: GPUHTTPActive] = [:]
         defer {
@@ -681,17 +822,18 @@ private final class GPUHTTPServer: @unchecked Sendable {
             try? MX.synchronize()
         }
         health.withLock { $0.state = inbox.isStopping ? "stopping" : "ready"; $0.idle = true }
-        log("HTTP model state=ready default=AR experimental_mtp_depth=2 context=16384 chunk=416")
+        log("HTTP model state=ready default=AR experimental_mtp_depth=\(pagedKVContext == nil ? 2 : 0) context=16384 chunk=416 paged_kv_configured=\(pagedKVContext != nil) paged_kv_pages_per_layer=\(configuration.pagedKVPagesPerLayer ?? 0)")
         func snapshot(active: Int = 0) {
             let s = scheduler.snapshot()
             let cacheJSON = generator.prefixCacheStatistics.flatMap { try? JSONEncoder().encode($0) }
             let diskJSON = generator.prefixDiskStatistics.flatMap { try? JSONEncoder().encode($0) }
             let budgetJSON = try? JSONEncoder().encode(generator.stateBudgetStatistics)
+            let pagedJSON = pagedKVContext.flatMap { pagedKVCompleted.snapshot(context: $0) }
             // All MLX interaction stays on this inference OS thread. The
             // network queue sees only the copied numeric values below.
             let memory = try? MX.memory()
             health.withLock {
-                $0.prefixCacheJSON = cacheJSON
+                $0.prefixCacheJSON = cacheJSON; $0.pagedKVJSON = pagedJSON
                 $0.prefixDiskJSON = diskJSON; $0.stateBudgetJSON = budgetJSON; $0.mlxMemory = memory
                 $0.active = active; $0.jobs = jobs.count; $0.prefills = s.queuedPrefills
                 $0.runningJob = s.runningJob?.uuidString
@@ -775,6 +917,7 @@ private final class GPUHTTPServer: @unchecked Sendable {
             snapshot(active: scheduler.snapshot().isIdle ? 0 : 1)
             if let event = try scheduler.runNext(), [.completed, .failed, .cancelled].contains(event.kind),
                let active = jobs.removeValue(forKey: event.jobID) {
+                if pagedKVContext != nil { pagedKVCompleted.record(event.result?.phases) }
                 complete(event, active: active)
             }
             snapshot()
@@ -854,6 +997,12 @@ private final class GPUHTTPServer: @unchecked Sendable {
         modelFields["kv_capacity_token_steps"] = terminalPhases?.kvCapacityTokenSteps as Any? ?? NSNull()
         modelFields["kv_capacity_workspace_fallbacks"] = terminalPhases?.kvCapacityWorkspaceFallbacks as Any? ?? NSNull()
         modelFields["kv_capacity_workspace_peak_bytes"] = terminalPhases?.kvCapacityWorkspacePeakBytes as Any? ?? NSNull()
+        modelFields["paged_kv_import_seconds"] = terminalPhases?.pagedKVImportSeconds.map(finite) ?? NSNull()
+        modelFields["paged_kv_token_steps"] = terminalPhases?.pagedKVTokenSteps as Any? ?? NSNull()
+        modelFields["paged_kv_reused_prefix_tokens"] = terminalPhases?.pagedKVReusedPrefixTokens as Any? ?? NSNull()
+        modelFields["paged_kv_imported_suffix_rows"] = terminalPhases?.pagedKVImportedSuffixRows as Any? ?? NSNull()
+        modelFields["paged_kv_capacity_fallbacks"] = terminalPhases?.pagedKVCapacityFallbacks as Any? ?? NSNull()
+        modelFields["paged_kv_reserved_pages_per_layer"] = terminalPhases?.pagedKVReservedPagesPerLayer as Any? ?? NSNull()
         if let result = event.result {
             modelFields["model_finish_reason"] = result.finishReason.rawValue
             modelFields["prompt_tokens"] = result.statistics.promptTokenCount
