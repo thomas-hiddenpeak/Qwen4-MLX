@@ -24,7 +24,7 @@ xcrun swift build -c release
   --output results/first-generation.json
 ```
 
-已提供 [11k agent 输入](fixtures/gpu-agent-11k/provenance.json)，可用 `--tokens-file fixtures/gpu-agent-11k/prompt-token-ids.json` 替换 `--prompt`，保持 `--context 16384`。生成报告保存完整输出 token IDs 及分阶段成本。运行整模型实验时应安排独占模型资源；[实验控制器](docs/EXPERIMENT_CONTROLLER.md)只清理其拥有的进程并恢复已登记的参考服务。
+已提供 [11k agent 输入](fixtures/gpu-agent-11k/provenance.json)，可用 `--tokens-file fixtures/gpu-agent-11k/prompt-token-ids.json` 替换 `--prompt`，保持 `--context 16384`。生成报告保存完整输出 token IDs 及分阶段成本。运行整模型实验时应安排独占模型资源；原作者 mlx-serve 默认关闭，需要对照时再按[参考服务配置](docs/MLX_SERVE_SERVICE.md)启动。[实验控制器](docs/EXPERIMENT_CONTROLLER.md)只清理其拥有的进程，默认不在结束后重启参考服务。
 
 ## 当前默认与能力状态
 

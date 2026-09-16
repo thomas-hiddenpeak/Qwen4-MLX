@@ -1,7 +1,8 @@
-"""Run a saved experiment plan with one model owner and finally-based restoration.
+"""Run a saved experiment plan with one model owner and opt-in restoration.
 
 Plan commands are local subprocess argument arrays. Token and capture gates stop
 the plan before subsequent benchmarks; all process identities/results are saved.
+The reference service stays stopped unless restore_reference is explicitly true.
 """
 from pathlib import Path
 import datetime, hashlib, json, os, signal, struct, subprocess, sys, time, urllib.request
@@ -11,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 plan_path = Path(sys.argv[1]).resolve()
 OUT = plan_path.parent
 plan = json.loads(plan_path.read_text())
+restore_reference = plan.get('restore_reference', False)
+if type(restore_reference) is not bool:
+    raise ValueError('restore_reference must be a JSON boolean')
 # The nested MTP analysis plan is deliberately not an execution plan. Reject
 # it before pausing the reference or creating an experiment ledger.
 assert isinstance(plan.get('cases'), list) and plan['cases'] and all(
@@ -52,15 +56,20 @@ def tensors(path):
 reference = json.loads(Path(plan['reference_ledger']).read_text())['restoration']
 status = json.loads(STATUS.read_text())
 pid, argv = reference['pid'], reference['argv']
-assert status['server_pid'] == pid and identity(pid) == ' '.join(argv), 'Reference identity mismatch'
-metrics = http('/metrics')
-for key in ('vllm:num_requests_running', 'vllm:num_requests_waiting'):
-    values = [float(line.split()[-1]) for line in metrics.splitlines() if line.startswith(key + ' ')]
-    assert values and all(v == 0 for v in values), 'Reference is not verifiably idle'
+reference_active = status['server_pid'] is not None
+if reference_active:
+    assert status['server_pid'] == pid and identity(pid) == ' '.join(argv), 'Reference identity mismatch'
+    metrics = http('/metrics')
+    for key in ('vllm:num_requests_running', 'vllm:num_requests_waiting'):
+        values = [float(line.split()[-1]) for line in metrics.splitlines() if line.startswith(key + ' ')]
+        assert values and all(v == 0 for v in values), 'Reference is not verifiably idle'
+else:
+    assert identity(pid) != ' '.join(argv), 'Reference is still running despite stopped status'
 assert all(flag in argv for flag in ('--no-mtp', '--no-drafter', '--no-pld'))
 assert not (OUT / 'run-ledger.json').exists(), 'Refuse to overwrite an experiment'
 binary = ROOT / '.build/release/ane-runner'
-ledger = {'started_utc': now(), 'original_reference_pid': pid, 'reference_argv': argv,
+ledger = {'started_utc': now(), 'original_reference_pid': pid if reference_active else None, 'reference_argv': argv,
+          'reference_ledger': plan['reference_ledger'], 'restore_reference': restore_reference,
           'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'runs': [], 'restoration': None}
 save()
 owned = None
@@ -69,16 +78,18 @@ env = os.environ.copy()
 env['DEVELOPER_DIR'] = '/Applications/Xcode.app/Contents/Developer'
 for key in ('MLX_MAX_MB_PER_BUFFER', 'MLX_MAX_OPS_PER_BUFFER'): env.pop(key, None)
 env.update(plan.get('environment', {}))
-print('Pausing verified idle reference', flush=True)
+print('Pausing verified idle reference' if reference_active else 'Reference remains stopped', flush=True)
 signal.signal(signal.SIGTERM, request_stop)
 signal.signal(signal.SIGINT, request_stop)
 try:
     check_stop()
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 30
-    while identity(pid) and time.monotonic() < deadline: time.sleep(0.1)
-    assert not identity(pid), 'Reference did not stop'
-    status.update(phase='paused_for_specialization_validation', server_retained=False, updated_utc=now())
+    if reference_active:
+        assert identity(pid) == ' '.join(argv), 'Reference identity changed before pause'
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 30
+        while identity(pid) and time.monotonic() < deadline: time.sleep(0.1)
+        assert not identity(pid), 'Reference did not stop'
+    status.update(phase='paused_for_specialization_validation', server_pid=None, server_retained=False, updated_utc=now())
     STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
     check_stop()
     for case in plan['cases']:
@@ -137,7 +148,28 @@ finally:
         raise RuntimeError('Cannot prove experiment group exited; refusing to load another model')
     owned = None
     current_reference = identity(pid)
-    if current_reference:
+    # A historical PID can legitimately have been reused while the reference
+    # was already stopped. Never act on that unrelated process.
+    if not reference_active and current_reference != ' '.join(argv):
+        current_reference = ''
+    if not restore_reference:
+        restoration = {'ready': False, 'skipped': True, 'reason': 'reference_on_demand'}
+        ledger['restoration'] = restoration
+        if current_reference:
+            matching_reference = current_reference == ' '.join(argv)
+            restoration.update(pid=pid, argv=argv, retained_original=matching_reference,
+                               error='Reference did not stop or its original PID changed identity')
+            status.update(phase='reference_stop_needs_attention', server_pid=pid if matching_reference else None,
+                          server_retained=matching_reference, reference_service_policy='on_demand', updated_utc=now())
+        else:
+            status.update(phase='reference_stopped_on_demand', server_pid=None, server_retained=False,
+                          reference_service_policy='on_demand', updated_utc=now())
+        # Keep the last actual reference ledger for its verified startup argv.
+        save()
+        STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
+        assert not current_reference, 'Reference stop needs attention; no replacement model was started'
+        print('Reference remains stopped (on-demand policy)', flush=True)
+    elif current_reference:
         restoration = dict(reference, ready=False, retained_original=True)
         ledger['restoration'] = restoration
         if current_reference != ' '.join(argv):
@@ -150,7 +182,7 @@ finally:
             except Exception as error:
                 restoration['error'] = f'Retained reference readiness failed: {error}'
         status.update(phase='ready_reference_retained_after_specialization' if restoration['ready'] else 'reference_restore_needs_attention',
-                      server_retained=restoration['ready'], reference_ledger=str(OUT / 'run-ledger.json'), updated_utc=now())
+                      server_pid=pid, server_retained=restoration['ready'], reference_ledger=str(OUT / 'run-ledger.json'), updated_utc=now())
         save()
         STATUS.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
         assert restoration['ready'], 'Could not verify retained reference; no new model was started'

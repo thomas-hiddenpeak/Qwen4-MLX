@@ -1,14 +1,14 @@
 # 本机实验控制器的所属进程与退出合同
 
-[run_specialization_experiment.py](../scripts/run_specialization_experiment.py) 负责核对并暂停已登记的空闲参考服务，串行执行本机实验，最后恢复原参数。新增 [owned_process_group.py](../scripts/owned_process_group.py) 只管理本次创建的一组进程，不是通用作业系统。
+[run_specialization_experiment.py](../scripts/run_specialization_experiment.py) 串行执行本机实验；参考服务在运行时，先核对并暂停。**2026-09-17起默认保持参考服务关闭**，已关闭时可直接执行实验；只有计划显式设置布尔值 `restore_reference: true` 才在结束后恢复原参数。[owned_process_group.py](../scripts/owned_process_group.py) 只管理本次创建的一组进程，不是通用作业系统。
 
 ```bash
 python3 scripts/run_specialization_experiment.py /absolute/path/controller-plan.json
 ```
 
-执行计划的 `cases` 必须是含 `name`、`command` 的平铺列表，`reference_ledger` 指向最近一次已核验恢复记录，输出目录不能已有 run-ledger。MTP 的嵌套窗口分析计划含 task/budget/processes，不能直接执行；控制器会在暂停参考前拒绝这种结构。运行前还核对参考 PID/精确 argv、状态文件、空闲 metrics 和关闭 MTP/drafter/PLD 的参数。不要绕过单 GPU 所有者的约定启动第二个控制器。
+执行计划的 `cases` 必须是含 `name`、`command` 的平铺列表，`reference_ledger` 指向最近一次已核验启动参数记录，输出目录不能已有 run-ledger。MTP 的嵌套窗口分析计划含 task/budget/processes，不能直接执行；控制器会在暂停参考前拒绝这种结构。参考在运行时核对 PID/精确 argv、状态文件、空闲 metrics 和关闭 MTP/drafter/PLD 的参数；状态声明关闭时也会检查旧记录进程没有继续运行。不要绕过单 GPU 所有者的约定启动第二个控制器。
 
-2026-09-10 起，常驻 mlx-serve 采用[业务配置](MLX_SERVE_SERVICE.md)：原生 262144-token 上限和热前缀缓存。新计划从 `../qwen38-ssd/results/experiment-status.json` 的 `reference_ledger` 读取当前记录，再核验其 ready/PID/argv；每次实验恢复都会更新此指针。历史 4096-token、关闭缓存的 argv 仅是旧基线，不得用来覆盖当前服务。实验 case 如需禁用缓存，应在该 case 的独立进程中配置，结束后仍恢复业务服务原参数。
+按需 mlx-serve 保留[参考配置](MLX_SERVE_SERVICE.md)：原生 262144-token 上限和热前缀缓存。新计划从 `../qwen38-ssd/results/experiment-status.json` 的 `reference_ledger` 读取参数记录，实际运行状态以当前进程核验为准。默认结束记录 `restoration.skipped=true`、`reason=reference_on_demand`，不把按需关闭当作恢复故障，也不覆盖历史参数指针。历史 4096-token、关闭缓存的 argv 仅是旧基线，不得用来覆盖当前配置。
 
 ## 所有权与中断顺序
 
@@ -18,11 +18,13 @@ SIGTERM/SIGINT handler 仅记录停止 flag。case 的等待每次最多 1 秒�
 
 清理先给自有整组 SIGTERM，最多等待 **45 秒**，覆盖 HTTP harness 自身的 30+10 秒退出过程。仍有残留时向同一组 SIGKILL，再最多等 **10 秒**。leader 退出不等于整组退出：控制器会 reap 自己的直接子进程，并继续检查同组后代。正常完成的 case 也要完成这项检查。`finish` 成功或失败的结果都会保留，重复调用不会再次向可能已失效的 PGID 发信号。
 
-**只有确认整组已不存在，才释放该组所有权并恢复参考服务。** 无法确认时，ledger 记录 `restoration.ready=false` 与 `blocked_by_owned_group`，状态标记 `reference_restore_blocked_by_owned_group`，拒绝加载第二份模型。超时不会因为子进程最终以 0 退出而被算作成功实验。
+**只有确认整组已不存在，才释放该组所有权，并在显式请求恢复时启动参考服务。** 无法确认时，ledger 记录 `restoration.ready=false` 与 `blocked_by_owned_group`，状态标记 `reference_restore_blocked_by_owned_group`，拒绝加载第二份模型。超时不会因为子进程最终以 0 退出而被算作成功实验。
 
-恢复参考使用另一个 `Popen(..., start_new_session=True)`，发生在实验组清理之后；它不属于已清理的 case 组。仍存在的原参考须重新匹配精确 argv 并核对 `/v1/models` 的 ready 条件，不能只凭 PID 存在写 ready。新参考最多等待 90 秒核对 MTP/drafter 未加载。后续实验仍须重新核对最新 ledger、状态文件与实际进程。
+显式恢复参考使用另一个 `Popen(..., start_new_session=True)`，发生在实验组清理之后；它不属于已清理的 case 组。仍存在的原参考须重新匹配精确 argv 并核对 `/v1/models` 的 ready 条件，不能只凭 PID 存在写 ready；默认不恢复模式也不能把未退出的原进程误标为已停止。新参考最多等待 90 秒核对 MTP/drafter 未加载。后续实验仍须重新核对最新 ledger、状态文件与实际进程。
 
 ## 已验证的范围
+
+2026-09-17按需模式：参考已停止时，CPU-only成功case、主动失败case均执行清理并保持参考关闭，历史参数指针不变；字符串形式的 `restore_reference` 被提前拒绝，没有创建实验ledger。未为验证旧显式恢复分支重新加载模型。实测记录在 `results/reference-policy-smoke-20260916T174347Z/`。
 
 2026-09-07，[4 项 CPU 进程测试](../scripts/test_owned_process_group.py)全部通过：leader 先退出但后代仍在、TERM 清理宽限、强杀自有组时另一独立对照组仍存活、重复 finish 不再发送信号。
 

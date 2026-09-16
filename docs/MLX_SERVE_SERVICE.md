@@ -1,6 +1,8 @@
-# mlx-serve 本机业务服务
+# mlx-serve 按需参考服务
 
-2026-09-10建立，2026-09-16更新监听配置。此处是原作者 mlx-serve 的常驻服务，独立 Swift/MLX runner 继续独立开发。原生模型配置 `max_position_embeddings=262144`，对应 256 Ki tokens；不是 265000 tokens。上下文是输入与输出的总预算。
+2026-09-17按用户要求改为**默认停止、按需启动**，开发资源优先用于独立 Swift runner 与 CoreAI。原作者 mlx-serve 只在参考对照或手动评估需要时启动，实验结束后不自动恢复；旧常驻策略不再适用。以下配置和历史验证继续保留。
+
+服务于2026-09-10建立、2026-09-16更新监听配置。原生模型配置 `max_position_embeddings=262144`，对应 256 Ki tokens；不是 265000 tokens。上下文是输入与输出的总预算。
 
 ## 固定配置
 
@@ -29,14 +31,16 @@
 
 ## 启动与后续实验
 
-检查当前状态与监听后再操作；启动器拒绝在已有监听时启动第二份模型：
+需要参考服务时，检查当前模型进程和监听后再显式启动；启动器拒绝在已有监听时启动第二份模型：
 
 ```sh
 python3 -B scripts/serve_mlx_business.py --print-argv
 python3 -B scripts/serve_mlx_business.py
 ```
 
-启动器在前台 exec 服务，本身不安装登录启动项或重启守护。受控切换后的当前 PID、日志及 `reference_ledger` 写入 `../qwen38-ssd/results/experiment-status.json`。实验控制器每次恢复更新最新 ledger，并保留业务服务的精确 argv；不恢复历史 4096-token/禁用缓存的基线。服务占用期间不得另起模型测试。复跑会占用 GPU 并影响业务延迟，应选择空闲窗口。
+启动器在前台 exec 服务，本身不安装登录启动项或重启守护。手动使用完成后终止该前台进程；受控启停还需同步 `../qwen38-ssd/results/experiment-status.json` 的 PID 与状态。停止时 `server_pid=null`、`server_retained=false`，`reference_ledger` 仅保留上次已核验的启动参数，不表示服务仍在运行。
+
+实验控制器默认不恢复参考服务；只有计划显式设置 `restore_reference: true` 才在完成进程清理后按精确 argv 恢复并更新 ledger。历史 4096-token/禁用缓存的基线不得覆盖当前配置。旧 `capture_moe.py` 是固定4096配置的历史抓取器，含旧自动恢复逻辑，不用于当前开发或参考服务管理。服务占用期间不得另起完整模型测试。
 
 ## 本地引擎补丁
 
