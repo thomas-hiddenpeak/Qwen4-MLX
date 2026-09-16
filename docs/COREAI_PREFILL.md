@@ -92,3 +92,12 @@ PLE大批量SSD读取对重复行去重，并以最多8个worker执行pread；S1
 完整11K测试中，4096主块热态18.739s/590.1token/s，8192主块23.143s/477.8token/s，均未优于2048主块17.645s/626.6token/s。采样峰值分别88.02GiB和101.22GiB；不据此认定具体内存或算力瓶颈。大块能力保留为可选实验，不提升为性能默认配置。所有场景均重算完整prompt，两轮文本输出一致；这仍不是源模型质量验收。
 
 进一步head诊断中，两实现返回的FP16 mixed逐值一致；用实际mixed和真实权重进行FP32 CPU线性重放，Metal logits的relative L2为1.31e-7，而原图内投影为1.70e-4。新kernel符合声明的FP16输入边界；原图内部为何与显式边界重放不同仍未定位，不宣称已证明某种编译融合机制。设备mixed相对CPU HC仍有差异，需独立的整模型质量验收。证据`head-mixed-diagnostic/cpu-device-mixed-replay.json`。
+
+
+### 量化读取与原生 uint4 实验（仍未达 1K）
+
+可选 `--flat-q4 --contiguous-affine` 将同一 affine group 的相邻 I16 words 分配给同一线程，减少重复读取 scale/bias；原 FP16 解包与 MMA 算法不变。真实 layer0 down 投影 S2048 从 8.113ms 到 7.141ms，S8192 从 27.084ms 到 24.531ms，输出和计划逐 bit 一致。但 fused gate/up S2048 为 12.863ms vs 13.084ms，无收益。完整 11,057-token 两轮为 21.799s 和 17.514s（热态 631.3token/s），文本与重置 logits 一致，采样峰值约 80.35GiB；相对原 626.6 的幅度不足以认定稳定整模型收益。选项默认关闭。7 项 flat CPU 测试与 9 项共享导出 CPU 测试通过。
+
+公开 MPP `half × uint4b_format` 小图已在本机编译运行；原生 uint4 grouped 全 K 候选仍比原 packed-half 慢：同 S2048 合成几何输入 8.402ms vs 7.093ms。该方案使用分组 affine 后校正，省略了原逐权重 FP16 舍入，输出 relative L2 为 0.000312，因此保留为独立实验，不进入生产默认。原生路径边界 CPU 测试通过，GPU 小图对其独立新公式 oracle 逐 bit 一致；这不等于原模型数学等价。
+
+原始证据位于 `results/coreai-prefill-1k/` 下 `q4-loader-down-s2048`、`q4-loader-down-s8192`、`q4-loader-gateup-s2048/device-summary.json`、`full-agent-11k-contiguous.json`、`q4-native-grouped-smoke/device-large-summary.json`。这些结果均未使用 MTP 或 KV/prefix 命中。

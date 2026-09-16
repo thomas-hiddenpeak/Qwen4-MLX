@@ -120,9 +120,23 @@ def geometry_signature(geometry):
             for name, value in geometry.items()}
 
 
+def validate_contiguous_affine(*, flat_q4, moe_tile, contiguous_affine):
+    """Reject unsupported optional loader combinations before reading weights."""
+    if not contiguous_affine:
+        return
+    if not flat_q4:
+        raise ValueError('--contiguous-affine requires --flat-q4')
+    if (len(moe_tile) != 3 or moe_tile[0] not in (16, 32)
+            or moe_tile[1] not in (32, 64) or moe_tile[2] != 64):
+        raise ValueError('--contiguous-affine requires BM16/32, BN32/64 and BK=64')
+
+
 def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gateup,
-                        moe_tile=(16, 32, 64), flat_q4=False, integer_grouping=False):
+                        moe_tile=(16, 32, 64), flat_q4=False, integer_grouping=False,
+                        contiguous_affine=False):
     """Construct unchanged tensor-PD math; reusable by component diagnostics."""
+    validate_contiguous_affine(flat_q4=flat_q4, moe_tile=moe_tile,
+                               contiguous_affine=contiguous_affine)
     from coreai_q4_metal import MetalPackedQ4, get_q4_kernel
     from coreai_moe_chunk import ChunkQ4MoE
     from coreai_gdn_chunk import GDNRegisterPrefill
@@ -176,6 +190,9 @@ def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gat
     if flat_q4:
         from coreai_q4_flat import flatten_moe_weights
         kernels += flatten_moe_weights(module)
+    if contiguous_affine:
+        from coreai_q4_flat import install_contiguous_affine
+        kernels += install_contiguous_affine(module)
     if integer_grouping:
         from coreai_expert_grouping import enable_integer_grouping
         kernels += enable_integer_grouping(module)
@@ -282,6 +299,8 @@ def main(argv=None):
     parser.add_argument('--components', nargs='+', choices=('layers', 'embedding', 'head'), default=['layers', 'embedding', 'head'])
     parser.add_argument('--metal-weight-inputs', action='store_true', help='Optional explicit MTLBuffer IO constraint; no demonstrated speed benefit')
     parser.add_argument('--flat-q4', action='store_true', help='Use rank-one external Q4 buffers and explicit kernel addressing; preserves packed bytes')
+    parser.add_argument('--contiguous-affine', action='store_true',
+                        help='Optional adjacent-word affine loader for routed prefill; requires --flat-q4 and baseline BK64; decode unchanged')
     parser.add_argument('--integer-grouping', action='store_true', help='Use stable I32 expert grouping; required for chunks above2048')
     parser.add_argument('--chunk', type=int, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
                         help='Override primary chunk while inheriting v1 capacity/geometry and smaller phases')
@@ -294,6 +313,8 @@ def main(argv=None):
     baseline = json.loads(baseline_path.read_text())
     inherited_phases = validate_baseline(baseline)
     phases = resolve_phases(baseline, args.chunk, integer_grouping=args.integer_grouping)
+    validate_contiguous_affine(flat_q4=args.flat_q4, moe_tile=baseline['moeTile'],
+                               contiguous_affine=args.contiguous_affine)
     layers = list(range(48)) if args.layers is None else [int(value) for value in args.layers.split(',')]
     if not layers or len(set(layers)) != len(layers) or any(index not in range(48) for index in layers):
         raise ValueError('Invalid layer selection')
@@ -322,6 +343,7 @@ def main(argv=None):
         sourcePDDirectory=str(args.baseline_pd.resolve()), sourcePDManifestSHA256=sha256_file(baseline_path),
         exporterSHA256=sha256_file(Path(__file__)), authoringSourceSHA256=authoring_source_hashes(),
         metalWeightInputs=args.metal_weight_inputs, flatQ4=args.flat_q4,
+        contiguousAffine=args.contiguous_affine,
         integerExpertGrouping=args.integer_grouping,
         tokenChunk=dict(phases)['prefill'], tailChunks=[count for name, count in phases if name.startswith('prefill_s')],
         headProjection=('metal-fp16-weights-fp32-logits' if args.metal_head
@@ -345,7 +367,7 @@ def main(argv=None):
             module, kind, states, bindings, geometry_names, kernels = build_decoder_layer(source, config,
                 baseline['capacity'], prefill_sdpa_fp16=baseline['prefillSDPA'] == 'float16',
                 fuse_gateup=baseline['fusedGateUp'], moe_tile=tuple(baseline['moeTile']), flat_q4=args.flat_q4,
-                integer_grouping=args.integer_grouping)
+                integer_grouping=args.integer_grouping, contiguous_affine=args.contiguous_affine)
             named, geometry = externalizable_buffers(module, geometry_names)
             key = kind + ('-ple' if module.ple is not None else '')
             weights = write_aligned_weights(args.output / f'layer-{index:02d}.weights.bin', named)
@@ -362,7 +384,7 @@ def main(argv=None):
                     args.output / f'shared-{key}.aimodel', kernels, metal_weight_inputs=args.metal_weight_inputs)
                 asset.update(geometrySignature=geo_signature, stateBindings=bindings,
                              initialState=state_metadata(states), kind=kind, hasPLE=module.ple is not None,
-                             exampleLayer=index)
+                             exampleLayer=index, contiguousAffine=args.contiguous_affine)
                 manifest['sharedAssets'][key] = asset
                 del examples
             else:

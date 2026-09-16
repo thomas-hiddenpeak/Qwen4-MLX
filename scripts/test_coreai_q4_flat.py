@@ -7,7 +7,8 @@ import re
 import torch
 
 from coreai_moe_chunk import ChunkQ4MoE, make_synthetic
-from coreai_q4_flat import FlatMetalPackedQ4, flatten_moe_weights, _grouped_source
+from coreai_q4_flat import (FlatMetalPackedQ4, flatten_moe_weights, _grouped_source,
+                           install_contiguous_affine, get_flat_grouped_kernel, get_flat_gateup_kernel)
 from coreai_q4_grouped import GEMM_SOURCE
 from coreai_q4_gateup import GATEUP_SOURCE
 from export_coreai_pd_shared import externalizable_buffers, export_generic, authoring_source_hashes
@@ -98,6 +99,36 @@ class FlatQ4Tests(unittest.TestCase):
     def test_shared_exporter_records_flat_source(self):
         self.assertEqual(authoring_source_hashes()['coreai_q4_flat'],
                          sha256_file(Path(__file__).with_name('coreai_q4_flat.py')))
+
+    def test_contiguous_affine_is_optional_preserves_storage_and_phase_outputs(self):
+        for fused in (False, True):
+            model = self.model(fused)
+            self.assertFalse(model.contiguous_affine)
+            flatten_moe_weights(model)
+            before = [(n, v.dtype, tuple(v.shape), v.data_ptr()) for n, v in model.named_buffers()]
+            inputs = [torch.zeros(1, size, 64, dtype=torch.float16) for size in (1, 17)]
+            inputs[-1][0, 1, 0] = .5
+            inputs[-1][0, 2, 0] = -.5
+            with torch.inference_mode():
+                expected = [model(x) for x in inputs]
+                kernels = install_contiguous_affine(model)
+                self.assertEqual(kernels, install_contiguous_affine(model))
+                self.assertTrue(set(kernels) <= set(model.custom_kernels()))
+                for x, reference in zip(inputs, expected, strict=True):
+                    for actual, wanted in zip(model(x), reference, strict=True):
+                        torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+            self.assertEqual(before, [(n, v.dtype, tuple(v.shape), v.data_ptr()) for n, v in model.named_buffers()])
+
+    def test_contiguous_registration_normalizes_defaults_and_rejects_bk128(self):
+        for getter in (get_flat_grouped_kernel, get_flat_gateup_kernel):
+            self.assertIs(getter(12, 128, 64), getter(12, 128, 64, 16, 32, 64, False))
+            self.assertIs(getter(12, 128, 64, contiguous_affine=True),
+                          getter(12, 128, 64, 16, 32, 64, True))
+            with self.assertRaisesRegex(ValueError, 'BK=64'):
+                getter(12, 128, 64, inner=128, contiguous_affine=True)
+        model = self.model()
+        with self.assertRaisesRegex(ValueError, 'flattened'):
+            install_contiguous_affine(model)
 
 
 if __name__ == '__main__':

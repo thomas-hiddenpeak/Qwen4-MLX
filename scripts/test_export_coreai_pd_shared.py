@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 
 from export_coreai_pd_shared import (ALIGNMENT, ExternalModule, buffer_signature,
     export_generic, externalizable_buffers, geometry_signature, validate_baseline,
-    write_aligned_weights)
+    write_aligned_weights, validate_contiguous_affine, build_decoder_layer, main)
 
 
 torch.set_num_threads(2)
@@ -31,6 +32,64 @@ class Tiny(torch.nn.Module):
 
 
 class SharedExportTests(unittest.TestCase):
+    def test_contiguous_affine_configuration_rejects_before_weight_reads(self):
+        for flat in (False, True):
+            validate_contiguous_affine(flat_q4=flat, moe_tile=(16, 64, 128), contiguous_affine=False)
+        for block in (16, 32):
+            for columns in (32, 64):
+                validate_contiguous_affine(flat_q4=True, moe_tile=(block, columns, 64), contiguous_affine=True)
+        for flat, tile, message in ((False, (16, 32, 64), '--flat-q4'),
+                                    (True, (16, 32, 128), 'BK=64'),
+                                    (True, (16, 16, 64), 'BN32/64')):
+            with self.subTest(flat=flat, tile=tile), self.assertRaisesRegex(ValueError, message):
+                # None cannot read a model source: invalid setup must fail first.
+                build_decoder_layer(None, {}, 4096, prefill_sdpa_fp16=True, fuse_gateup=True,
+                    flat_q4=flat, moe_tile=tile, contiguous_affine=True)
+
+    def test_actual_cli_contiguous_affine_default_opt_in_and_provenance(self):
+        import export_coreai_pd_shared as exporter
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_dir, model_dir = root/'baseline', root/'model'
+            baseline_dir.mkdir()
+            model_dir.mkdir()
+            config = model_dir/'config.json'
+            config.write_text('{"text_config": {}}')
+            asset_dir = baseline_dir/'embedding.aimodel'
+            asset_dir.mkdir()
+            (asset_dir/'tiny.bin').write_bytes(b'CPU CLI fixture')
+            baseline = {'version': 1, 'backend': 'native-coreai-pd', 'status': 'complete',
+                'completeModelLayerSet': True, 'prefillKernels': 'tensor', 'q4Kernel': 'metal',
+                'stableProjections': False, 'layers': [{'index': i} for i in range(48)],
+                'tokenChunk': 2048, 'tailChunks': [], 'capacity': 4096, 'moeTile': [16, 32, 64],
+                'modelDirectory': str(model_dir), 'configSHA256': hashlib.sha256(config.read_bytes()).hexdigest(),
+                'assets': {'embedding': {'path': 'embedding.aimodel', 'modelBytes': 15}}}
+            (baseline_dir/'manifest.json').write_text(json.dumps(baseline))
+            with mock.patch.object(exporter, 'Source') as source, \
+                    mock.patch.object(exporter.DenseConfig, 'from_model'), \
+                    mock.patch.object(exporter, 'verify_recorded_asset'), \
+                    mock.patch.object(exporter.torch, 'set_num_threads'), \
+                    mock.patch.object(exporter.torch, 'set_num_interop_threads'), \
+                    mock.patch.object(exporter.shutil, 'disk_usage', return_value=mock.Mock(free=10**12)):
+                source.return_value.directory = model_dir
+                for enabled in (False, True):
+                    output = root/('on' if enabled else 'off')
+                    arguments = ['--baseline-pd', str(baseline_dir), '--output', str(output),
+                                 '--components', 'embedding', '--flat-q4']
+                    if enabled:
+                        arguments += ['--contiguous-affine']
+                    main(arguments)
+                    saved = json.loads((output/'manifest.json').read_text())
+                    self.assertEqual(saved['contiguousAffine'], enabled)
+                    self.assertTrue(saved['flatQ4'])
+                    self.assertIn('coreai_q4_flat', saved['authoringSourceSHA256'])
+                    self.assertFalse(saved['completeModelLayerSet'])
+                source.reset_mock()
+                with self.assertRaisesRegex(ValueError, '--flat-q4'):
+                    main(['--baseline-pd', str(baseline_dir), '--output', str(root/'invalid'),
+                          '--contiguous-affine'])
+                source.assert_not_called()
+
     def test_weight_binary_preserves_dtype_bytes_alignment_and_hashes(self):
         named = [('packed', torch.tensor([[-32768, -1, 0, 32767]], dtype=torch.int16)),
                  ('half', torch.tensor([.125, -1.75], dtype=torch.float16)),
