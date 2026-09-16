@@ -1,5 +1,7 @@
 # 自主研究与开发接续
 
+2026-09-17 CoreAI 状态阶段：新增 `CoreAIStateSession` 和 `probe-coreai-sequence`，真实权重 GDN S4+3S1、QSA 短序列及2051→2056稀疏边界在系统CoreAI/GPU偏好下共46步、298项输出/状态对照通过。reset与同一checkpoint两次续算的逻辑值逐位一致；状态用NDArray连续传递，不回灌CPU参考。FP16/FP32候选对原BF16源仍有单独误差，尚非整层/全模型验收；下一步完整decoder/量化MoE连接，详见[CoreAI连续状态](COREAI_STATEFUL.md)。参考服务保持关闭。
+
 2026-09-17新策略：用户要求 mlx-serve **默认停止，参考对照需要时再启动**，专注独立 runner/CoreAI。已按精确 argv 核验并用 SIGTERM 停止原服务PID6595，确认进程退出；status记录 `server_pid=null`、`server_retained=false`、`reference_service_policy=on_demand`。控制器默认不再恢复，仅显式 `restore_reference: true` 启用恢复；旧参考 ledger 保留启动参数。下面各次“结束后恢复/常驻”的要求均属历史，不再作为默认工作流程。CoreAI首轮真实专家与后续路线见[CoreAI后端](COREAI_BACKEND.md)。
 
 2026-09-16业务配置更新：用户要求mlx-serve直接监听`0.0.0.0:11235`，已写入`config/mlx-serve-business.json`并仅改host重启为PID51451。RAM prefix仍为8项/10GiB、SSD prefix关闭；两次211-token chat实测第二次命中180、实算31，usage/metrics一致。11237临时转发已停止。当前ledger是`results/mlx-business-listen-20260916/run-ledger.json`，且已同步到`../qwen38-ssd/results/experiment-status.json`的`reference_ledger`；后续恢复必须沿用最新记录，下面9月14日的PID及loopback-only配置均为历史。详见[业务服务](MLX_SERVE_SERVICE.md)。

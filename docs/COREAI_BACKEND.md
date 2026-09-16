@@ -1,6 +1,6 @@
 # Core AI 后端：首批真实权重子图
 
-2026-09-17 起在 macOS 27 系统 Core AI 上开发。独立 Swift runner 已新增 `probe-coreai`，直接加载 `.aimodel`、执行函数并读取输出；当前范围是无状态子图。**完整 48 层生成和 HTTP 服务仍使用 MLX，尚未切换为 Core AI。**
+2026-09-17 起在 macOS 27 系统 Core AI 上开发。独立 Swift runner 的 `probe-coreai` 直接加载 `.aimodel`、执行函数并读取输出；后续新增 `probe-coreai-sequence`，已完成真实权重 GDN/QSA 的[连续状态验证](COREAI_STATEFUL.md)。**完整 48 层生成和 HTTP 服务仍使用 MLX，尚未切换为 Core AI。** 以下保留首批 MoE 子图结果。
 
 ## 本轮实测
 
@@ -60,7 +60,7 @@ xcrun swift build -c release
 
 ## 向完整模型推进
 
-1. **一个 GDN 层和一个 QSA 层的状态语义。** 运行真实短 prefill 后连续 decode，逐步对照输出、KV、递归状态、位置和 PLE 历史。先使用 CoreAI GPU 路径建立可运行的模型组件，再按 profile 选择设备。
+1. **GDN / QSA 状态语义。** 首轮真实权重子层的短 prefill/decode、稀疏边界和状态恢复已通过，范围见[连续状态结果](COREAI_STATEFUL.md)。下一步串接完整 decoder 层并检查 PLE、残差与源 BF16 的累计误差；再按 profile 选择设备。
 2. **保留量化驻留的 MoE。** 使用 CoreAI 的 GatherMM/量化路线或 Metal 扩展，验证本模型 Q4 分组、scale/bias、top-10 路由及共享门控。整套专家展开 FP16 会超过目标机器的可用容量，不能把本轮单专家导出方式直接推广至全模型。
 3. **整层、整模型与现有服务对接。** 保留 SSD n-gram 按行读取、prefill/decode 分离及 runner 的调度；CoreAI 只接收本轮需要的 PLE 行，不把 51.2 GB 表变为模型常量。后端状态需要明确导入/导出及身份版本，不能直接复用现有 MLX 缓存文件。
 4. **长上下文和性能验收。** 再恢复前缀缓存、SSD 状态归档、取消、内存压力和 262144 上下文检查。独立统计 prefill/decode，用硬件时间线判断 GPU/ANE/CPU 分工；MTP 性能仍放在后段。

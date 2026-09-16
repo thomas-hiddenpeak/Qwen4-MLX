@@ -6,7 +6,7 @@ GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经�
 
 KV cache 是既有服务的重点。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；各项实现和验收进度在能力计划中分别记录。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
 
-macOS 27 上已开始 [CoreAI 后端开发](docs/COREAI_BACKEND.md)：新增 Swift `probe-coreai`，首批真实共享/路由专家子图通过 GPU 偏好下的数值检查。完整模型生成仍使用 MLX；后续逐步接入注意力、递归状态、量化专家与既有缓存能力。
+macOS 27 上已开始 [CoreAI 后端开发](docs/COREAI_BACKEND.md)：真实共享/路由专家子图通过首批数值检查，GDN/QSA 已完成[跨 prefill/decode 的状态执行、重置与检查点恢复验证](docs/COREAI_STATEFUL.md)。完整模型生成仍使用 MLX；后续连接完整 decoder 层、量化专家与既有缓存能力。
 
 ## 构建与生成
 

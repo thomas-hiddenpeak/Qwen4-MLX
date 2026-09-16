@@ -67,7 +67,7 @@ public enum CoreAIBlockRunnerError: LocalizedError, Sendable {
 @available(macOS 27.0, *)
 public final class CoreAIBlockRunner {
     private let model: AIModel
-    private let function: InferenceFunction
+    let function: InferenceFunction
     private let modelURL: URL
     private let computeUnits: CoreAIComputeUnits
     private let options: SpecializationOptions
@@ -156,16 +156,33 @@ public final class CoreAIBlockRunner {
             outputs: outputs, comparisons: comparisons)
     }
 
-    private func makeInputs(_ tensors: [String: CoreMLTensor]) throws -> [String: NDArray] {
-        guard Set(tensors.keys) == Set(function.descriptor.inputNames) else {
+    func makeInputs(_ tensors: [String: CoreMLTensor], retainedInputs: [String: NDArray] = [:]) throws -> [String: NDArray] {
+        guard Set(tensors.keys).isDisjoint(with: retainedInputs.keys) else {
+            throw CoreAIBlockRunnerError.invalidFixture("Fixture inputs must not replace retained state")
+        }
+        guard Set(tensors.keys).union(retainedInputs.keys) == Set(function.descriptor.inputNames) else {
             throw CoreAIBlockRunnerError.invalidFixture("Input names must match \(function.descriptor.inputNames.sorted())")
         }
-        var inputs = [String: NDArray]()
-        for (name, tensor) in tensors {
-            try tensor.validate(name: name)
+        var inputs = retainedInputs
+        for (name, array) in retainedInputs {
             guard case .ndArray(let descriptor) = function.descriptor.inputDescriptor(of: name) else {
                 throw CoreAIBlockRunnerError.unsupportedFeature("\(name): only tensor inputs are supported")
             }
+            try Self.validate(array, descriptor: descriptor, name: name)
+        }
+        for (name, tensor) in tensors {
+            guard case .ndArray(let descriptor) = function.descriptor.inputDescriptor(of: name) else {
+                throw CoreAIBlockRunnerError.unsupportedFeature("\(name): only tensor inputs are supported")
+            }
+            inputs[name] = try Self.makeArray(tensor, descriptor: descriptor, name: name)
+        }
+        return inputs
+    }
+
+    static func makeArray(_ tensor: CoreMLTensor, descriptor: NDArrayDescriptor? = nil, name: String) throws -> NDArray {
+        try tensor.validate(name: name)
+        var array: NDArray
+        if let descriptor {
             guard try Self.dtype(descriptor.scalarType, name: name) == tensor.dtype else {
                 throw CoreAIBlockRunnerError.invalidFixture("\(name): fixture dtype does not match model dtype")
             }
@@ -180,27 +197,52 @@ public final class CoreAIBlockRunner {
             guard resolved.interleaveLayout == nil else {
                 throw CoreAIBlockRunnerError.unsupportedFeature("\(name): interleaved tensor inputs are unsupported")
             }
-            var array = NDArray(descriptor: resolved)
+            array = NDArray(descriptor: resolved)
+        } else {
+            let scalarType: NDArray.ScalarType
             switch tensor.dtype {
-            case .float16:
-                var view = array.mutableView(as: Float16.self)
-                view.copyElements(fromContentsOf: tensor.values.map(Float16.init))
-            case .float32:
-                var view = array.mutableView(as: Float.self)
-                view.copyElements(fromContentsOf: tensor.values.map(Float.init))
-            case .float64:
-                var view = array.mutableView(as: Double.self)
-                view.copyElements(fromContentsOf: tensor.values)
-            case .int32:
-                var view = array.mutableView(as: Int32.self)
-                view.copyElements(fromContentsOf: tensor.values.map(Int32.init))
+            case .float16: scalarType = .float16
+            case .float32: scalarType = .float32
+            case .float64: scalarType = .float64
+            case .int32: scalarType = .int32
             }
-            inputs[name] = array
+            array = NDArray(shape: tensor.shape, scalarType: scalarType)
         }
-        return inputs
+        switch tensor.dtype {
+        case .float16:
+            var view = array.mutableView(as: Float16.self)
+            view.copyElements(fromContentsOf: tensor.values.map(Float16.init))
+        case .float32:
+            var view = array.mutableView(as: Float.self)
+            view.copyElements(fromContentsOf: tensor.values.map(Float.init))
+        case .float64:
+            var view = array.mutableView(as: Double.self)
+            view.copyElements(fromContentsOf: tensor.values)
+        case .int32:
+            var view = array.mutableView(as: Int32.self)
+            view.copyElements(fromContentsOf: tensor.values.map(Int32.init))
+        }
+        return array
     }
 
-    private static func dtype(_ type: NDArray.ScalarType, name: String) throws -> CoreMLTensorDataType {
+    static func validate(_ array: NDArray, descriptor: NDArrayDescriptor, name: String) throws {
+        guard array.scalarType == descriptor.scalarType,
+              array.shape.count == descriptor.rank,
+              !array.shape.isEmpty, array.shape.allSatisfy({ $0 > 0 }),
+              zip(descriptor.shape, array.shape).allSatisfy({ $0 < 0 || $0 == $1 }) else {
+            throw CoreAIBlockRunnerError.invalidFixture("\(name): retained tensor dtype or shape does not match model descriptor")
+        }
+        guard array.interleaveLayout == nil, descriptor.interleaveLayout == nil else {
+            throw CoreAIBlockRunnerError.unsupportedFeature("\(name): interleaved tensors are unsupported")
+        }
+        let resolved = descriptor.hasDynamicShape ? descriptor.resolvingDynamicDimensions(array.shape) : descriptor
+        guard !resolved.hasDynamicShape, resolved.shape == array.shape else {
+            throw CoreAIBlockRunnerError.invalidFixture("\(name): retained tensor shape could not be resolved")
+        }
+        _ = try dtype(array.scalarType, name: name)
+    }
+
+    static func dtype(_ type: NDArray.ScalarType, name: String) throws -> CoreMLTensorDataType {
         switch type {
         case .float16: .float16
         case .float32: .float32
@@ -210,7 +252,7 @@ public final class CoreAIBlockRunner {
         }
     }
 
-    private static func read(_ array: NDArray, name: String) throws -> CoreMLTensor {
+    static func read(_ array: NDArray, name: String) throws -> CoreMLTensor {
         let type = try dtype(array.scalarType, name: name)
         guard array.interleaveLayout == nil else {
             throw CoreAIBlockRunnerError.unsupportedFeature("\(name): interleaved tensor outputs are unsupported")
@@ -274,7 +316,7 @@ public final class CoreAIBlockRunner {
             preferredComputeUnit: options.preferredComputeUnitKind.map { String(describing: $0) })
     }
 
-    private static func milliseconds(since start: UInt64) -> Double {
+    static func milliseconds(since start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
     }
 }

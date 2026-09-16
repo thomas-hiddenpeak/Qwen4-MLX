@@ -72,6 +72,8 @@ struct RunnerCLI {
                 try probeCoreML(arguments)
             case "probe-coreai":
                 try await probeCoreAI(arguments)
+            case "probe-coreai-sequence":
+                try await probeCoreAISequence(arguments)
             case "probe-moe", "route-moe":
                 try probeMoE(arguments)
             case "probe-gpu-moe":
@@ -466,6 +468,9 @@ struct RunnerCLI {
         Execute a stateless system CoreAI function on macOS 27; reuses Core ML JSON fixtures.
         Options: --compute-units cpuOnly|default|gpu|neuralEngine --warmups 3 --runs 5
         Warmups: 0...1000; measured runs: 1...10000. GPU/ANE preferences do not prove hardware placement.
+    probe-coreai-sequence --sequence PATH [--compute-units gpu] [--output report.json]
+        Validate explicit CoreAI state across prefill/decode, reset and checkpoint replay on macOS 27.
+        Options: --replays 2 (1...4) --checkpoint-step 1 (0 disables checkpoint replay).
     route-moe --manifest PATH --fixture PATH [--precision bfloat16Boundaries|float32] [--output report.json]
         Route real token activations across every expert without loading expert models.
     probe-moe --manifest PATH --fixture PATH [--output report.json]
