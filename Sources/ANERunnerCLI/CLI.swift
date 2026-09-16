@@ -70,6 +70,8 @@ struct RunnerCLI {
                 try hash(arguments)
             case "probe-coreml":
                 try probeCoreML(arguments)
+            case "probe-coreai":
+                try await probeCoreAI(arguments)
             case "probe-moe", "route-moe":
                 try probeMoE(arguments)
             case "probe-gpu-moe":
@@ -460,6 +462,10 @@ struct RunnerCLI {
         Compute n-gram row IDs with the model's EOS and token-history semantics.
     probe-coreml --model PATH --fixture PATH [--output report.json]
         Execute a Core ML block with CPU + Neural Engine allowed; CPU fallback is possible.
+    probe-coreai --model PATH --fixture PATH [--function main] [--output report.json]
+        Execute a stateless system CoreAI function on macOS 27; reuses Core ML JSON fixtures.
+        Options: --compute-units cpuOnly|default|gpu|neuralEngine --warmups 3 --runs 5
+        Warmups: 0...1000; measured runs: 1...10000. GPU/ANE preferences do not prove hardware placement.
     route-moe --manifest PATH --fixture PATH [--precision bfloat16Boundaries|float32] [--output report.json]
         Route real token activations across every expert without loading expert models.
     probe-moe --manifest PATH --fixture PATH [--output report.json]

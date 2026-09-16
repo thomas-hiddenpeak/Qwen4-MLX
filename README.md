@@ -4,7 +4,9 @@
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
-当前集中完善 KV cache。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；各项实现和验收进度在能力计划中分别记录。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
+KV cache 是既有服务的重点。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；各项实现和验收进度在能力计划中分别记录。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
+
+macOS 27 上已开始 [CoreAI 后端开发](docs/COREAI_BACKEND.md)：新增 Swift `probe-coreai`，首批真实共享/路由专家子图通过 GPU 偏好下的数值检查。完整模型生成仍使用 MLX；后续逐步接入注意力、递归状态、量化专家与既有缓存能力。
 
 ## 构建与生成
 
@@ -13,7 +15,7 @@ GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经�
 从本仓库目录执行，模型目录按实际安装位置替换：
 
 ```sh
-env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift build -c release
+xcrun swift build -c release
 
 .build/release/ane-runner generate-gpu \
   --model-dir ../qwen38-ssd/models/Qwen3.8-Flash-Next-MLX-SSD-Stream \
@@ -111,7 +113,7 @@ ANERUNNER_GATEUP_LIBRARY="$PWD/results/local-moe-native/lib/libanemlx_moe_gateup
 ## 文档、历史与来源
 
 - [KV cache关键能力](docs/KV_CACHE_CAPABILITIES.md)、[主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[缓存可靠性验收](docs/KV_CACHE_RELIABILITY.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)：区分当前计划、实际完成与发布门槛。早期[精确前缀设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)及[首轮缓存验收](docs/AR_PREFIX_CACHE.md)保留追溯。
-- [Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)：保留早期局部数值、硬件证据、负结果与命令；完整MLX生成当前不使用ANE，也未实现CoreAI后端。
+- [CoreAI后端](docs/COREAI_BACKEND.md)：macOS 27 系统运行时、真实权重子图与整模型接入计划；[Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)保留早期局部数值、硬件证据和负结果。完整MLX生成当前不使用ANE。
 - [上游许可](UPSTREAM-LICENSE)与[garnermccloud/mlx-serve固定源码](https://github.com/garnermccloud/mlx-serve/blob/7dbcba04c98e4fd3bcc533c63e645547f13cc3b1/src/qwen4_exp.zig)：复用与移植文件保留来源和许可；vLLM、SGLang、DwarfStar的借鉴范围见吸收计划。
 
 本仓库提交源码、测试、脚本、文档与文本fixture。模型权重、大型张量、`results/`和构建产物不随克隆提供，文档中的历史本地结果链接需要对应实验产物。Swift推理不启动Python；Python用于插件构建、离线转换和验证。
