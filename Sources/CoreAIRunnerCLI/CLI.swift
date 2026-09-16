@@ -20,16 +20,22 @@ struct CoreAIRunnerCLI {
                 coreai-runner generate --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH --prompt TEXT \
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
+                coreai-runner serve --model-dir PATH --attention-manifest PATH \
+                  --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
+                  [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
+                  [--request-timeout-seconds 1800] [--max-pending-requests 2]
                 Complete CoreAI text inference. CPU handles tokenization, SSD rows and greedy selection.
                 Requires macOS 27. The exported attention manifest sets context capacity.
                 """)
                 return
             }
-            guard arguments.first == "generate", arguments.count % 2 == 1 else {
-                throw NativeCLIError.invalid("Use generate followed by unique --option value pairs")
+            guard let command = arguments.first, ["generate", "serve"].contains(command), arguments.count % 2 == 1 else {
+                throw NativeCLIError.invalid("Use generate or serve followed by unique --option value pairs")
             }
-            let allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest",
-                "--prompt", "--max-tokens", "--repeat", "--raw-prompt", "--output"]
+            var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest"]
+            allowed.formUnion(command == "generate" ? ["--prompt", "--max-tokens", "--repeat", "--raw-prompt", "--output"] :
+                ["--host", "--port", "--prefix-cache-bytes", "--prefix-cache-entries", "--request-timeout-seconds",
+                 "--max-pending-requests", "--max-connections", "--max-body-bytes", "--max-output-bytes"])
             var options: [String: String] = [:]
             for index in stride(from: 1, to: arguments.count, by: 2) {
                 let key = arguments[index]
@@ -39,7 +45,11 @@ struct CoreAIRunnerCLI {
                 options[key] = arguments[index + 1]
             }
             #if canImport(CoreAI)
-            if #available(macOS 27.0, *) { try await generate(options); return }
+            if #available(macOS 27.0, *) {
+                if command == "serve" { try await serve(options) }
+                else { try await generate(options) }
+                return
+            }
             #endif
             throw NativeCLIError.invalid("Native CoreAI generation requires macOS 27 and its SDK")
         } catch {
@@ -49,6 +59,41 @@ struct CoreAIRunnerCLI {
     }
 
     #if canImport(CoreAI)
+    @available(macOS 27.0, *)
+    private static func serve(_ options: [String: String]) async throws {
+        func path(_ key: String) throws -> URL {
+            guard let value = options[key], !value.isEmpty else { throw NativeCLIError.invalid("Missing \(key)") }
+            return URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath()
+        }
+        func number(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) throws -> Int {
+            guard let value = Int(options[key] ?? String(fallback)), range.contains(value) else {
+                throw NativeCLIError.invalid("\(key) must be in \(range)")
+            }
+            return value
+        }
+        let configuration = try CoreAIServiceConfiguration(modelDirectory: path("--model-dir"),
+            attentionManifest: path("--attention-manifest"), denseManifest: path("--dense-manifest"), moeManifest: path("--moe-manifest"),
+            cacheBytes: number("--prefix-cache-bytes", 536_870_912, 0...2_147_483_648),
+            cacheEntries: number("--prefix-cache-entries", 2, 0...8),
+            maxPendingRequests: number("--max-pending-requests", 2, 1...8),
+            maxOutputBytes: number("--max-output-bytes", 65_536, 4096...1_048_576))
+        let host = options["--host"] ?? "127.0.0.1"
+        guard ["127.0.0.1", "0.0.0.0"].contains(host) else {
+            throw NativeCLIError.invalid("--host must be 127.0.0.1 or 0.0.0.0")
+        }
+        let transport = try CoreAIHTTPServer.Configuration(host: host, port: UInt16(number("--port", 11236, 1024...65535)),
+            maxConnections: number("--max-connections", 8, 1...32), maxBodyBytes: number("--max-body-bytes", 262_144, 1024...1_048_576),
+            maxOutputBytes: configuration.maxOutputBytes,
+            requestTimeoutSeconds: Double(number("--request-timeout-seconds", 1800, 1...86_400)), sendTimeoutSeconds: 15)
+        let worker = CoreAIServiceWorker(configuration: configuration)
+        worker.start()
+        progress("CoreAI service loading; GET /health on \(host):\(transport.port) reports readiness")
+        do { try await CoreAIHTTPServer.run(configuration: transport, backend: worker) }
+        catch { worker.shutdown(); await worker.waitUntilStopped(); throw error }
+        worker.shutdown()
+        await worker.waitUntilStopped()
+    }
+
     @available(macOS 27.0, *)
     private static func generate(_ options: [String: String]) async throws {
         func require(_ key: String) throws -> String {

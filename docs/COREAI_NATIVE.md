@@ -2,7 +2,7 @@
 
 `coreai-runner` 将本模型的全部神经网络计算交给 macOS 27 系统 CoreAI。独立 Swift 可执行文件只依赖 `ANERunnerCore`，不依赖 `ANERunnerGPU` 或 `CMLX`；没有 MLX fallback。它与此前保留 MLX MoE/HC 的 [hybrid 路径](COREAI_HYBRID.md)是两个入口。
 
-当前是固定 **256-token 容量、逐 token prefill** 的文本集成版本。导出、子图数值检查和完整生成验收分别记录；它尚不代表长上下文服务、模型质量或吞吐性能验收。
+本页保留首次 **256-token 容量、逐 token prefill** 的完整迁移证据。后续已新增[4096容量的 HTTP 试用服务](COREAI_SERVICE.md)，支持JSON/SSE与RAM前缀缓存。导出、子图数值检查和完整生成验收分别记录；这些结果尚不代表262K服务、模型质量或吞吐性能验收。
 
 ## 执行边界
 
@@ -141,8 +141,8 @@ Embedding 使用真实 token `248046`；HC 和 head 使用其真实 embedding st
 
 ## 尚未迁移的业务能力
 
-当前容量只有 256，未证明 262144-token 上下文；在此容量内不会触发超过 2051 token 的 QSA 稀疏筛选。较长 QSA 边界子图的独立证据见 [CoreAI 连续状态验证](COREAI_STATEFUL.md)，不能替代完整模型长上下文验收。
+本页首次生成容量只有256，不会触发超过2051 token的QSA稀疏筛选。后续4096资产及实际HTTP验证见[CoreAI服务](COREAI_SERVICE.md)；尚未证明262144-token上下文。较长QSA边界子图的独立证据见[CoreAI连续状态验证](COREAI_STATEFUL.md)，不能替代完整模型长上下文验收。
 
-HTTP API、并发/取消调度、分块或业务独立部署的 prefill/decode、前缀树、SSD KV offload、缓存导入导出及内存压力策略尚未从服务迁移到这个入口。原有 MLX 缓存、prefix 或 archive 文件不能导入 CoreAI 会话；神经状态表示和版本不同，需要独立迁移与验收。
+后续已实现有界的单worker HTTP API、取消/reset，以及独立深拷贝的完整状态RAM前缀缓存。分块或业务独立部署的prefill/decode、前缀树、SSD KV offload、持久化导入导出及内存压力策略仍未迁入。原有MLX缓存、prefix或archive文件不能导入CoreAI会话；神经状态表示和版本不同，需要独立迁移与验收。
 
 原 BF16 路径被 FP16 权重/激活及 FP32 GDN state/logits 替代，路由、词表排名和长程累积误差都需要完整模型质量验证。子图低误差、可生成文本或 reset 重复一致，均不足以单独判定质量合格。先完成全链路，再做质量、状态管理和性能；MTP 优化仍放在后段。

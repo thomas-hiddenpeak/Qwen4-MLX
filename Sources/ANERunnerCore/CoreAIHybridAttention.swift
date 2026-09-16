@@ -31,6 +31,20 @@ private struct HybridAttentionManifest: Decodable {
     let layers: [Layer]
 }
 
+/// An immutable, independently owned RAM checkpoint of all 48 attention layers.
+/// It can only be restored into the backend instance that created it.
+@available(macOS 27.0, *)
+public struct CoreAIHybridAttentionSnapshot: Sendable {
+    fileprivate struct LayerState: Sendable {
+        let states: [String: NDArray]
+        let offset: Int
+    }
+    fileprivate let owner: UUID
+    fileprivate let layers: [Int: LayerState]
+    public let offset: Int
+    public let logicalByteCount: Int
+}
+
 /// Serial S1 attention backend for the Qwen3.8 hybrid prototype. It retains native
 /// CoreAI state and reads only the 2560-element activation and QSA integer counters.
 /// MoE, normalization, PLE and sampling remain the caller's responsibility.
@@ -66,6 +80,7 @@ public final class CoreAIHybridAttention {
     public private(set) var poisonReason: String?
 
     private let layers: [Int: LoadedLayer]
+    private let snapshotOwner = UUID()
     private let gate = NSLock()
     private var operationInProgress = false
 
@@ -255,6 +270,96 @@ public final class CoreAIHybridAttention {
         }
     }
 
+    /// Metadata-only size for reserving a checkpoint budget before allocating it.
+    /// Does not include weights, allocator padding or Swift object overhead.
+    public func stateByteCount() throws -> Int {
+        try beginOperation()
+        defer { endOperation() }
+        var bytes = 0
+        for layer in layers.values {
+            bytes = try CoreAITensorCopy.addingByteCounts(bytes, CoreAITensorCopy.logicalByteCount(layer.states))
+        }
+        return bytes
+    }
+
+    public func checkpoint() throws -> CoreAIHybridAttentionSnapshot {
+        try beginOperation()
+        defer { endOperation() }
+        guard !isPoisoned, loadedLayerIndices == Array(0..<48),
+              let commonOffset = layers[0]?.nextOffset,
+              commonOffset >= 0, commonOffset <= capacity,
+              layers.values.allSatisfy({ $0.nextOffset == commonOffset }) else {
+            throw CoreAIBlockRunnerError.invalidFixture("Attention checkpoint requires a valid, complete 48-layer token boundary")
+        }
+        var copied: [Int: CoreAIHybridAttentionSnapshot.LayerState] = [:]
+        var bytes = 0
+        for index in loadedLayerIndices {
+            let layer = layers[index]!
+            try Self.validateCheckpointStates(layer.states, layer: layer, offset: commonOffset)
+            bytes = try CoreAITensorCopy.addingByteCounts(bytes, CoreAITensorCopy.logicalByteCount(layer.states))
+            copied[index] = .init(states: try CoreAITensorCopy.deepCopy(layer.states), offset: commonOffset)
+        }
+        return CoreAIHybridAttentionSnapshot(owner: snapshotOwner, layers: copied,
+                                            offset: commonOffset, logicalByteCount: bytes)
+    }
+
+    /// Validates and copies every layer before changing any live state. Rejected
+    /// snapshots leave the current state, poison flags and counters unchanged.
+    public func restore(_ snapshot: CoreAIHybridAttentionSnapshot) throws {
+        try beginOperation()
+        defer { endOperation() }
+        guard snapshot.owner == snapshotOwner else {
+            throw CoreAIBlockRunnerError.invalidFixture("Cannot restore an attention checkpoint from another backend instance")
+        }
+        guard loadedLayerIndices == Array(0..<48), Set(snapshot.layers.keys) == Set(loadedLayerIndices),
+              snapshot.offset >= 0, snapshot.offset <= capacity else {
+            throw CoreAIBlockRunnerError.invalidFixture("Attention checkpoint does not contain a complete valid layer set")
+        }
+        var restored: [Int: [String: NDArray]] = [:]
+        var bytes = 0
+        for index in loadedLayerIndices {
+            let saved = snapshot.layers[index]!
+            guard saved.offset == snapshot.offset else {
+                throw CoreAIBlockRunnerError.invalidFixture("Attention checkpoint layer offsets disagree")
+            }
+            try Self.validateCheckpointStates(saved.states, layer: layers[index]!, offset: saved.offset)
+            bytes = try CoreAITensorCopy.addingByteCounts(bytes, CoreAITensorCopy.logicalByteCount(saved.states))
+            restored[index] = try CoreAITensorCopy.deepCopy(saved.states)
+        }
+        guard bytes == snapshot.logicalByteCount else {
+            throw CoreAIBlockRunnerError.invalidFixture("Attention checkpoint logical size does not match its state tensors")
+        }
+        for index in loadedLayerIndices {
+            layers[index]!.states = restored[index]!
+            layers[index]!.nextOffset = snapshot.layers[index]!.offset
+        }
+        successfulCalls = 0
+        totalInputMilliseconds = 0
+        totalPredictionMilliseconds = 0
+        totalOutputMilliseconds = 0
+        lastPredictionMilliseconds = 0
+        isPoisoned = false
+        poisonReason = nil
+    }
+
+    private static func validateCheckpointStates(_ states: [String: NDArray], layer: LoadedLayer, offset: Int) throws {
+        guard Set(states.keys) == Set(layer.spec.stateBindings.keys) else {
+            throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer.spec.index): checkpoint state names differ from the model")
+        }
+        for (name, state) in states {
+            guard case .ndArray(let descriptor) = layer.runner.function.descriptor.inputDescriptor(of: name) else {
+                throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer.spec.index): checkpoint state input \(name) is missing")
+            }
+            try CoreAIBlockRunner.validate(state, descriptor: descriptor, name: name)
+        }
+        if layer.spec.kind == "qsa" {
+            guard try integerState(states, name: "offset") == offset,
+                  try integerState(states, name: "pooled_count") == offset / 4 else {
+                throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer.spec.index): checkpoint QSA counters do not match its offset")
+            }
+        }
+    }
+
     /// Recreates zero state without reloading weights. Replaces all layers only
     /// after every new state allocation succeeds, and clears counters and poison.
     public func reset() throws {
@@ -326,22 +431,13 @@ public final class CoreAIHybridAttention {
             guard case .ndArray(let descriptor) = runner.function.descriptor.inputDescriptor(of: name) else {
                 throw CoreAIBlockRunnerError.invalidModel("Layer \(spec.index): missing zero-state descriptor \(name)")
             }
-            let count = try elementCount(state.shape)
-            var array = NDArray(descriptor: descriptor)
-            switch state.dtype {
-            case .float16:
-                var view = array.mutableView(as: Float16.self)
-                view.copyElements(from: repeatElement(Float16.zero, count: count))
-            case .float32:
-                var view = array.mutableView(as: Float.self)
-                view.copyElements(from: repeatElement(Float.zero, count: count))
-            case .float64:
-                var view = array.mutableView(as: Double.self)
-                view.copyElements(from: repeatElement(Double.zero, count: count))
-            case .int32:
-                var view = array.mutableView(as: Int32.self)
-                view.copyElements(from: repeatElement(Int32.zero, count: count))
+            guard state.fill == 0, descriptor.shape == state.shape,
+                  descriptor.interleaveLayout == nil,
+                  try CoreAIBlockRunner.dtype(descriptor.scalarType, name: name) == state.dtype else {
+                throw CoreAIBlockRunnerError.invalidModel("Invalid attention zero-state metadata or descriptor")
             }
+            let array = try CoreAITensorCopy.zeroArray(shape: state.shape, scalarType: descriptor.scalarType)
+            try CoreAIBlockRunner.validate(array, descriptor: descriptor, name: name)
             result[name] = array
         }
         return result

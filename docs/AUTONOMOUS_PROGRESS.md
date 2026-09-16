@@ -1,5 +1,7 @@
 # 自主研究与开发接续
 
+2026-09-17 CoreAI试用服务：新增独立 `coreai-runner serve`，JSON/SSE、健康查询、单worker有界队列、协作取消/reset，以及512MiB/2条完整状态RAM前缀缓存（system与prompt精确token前缀）。全部48层attention+PLE深拷贝checkpoint/restore、owner与offset校验已接入，4096容量资产导出完成。最终binary `5d3498b3…2adeb9a` 的16项实际HTTP检查和18项CPU网络检查通过；修复状态序列清零7.1s开销，同尺寸批量填充约12–29ms且逐字节全零，热请求由约9.23s降为0.77s。不是decode提速；S1prefill、源BF16质量差异、262K/SSD/PD/工具调用仍有缺口。完整2064token稀疏边界/热缓存正在独立实测，不能提前称为通过。mlx-serve继续关闭，详情与复跑见[CoreAI服务](COREAI_SERVICE.md)。
+
 2026-09-17 完整 CoreAI 迁移：按用户“完全迁移”新增独立 `coreai-runner`，无 MLX/CMLX 链接或回退。embedding、96 HC read、共享 HC write、48 attention、48 全512专家 MoE、PLE与head均在CoreAI执行；CPU保留分词/SSD FP8行读取/greedy及QSA标量计数校验。原 Q4 字节以I16视图规避本机GPU I32解包低位错误，完整layer0对同FP16边界CPU误差relative L2 0.000461、路由精确；所有模型资产已导出约77.88GB，没有全专家dense展开。
 
 两条实际请求各reset重放一次，共4次EOS、41,322次CoreAI调用；介绍27 tokens、算术3 tokens含EOS，reset精确相同、实际运行MLX镜像为空。介绍第17token与源BF16参考分歧，不能称质量等价；算术输出51与源参考一致。介绍decode两遍2.68/2.72 token/s、每步291次调用，只作为当前未优化功能基线；仍是容量256/S1 prefill，尚未迁移HTTP、PD调度、prefix/SSD KV cache或262K。完整release、无MLX路径独立product构建、16项CPU测试、3项不完整manifest拒绝检查通过；未运行XCTest。下一步先定位累计精度与算子开销，再扩展prefill/状态及服务，MTP后置，mlx-serve继续关闭。复跑与证据见[完整CoreAI路径](COREAI_NATIVE.md)。

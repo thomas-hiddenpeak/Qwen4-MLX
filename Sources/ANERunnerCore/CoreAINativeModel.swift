@@ -52,6 +52,19 @@ private struct NativeMoEManifest: Decodable {
     let layers: [Layer]
 }
 
+/// Complete native model state at a finished token boundary. Tensor storage is
+/// independent of the running model and is copied again on each restore.
+/// CPU n-gram history, prompt IDs and next-token logits belong to the caller.
+@available(macOS 27.0, *)
+public struct CoreAINativeSnapshot: Sendable {
+    fileprivate let owner: UUID
+    fileprivate let attention: CoreAIHybridAttentionSnapshot
+    fileprivate let pleStates: [String: NDArray]
+    public let offset: Int
+    /// Logical state bytes only; excludes weights, padding and caller metadata.
+    public let logicalByteCount: Int
+}
+
 /// Complete S1 text forward using system CoreAI for every neural-network block.
 /// Native NDArrays connect embedding, HC, attention, routed/shared MoE, PLE and
 /// vocabulary projection. The caller supplies CPU SSD lookup rows and token IDs;
@@ -91,6 +104,7 @@ public final class CoreAINativeModel {
     private let layers: [DenseLayer]
     private let pleSpec: NativeAsset
     private var pleStates: [String: NDArray]
+    private let snapshotOwner = UUID()
     private let gate = NSLock()
     private var operationInProgress = false
 
@@ -289,6 +303,77 @@ public final class CoreAINativeModel {
         }
     }
 
+    /// Reads state shapes/dtypes only. Callers can reserve a cache budget before
+    /// checkpoint() allocates independent copies of all state tensors.
+    public func stateByteCount() throws -> Int {
+        try beginOperation()
+        defer { endOperation() }
+        return try CoreAITensorCopy.addingByteCounts(attention.stateByteCount(),
+                                                    CoreAITensorCopy.logicalByteCount(pleStates))
+    }
+
+    public func checkpoint() throws -> CoreAINativeSnapshot {
+        try beginOperation()
+        defer { endOperation() }
+        guard valid, !attention.isPoisoned, offset >= 0, offset <= capacity else {
+            throw CoreAIBlockRunnerError.invalidFixture("Cannot checkpoint a failed or incomplete CoreAI native token")
+        }
+        try validatePLECheckpoint(pleStates)
+        let attentionState = try attention.checkpoint()
+        guard attentionState.offset == offset else {
+            throw CoreAIBlockRunnerError.invalidFixture("Native model and attention checkpoint offsets disagree")
+        }
+        let bytes = try CoreAITensorCopy.addingByteCounts(attentionState.logicalByteCount,
+                                                        CoreAITensorCopy.logicalByteCount(pleStates))
+        let copiedPLE = try CoreAITensorCopy.deepCopy(pleStates)
+        return CoreAINativeSnapshot(owner: snapshotOwner, attention: attentionState, pleStates: copiedPLE,
+                                   offset: offset, logicalByteCount: bytes)
+    }
+
+    /// Foreign or rejected snapshots do not alter the live model. A successful
+    /// restore may recover a failed session, and clears all timing/call counters.
+    public func restore(_ snapshot: CoreAINativeSnapshot) throws {
+        try beginOperation()
+        defer { endOperation() }
+        guard snapshot.owner == snapshotOwner else {
+            throw CoreAIBlockRunnerError.invalidFixture("Cannot restore a native checkpoint from another model instance")
+        }
+        guard snapshot.offset >= 0, snapshot.offset <= capacity,
+              snapshot.attention.offset == snapshot.offset else {
+            throw CoreAIBlockRunnerError.invalidFixture("Native checkpoint offsets are invalid or inconsistent")
+        }
+        try validatePLECheckpoint(snapshot.pleStates)
+        let bytes = try CoreAITensorCopy.addingByteCounts(snapshot.attention.logicalByteCount,
+                                                        CoreAITensorCopy.logicalByteCount(snapshot.pleStates))
+        guard bytes == snapshot.logicalByteCount else {
+            throw CoreAIBlockRunnerError.invalidFixture("Native checkpoint logical size does not match its state tensors")
+        }
+        // Finish every potentially throwing PLE operation before attention's
+        // atomic restore. Nothing after its successful return can throw.
+        let restoredPLE = try CoreAITensorCopy.deepCopy(snapshot.pleStates)
+        try attention.restore(snapshot.attention)
+        pleStates = restoredPLE
+        offset = snapshot.offset
+        valid = true
+        failureReason = nil
+        successfulCalls = 0
+        callCounts = [:]
+        predictionMillisecondsByGroup = [:]
+        lastForwardMilliseconds = 0
+    }
+
+    private func validatePLECheckpoint(_ states: [String: NDArray]) throws {
+        guard let bindings = pleSpec.stateBindings, Set(states.keys) == Set(bindings.keys) else {
+            throw CoreAIBlockRunnerError.invalidFixture("Native checkpoint PLE state names differ from the model")
+        }
+        for (name, state) in states {
+            guard case .ndArray(let descriptor) = ple.function.descriptor.inputDescriptor(of: name) else {
+                throw CoreAIBlockRunnerError.invalidFixture("Native checkpoint PLE input \(name) is missing")
+            }
+            try CoreAIBlockRunner.validate(state, descriptor: descriptor, name: name)
+        }
+    }
+
     public func reset() throws {
         try beginOperation()
         defer { endOperation() }
@@ -386,12 +471,12 @@ public final class CoreAINativeModel {
         for (name, spec) in initial {
             guard spec.fill == 0, spec.dtype == .float16, spec.shape == [1, 9, 10240],
                   case .ndArray(let descriptor) = runner.function.descriptor.inputDescriptor(of: name),
-                  descriptor.shape == spec.shape, descriptor.scalarType == .float16 else {
+                  descriptor.shape == spec.shape, descriptor.scalarType == .float16,
+                  descriptor.interleaveLayout == nil else {
                 throw CoreAIBlockRunnerError.invalidModel("Invalid PLE initial-state metadata or descriptor")
             }
-            var array = NDArray(descriptor: descriptor)
-            var view = array.mutableView(as: Float16.self)
-            view.copyElements(from: repeatElement(Float16.zero, count: 9 * 10240))
+            let array = try CoreAITensorCopy.zeroArray(shape: spec.shape, scalarType: descriptor.scalarType)
+            try CoreAIBlockRunner.validate(array, descriptor: descriptor, name: name)
             states[name] = array
         }
         return states
