@@ -165,11 +165,12 @@ private final class WeakOwner {
         }
 
         func rejects(_ name: String, _ message: String, fixture: Fixture,
-                     integrity: Bool = false, _ change: (inout [String: Any]) -> Void) {
+                     integrity: Bool = false, storage: CoreAIExternalWeightStorage = .resident,
+                     _ change: (inout [String: Any]) -> Void) {
             record(name) {
                 do {
                     _ = try CoreAIExternalWeights(spec: fixture.spec(change), baseURL: fixture.base,
-                        device: device, verifyIntegrity: integrity)
+                        device: device, storage: storage, verifyIntegrity: integrity)
                     throw CheckFailure(description: "invalid input was accepted")
                 } catch CoreAIBlockRunnerError.invalidModel(let actual) {
                     try require(actual.contains(message), "unexpected rejection: \(actual)")
@@ -177,12 +178,12 @@ private final class WeakOwner {
             }
         }
 
-        for storage in [CoreAIExternalWeightStorage.resident, .mapped] {
+        for storage in [CoreAIExternalWeightStorage.resident, .residentFile, .mapped] {
             let name = "\(storage.rawValue)_typed_content_and_metadata"
             do {
                 let owner: CoreAIExternalWeights
                 if storage == .resident {
-                    // Omit storage deliberately: resident is the public default.
+                    // Omit storage deliberately: per-tensor resident is default.
                     owner = try CoreAIExternalWeights(spec: fixture.spec(), baseURL: fixture.base,
                         device: device, verifyIntegrity: true)
                 } else {
@@ -293,6 +294,14 @@ private final class WeakOwner {
         }
         rejects("slice_hash_mismatch", "slice SHA256 differs", fixture: fixture, integrity: true) {
             editSlice(&$0) { $0["sha256"] = String(repeating: "0", count: 64) }
+        }
+        let padding = try Fixture(in: root.appendingPathComponent("padding-corruption"))
+        var changedPadding = padding.data
+        changedPadding[128] ^= 1 // Outside every logical tensor slice.
+        try changedPadding.write(to: padding.file)
+        for storage in [CoreAIExternalWeightStorage.resident, .residentFile, .mapped] {
+            rejects("\(storage.rawValue)_whole_file_hash_includes_padding", "file SHA256 differs",
+                    fixture: padding, integrity: true, storage: storage) { _ in }
         }
         record("integrity_is_explicitly_opt_in") {
             let owner = try CoreAIExternalWeights(spec: fixture.spec { $0["sha256"] = String(repeating: "0", count: 64) },

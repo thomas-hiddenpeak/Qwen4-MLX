@@ -26,13 +26,15 @@ struct CoreAIExternalWeightsSpec: Decodable {
 }
 
 enum CoreAIExternalWeightStorage: String {
-    /// Reads the file once directly into a shared Metal allocation.
+    /// Reads each tensor's file slice directly into its own shared allocation.
     case resident
+    /// Regression option: one shared allocation with per-tensor byte offsets.
+    case residentFile
     /// Experimental file mapping; performance can differ from resident storage.
     case mapped
 }
 
-/// Retains one weight allocation and immutable inference-input views into it.
+/// Retains weight allocations and immutable inference-input views into them.
 /// Callers must retain the owner for their model lifetime and must not expose
 /// these weight inputs as mutable model state or outputs.
 @available(macOS 27.0, *)
@@ -45,10 +47,11 @@ final class CoreAIExternalWeights {
     let values: [String: InferenceFunction.AsyncValue]
 
     private let spec: CoreAIExternalWeightsSpec
-    private let buffer: any MTLBuffer
+    private let buffers: [any MTLBuffer]
 
-    /// Integrity verification is opt-in. It hashes the resident/mapped bytes,
-    /// including each declared slice, without rereading a second file copy.
+    /// Integrity verification is opt-in. Per-tensor storage streams the complete
+    /// file hash (including padding) with bounded scratch space, then verifies
+    /// each loaded tensor. Whole-file storage hashes its existing allocation.
     init(spec: CoreAIExternalWeightsSpec, baseURL: URL, device: any MTLDevice,
          storage: CoreAIExternalWeightStorage = .resident, verifyIntegrity: Bool = false) throws {
         let logicalBytes = try Self.validateMetadata(spec)
@@ -72,15 +75,17 @@ final class CoreAIExternalWeights {
             throw Self.invalid("Weight file must be regular and match its declared byteLength")
         }
 
-        let allocation: any MTLBuffer
+        let fileAllocation: (any MTLBuffer)?
         switch storage {
         case .resident:
+            fileAllocation = nil
+        case .residentFile:
             guard spec.byteLength <= device.maxBufferLength,
                   let created = device.makeBuffer(length: spec.byteLength, options: .storageModeShared) else {
                 throw Self.invalid("Cannot allocate the resident external-weight buffer")
             }
             try Self.readExactly(descriptor, into: created.contents(), count: spec.byteLength, path: url.path)
-            allocation = created
+            fileAllocation = created
         case .mapped:
             let page = Int(getpagesize())
             guard page > 0 else { throw Self.invalid("Invalid virtual-memory page size") }
@@ -99,24 +104,49 @@ final class CoreAIExternalWeights {
                 _ = munmap(address, mappingLength)
                 throw Self.invalid("Cannot wrap the mapped external-weight file in a Metal buffer")
             }
-            allocation = created
+            fileAllocation = created
         }
         if verifyIntegrity {
-            guard try Self.digest(allocation.contents(), count: spec.byteLength) == spec.sha256.lowercased() else {
+            let fileDigest: String
+            if let fileAllocation {
+                fileDigest = try Self.digest(fileAllocation.contents(), count: spec.byteLength)
+            } else {
+                fileDigest = try Self.digestFile(descriptor, count: spec.byteLength, path: url.path)
+            }
+            guard fileDigest == spec.sha256.lowercased() else {
                 throw Self.invalid("External-weight file SHA256 differs from the manifest")
             }
-            for entry in spec.buffers {
-                guard try Self.digest(allocation.contents().advanced(by: entry.byteOffset), count: entry.byteLength)
+        }
+        var allocations: [any MTLBuffer] = []
+        if let fileAllocation { allocations.append(fileAllocation) }
+        var views: [String: InferenceFunction.AsyncValue] = [:]
+        for entry in spec.buffers {
+            try Task.checkCancellation()
+            let allocation: any MTLBuffer
+            let byteOffset: Int
+            if let fileAllocation {
+                allocation = fileAllocation
+                byteOffset = entry.byteOffset
+            } else {
+                guard entry.byteLength <= device.maxBufferLength,
+                      let created = device.makeBuffer(length: entry.byteLength, options: .storageModeShared) else {
+                    throw Self.invalid("\(entry.inputName): cannot allocate the resident external-weight tensor")
+                }
+                try Self.readExactly(descriptor, into: created.contents(), count: entry.byteLength,
+                                     path: url.path, fileOffset: entry.byteOffset)
+                allocation = created
+                byteOffset = 0
+                allocations.append(created)
+            }
+            if verifyIntegrity {
+                guard try Self.digest(allocation.contents().advanced(by: byteOffset), count: entry.byteLength)
                         == entry.sha256.lowercased() else {
                     throw Self.invalid("\(entry.inputName): external-weight slice SHA256 differs from the manifest")
                 }
             }
-        }
-        var views: [String: InferenceFunction.AsyncValue] = [:]
-        for entry in spec.buffers {
             let type = try Self.scalarType(entry.dtype)
             views[entry.inputName] = InferenceFunction.AsyncValue(unsafeBuffer: allocation,
-                byteOffset: entry.byteOffset, scalarType: type, shape: entry.shape)
+                byteOffset: byteOffset, scalarType: type, shape: entry.shape)
         }
         self.spec = spec
         self.fileURL = url
@@ -124,7 +154,7 @@ final class CoreAIExternalWeights {
         self.byteLength = spec.byteLength
         self.logicalByteCount = logicalBytes
         self.inputNames = Set(views.keys)
-        self.buffer = allocation
+        self.buffers = allocations
         self.values = views
     }
 
@@ -221,12 +251,12 @@ final class CoreAIExternalWeights {
     }
 
     private static func readExactly(_ descriptor: Int32, into pointer: UnsafeMutableRawPointer,
-                                    count: Int, path: String) throws {
+                                    count: Int, path: String, fileOffset: Int = 0) throws {
         var completed = 0
         while completed < count {
             try Task.checkCancellation()
             let amount = Darwin.pread(descriptor, pointer.advanced(by: completed),
-                                      min(16 * 1024 * 1024, count - completed), off_t(completed))
+                                      min(16 * 1024 * 1024, count - completed), off_t(fileOffset + completed))
             if amount < 0 {
                 if errno == EINTR { continue }
                 throw fileError("pread", path: path)
@@ -234,6 +264,22 @@ final class CoreAIExternalWeights {
             guard amount > 0 else { throw invalid("External-weight file ended during resident loading") }
             completed += amount
         }
+    }
+
+    private static func digestFile(_ descriptor: Int32, count: Int, path: String) throws -> String {
+        var hash = SHA256()
+        var scratch = [UInt8](repeating: 0, count: min(16 * 1024 * 1024, count))
+        try scratch.withUnsafeMutableBytes { buffer in
+            var offset = 0
+            while offset < count {
+                let length = min(buffer.count, count - offset)
+                try readExactly(descriptor, into: buffer.baseAddress!, count: length,
+                                path: path, fileOffset: offset)
+                hash.update(bufferPointer: UnsafeRawBufferPointer(start: buffer.baseAddress!, count: length))
+                offset += length
+            }
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func digest(_ pointer: UnsafeRawPointer, count: Int) throws -> String {

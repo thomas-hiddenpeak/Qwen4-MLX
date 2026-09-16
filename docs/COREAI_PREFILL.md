@@ -60,15 +60,26 @@ GDN小尺寸状态连续/重置/恢复检查通过；QSA真实offset8192的chunk
 
 ## 共享图与显式常驻权重
 
-`export_coreai_pd_shared.py --baseline-pd <完整v1目录> --output <新目录>`导出v2格式：48份原量化权重、3份通用decoder图（GDN、含PLE的GDN、QSA），各层保持独立状态。Swift同时支持v1/v2；每份v2权重由长期持有的shared MTLBuffer拥有，加载时直接pread，不在每个token重读文件。权重格式检查覆盖路径、文件大小、dtype、offset、溢出和重叠；显式完整性验证可检查文件及分片哈希。几何常量仍留在图内，学习权重全部成为命名输入。
+`export_coreai_pd_shared.py --baseline-pd <完整v1目录> --output <新目录>`导出v2格式：48份原量化权重、3份通用decoder图（GDN、含PLE的GDN、QSA），各层保持独立状态。Swift同时支持v1/v2；每份v2权重由长期持有的shared MTLBuffer集合拥有，加载时直接pread，不在每个token重读文件。权重格式检查覆盖路径、文件大小、dtype、offset、溢出和重叠；显式完整性验证可检查文件及分片哈希。几何常量仍留在图内，学习权重全部成为命名输入。
 
 首个完整11,057-token v2测试完成两轮：prefill分别129.79s/85.19token/s及121.25s/91.19token/s，加载16.34s，采样physical footprint峰值109.72GiB。没有prefix命中或MTP；第二轮仅OS文件缓存变热。两轮重置后logits一致、两token输出一致，但这不是源模型质量验收。该版本仍未达到1000token/s。
 
 后续独立定位得到两个可重复结果：
 
 - `--flat-q4`将九个专家权重输入改为rank1，Metal显式按原行序寻址；名字、dtype、字节及存储顺序不变。相同S2048量化投影由12.74ms降到7.01ms；完整layer0由约74.7ms降到45.5ms，输出和两项状态逐值一致。这是常驻外部权重场景的收益，不能与之前常量权重寻址实验混为一谈。
-- `coreai_head_metal.py`及独立导出器保持HC与LastHead，使用FP16权重、FP32累加/输出的GEMV，避免整份输出权重转换成FP32。十入口head仅加载的graphics footprint由25.56GB降到0.132GB；同输入单次head由12.8ms降到3.75ms。设备logits对原head relative L2约0.000170，首选token相同，尚需区分HC与归约次序误差，不宣称逐值等价。
+- `coreai_head_metal.py`及独立导出器保持HC与LastHead，使用FP16权重、FP32累加/输出的GEMV，避免整份输出权重转换成FP32。十入口head仅加载的graphics footprint由25.56GB降到0.132GB；同输入单次head由12.8ms降到3.75ms。完整候选head的S1/S2048 logits逐值一致；对原head relative L2为`1.6990e-4`、maxAbs为`8.8215e-4`，对CPU参考分别为`4.5772e-4`、`0.0025303`，**未通过预先设定的`1e-5`/`0.0005`门槛**。首选token相同不代替数值或质量验收；证据为`head-metal-fp32-real/device-summary.json`。
+
+随后使用相同真实词表权重和同一份FP16 mixed输入，绕过HC，单独比较原FP32 linear与新Metal投影。设备候选对原投影relative L2为`1.3767e-7`、maxAbs为`7.1526e-7`；对CPU参考relative L2为`1.3046e-7`，通过原门槛。CPU模拟32-lane求和也只有`1.3046e-7`相对误差。12份完整head设备配置及S1 JSON fixture的末尾输入均逐字节一致，排除了不同输入后缀。证据为`head-projection-fp32-real/device-summary.json`、`manifest.json`及`fixture-audit.json`，可用`scripts/export_coreai_head_projection.py`重新导出。该对照把完整head的较大差异收窄到HC或其与投影连接的图上下文，尚未定位具体编译优化、融合或舍入行为；不能把差异直接归因于GEMV求和顺序，也不宣称HC问题已解决。
 
 `external_call_stage_milliseconds`进一步拆分共享图的提交、等待计算及提取NDArray时间，按prefill/decode分别汇总并记录逐块差值。它们是宿主阶段耗时，不是GPU硬件计数器。
 
 PLE大批量SSD读取对重复行去重，并以最多8个worker执行pread；S1维持串行小请求路径。结果和错误顺序保持原请求语义，14项小文件测试覆盖FP8/BF16、重复行、边界、截断及失败恢复。尚不把读取实现变化视为端到端性能达标。
+
+
+### 权重缓冲区修复后的完整结果
+
+只改变权重的拥有/绑定方式，独立设备对照同一flat layer0：一份整文件缓冲区加多个偏移为158.7ms（复测144.4ms），每个张量独立缓冲区且绑定偏移为0是45.8ms（复测45.7ms）。全部输出/状态逐值一致，进程内存占用基本相同。没有把这个现象归因于已证实的某个CoreAI内部复制机制。
+
+生产`.resident`因此改为逐张量直接pread到独立shared MTLBuffer，文件仍按原offset读取；`.residentFile`保留旧分配方式供对照，`.mapped`保留实验用途。41项实际生产loader检查通过，包含三种模式、视图持有生命周期，以及填充区损坏时的整文件哈希拒绝。
+
+相同11,057-token完整模型两轮prefill为**19.33s/571.9token/s**与**17.64s/626.6token/s**，模型加载8.07s，采样峰值80.31GiB。两轮均重新计算完整prompt，无KV/prefix命中、无MTP；第二轮OS文件缓存热。两轮重置输出一致，decode单步分别0.148s/0.123s，单步不能视为稳态decode吞吐。短尾块S32/S16/S1降到约0.24/0.20/0.16s，消除了原来接近9s/块的固定开销。**完整prefill仍未达1000token/s**；下一步测试更大块及其独立kernel。证据`full-agent-11k-per-tensor.json`、`full-agent-11k-per-tensor-memory.json`及`external-layer0/flat-buffer-layout-summary.json`。
