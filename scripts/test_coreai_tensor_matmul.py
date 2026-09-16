@@ -9,6 +9,10 @@ from coreai_tensor_matmul import TensorLinear, export_smoke, get_tensor_kernel, 
 
 
 class TensorMatmulTests(unittest.TestCase):
+    def test_default_and_explicit_tiles_share_one_custom_op_registration(self):
+        self.assertIs(get_tensor_kernel(), get_tensor_kernel(32, 64))
+        self.assertIs(get_tensor_kernel(), get_tensor_kernel(tile_n=64, tile_m=32))
+
     def test_rectangular_transpose_and_fp16_boundary(self):
         # Exactly representable small operands: independent Float64 oracle also
         # detects a transposition or output-axis mistake without a loose tolerance.

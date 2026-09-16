@@ -34,7 +34,8 @@ WEIGHT_DTYPES = {torch.float16, torch.float32, torch.int16, torch.int32}
 def authoring_source_hashes():
     """Record the optional flat implementation alongside the original math."""
     hashes = _pd_authoring_source_hashes()
-    hashes['coreai_q4_flat'] = sha256_file(Path(__file__).with_name('coreai_q4_flat.py'))
+    for name in ('coreai_q4_flat', 'coreai_expert_grouping', 'coreai_head_metal', 'export_coreai_top_chunks'):
+        hashes[name] = sha256_file(Path(__file__).with_name(name + '.py'))
     return hashes
 
 
@@ -120,7 +121,7 @@ def geometry_signature(geometry):
 
 
 def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gateup,
-                        moe_tile=(16, 32, 64), flat_q4=False):
+                        moe_tile=(16, 32, 64), flat_q4=False, integer_grouping=False):
     """Construct unchanged tensor-PD math; reusable by component diagnostics."""
     from coreai_q4_metal import MetalPackedQ4, get_q4_kernel
     from coreai_moe_chunk import ChunkQ4MoE
@@ -175,6 +176,9 @@ def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gat
     if flat_q4:
         from coreai_q4_flat import flatten_moe_weights
         kernels += flatten_moe_weights(module)
+    if integer_grouping:
+        from coreai_expert_grouping import enable_integer_grouping
+        kernels += enable_integer_grouping(module)
     return module, kind, states, bindings, geometry, kernels
 
 
@@ -246,6 +250,30 @@ def validate_baseline(manifest):
     return [('main', 1), ('prefill', chunk)] + [(f'prefill_s{size}', size) for size in sorted(tails)]
 
 
+def resolve_phases(baseline, chunk=None, *, integer_grouping=False):
+    """Inherit a verified v1 geometry while optionally enlarging v2 prefill."""
+    inherited = validate_baseline(baseline)
+    if chunk is None:
+        return inherited
+    if chunk not in (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+        raise ValueError('Unsupported shared prefill chunk')
+    if chunk > 2048 and not integer_grouping:
+        raise ValueError('Chunks above2048 require --integer-grouping')
+    if chunk > baseline['capacity']:
+        raise ValueError('Chunk exceeds inherited cache capacity')
+    tails = {size for _, size in inherited if 1 < size < chunk}
+    # When8192 is primary,4096 is also useful as an exact unpadded tail.
+    if chunk == 8192:
+        tails.add(4096)
+    return [('main', 1), ('prefill', chunk)] + [(f'prefill_s{size}', size) for size in sorted(tails)]
+
+
+def _boolean_option(value):
+    if value.lower() not in ('true', 'false'):
+        raise argparse.ArgumentTypeError('Expected true or false')
+    return value.lower() == 'true'
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline-pd', type=Path, required=True, help='Completed v1 PD directory; numerical options are inherited')
@@ -254,12 +282,18 @@ def main(argv=None):
     parser.add_argument('--components', nargs='+', choices=('layers', 'embedding', 'head'), default=['layers', 'embedding', 'head'])
     parser.add_argument('--metal-weight-inputs', action='store_true', help='Optional explicit MTLBuffer IO constraint; no demonstrated speed benefit')
     parser.add_argument('--flat-q4', action='store_true', help='Use rank-one external Q4 buffers and explicit kernel addressing; preserves packed bytes')
+    parser.add_argument('--integer-grouping', action='store_true', help='Use stable I32 expert grouping; required for chunks above2048')
+    parser.add_argument('--chunk', type=int, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+                        help='Override primary chunk while inheriting v1 capacity/geometry and smaller phases')
+    parser.add_argument('--metal-head', type=_boolean_option, nargs='?', const=True, default=False,
+                        help='Optional true/false FP32-output Metal head; omitted keeps original F.linear math')
     args = parser.parse_args(argv)
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
     baseline_path = args.baseline_pd / 'manifest.json'
     baseline = json.loads(baseline_path.read_text())
-    phases = validate_baseline(baseline)
+    inherited_phases = validate_baseline(baseline)
+    phases = resolve_phases(baseline, args.chunk, integer_grouping=args.integer_grouping)
     layers = list(range(48)) if args.layers is None else [int(value) for value in args.layers.split(',')]
     if not layers or len(set(layers)) != len(layers) or any(index not in range(48) for index in layers):
         raise ValueError('Invalid layer selection')
@@ -288,8 +322,13 @@ def main(argv=None):
         sourcePDDirectory=str(args.baseline_pd.resolve()), sourcePDManifestSHA256=sha256_file(baseline_path),
         exporterSHA256=sha256_file(Path(__file__)), authoringSourceSHA256=authoring_source_hashes(),
         metalWeightInputs=args.metal_weight_inputs, flatQ4=args.flat_q4,
-        weightStorage={'byteOrder': 'little', 'alignment': ALIGNMENT, 'recommendedRuntimeOwner': 'residentMTLBuffer',
-                       'mappingPolicy': 'Per-layer bytes are owned explicitly; graph/function objects shared by kind/PLE'},
+        integerExpertGrouping=args.integer_grouping,
+        tokenChunk=dict(phases)['prefill'], tailChunks=[count for name, count in phases if name.startswith('prefill_s')],
+        headProjection=('metal-fp16-weights-fp32-logits' if args.metal_head
+                        else 'original-linear' if phases != inherited_phases
+                        else baseline.get('headProjection', 'original-linear')),
+        weightStorage={'byteOrder': 'little', 'alignment': ALIGNMENT, 'recommendedRuntimeOwner': 'residentPerTensorMTLBuffer',
+                       'mappingPolicy': 'Each weight tensor owns a shared buffer bound at offset zero; graphs are shared by kind/PLE'},
         limitations=['New external-weight execution requires separate device/quality/performance validation.',
                      'No full-model or1000tokens/s acceptance implied by CPU export.'])
     manifest['baselineAuthoringSourceSHA256'] = baseline.get('authoringSourceSHA256', {})
@@ -305,7 +344,8 @@ def main(argv=None):
             source = Source(index)
             module, kind, states, bindings, geometry_names, kernels = build_decoder_layer(source, config,
                 baseline['capacity'], prefill_sdpa_fp16=baseline['prefillSDPA'] == 'float16',
-                fuse_gateup=baseline['fusedGateUp'], moe_tile=tuple(baseline['moeTile']), flat_q4=args.flat_q4)
+                fuse_gateup=baseline['fusedGateUp'], moe_tile=tuple(baseline['moeTile']), flat_q4=args.flat_q4,
+                integer_grouping=args.integer_grouping)
             named, geometry = externalizable_buffers(module, geometry_names)
             key = kind + ('-ple' if module.ple is not None else '')
             weights = write_aligned_weights(args.output / f'layer-{index:02d}.weights.bin', named)
@@ -343,8 +383,18 @@ def main(argv=None):
                   f'{time.perf_counter()-layer_start:.2f}s', flush=True)
             del module, named, geometry, states, source
             gc.collect()
+    top_reexport = [name for name in ('embedding', 'head') if name in args.components
+                    and (phases != inherited_phases or (name == 'head' and args.metal_head))]
+    if top_reexport:
+        from export_coreai_top_chunks import export_top_group
+        top = export_top_group(args.output, dict(phases), c, components=tuple(top_reexport), metal_head=args.metal_head)
+        manifest['assets'].update(top['assets'])
+        manifest['topSourceTensorReads'] = top['sourceSlices']
+        atomic_manifest(path, manifest)
     for name in ('embedding', 'head'):
         if name not in args.components:
+            continue
+        if name in top_reexport:
             continue
         asset = baseline['assets'][name]
         verify_recorded_asset(args.baseline_pd, asset)

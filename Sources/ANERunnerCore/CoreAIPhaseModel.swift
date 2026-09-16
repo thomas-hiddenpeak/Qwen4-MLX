@@ -49,6 +49,7 @@ private struct PhaseManifest: Decodable {
     let capacity: Int
     let tokenChunk: Int
     let tailChunks: [Int]?
+    let integerExpertGrouping: Bool?
     let hiddenSize: Int
     let streamCount: Int
     let vocabularySize: Int
@@ -143,14 +144,15 @@ public final class CoreAIPhaseModel {
         }
         let manifest = try JSONDecoder().decode(PhaseManifest.self, from: Data(contentsOf: manifestURL))
         let tailChunks = manifest.tailChunks ?? []
-        let allowedPrimary: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-        let allowedTails: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        let allowedPrimary: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        let allowedTails: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
         let sharedGraphs = manifest.version == 2 && manifest.backend == "native-coreai-pd-shared"
         let constantGraphs = manifest.version == 1 && manifest.backend == "native-coreai-pd"
         guard sharedGraphs || constantGraphs, manifest.status == "complete",
               manifest.completeModelLayerSet, manifest.layers.count == 48,
               Set(manifest.layers.map(\.index)) == Set(0..<48),
               allowedPrimary.contains(manifest.tokenChunk),
+              manifest.tokenChunk <= 2048 || manifest.integerExpertGrouping == true,
               Set(tailChunks).count == tailChunks.count,
               tailChunks.allSatisfy({ allowedTails.contains($0) && $0 < manifest.tokenChunk }),
               manifest.hiddenSize == 2560, manifest.streamCount == 4,

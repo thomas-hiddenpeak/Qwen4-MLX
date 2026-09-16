@@ -73,6 +73,7 @@ class ChunkQ4MoE(torch.nn.Module):
         self.block, self.columns, self.inner = block, columns, inner
         self.fuse_gateup = fuse_gateup
         self.flat_weights = False
+        self.integer_grouping = False
         get_plan_kernel(self.experts, block)
         get_grouped_kernel(block, columns, inner)
         if fuse_gateup:
@@ -84,15 +85,19 @@ class ChunkQ4MoE(torch.nn.Module):
         self.decode = original
 
     def custom_kernels(self):
+        grouping_kernels = []
+        if self.integer_grouping:
+            from coreai_expert_grouping import get_integer_grouping_kernels
+            grouping_kernels = list(get_integer_grouping_kernels(self.experts))
         if self.flat_weights:
             from coreai_q4_flat import flat_moe_kernels
-            return [get_plan_kernel(self.experts, self.block), get_tensor_kernel(), *flat_moe_kernels(self)]
+            return [get_plan_kernel(self.experts, self.block), get_tensor_kernel(), *flat_moe_kernels(self), *grouping_kernels]
         kernels = [get_plan_kernel(self.experts, self.block),
                 get_grouped_kernel(self.block, self.columns, self.inner),
                 get_tensor_kernel(), get_q4_kernel()]
         if self.fuse_gateup:
             kernels.append(get_gateup_kernel(self.block, self.columns, self.inner))
-        return kernels
+        return kernels + grouping_kernels
 
     def routing(self, x):
         count = x.shape[1]
@@ -120,8 +125,9 @@ class ChunkQ4MoE(torch.nn.Module):
                               self.block, self.columns, self.inner)
 
     def forward(self, x):
-        if x.dtype != torch.float16 or x.ndim != 3 or x.shape[0] != 1 or x.shape[2] != self.hidden or not 1 <= x.shape[1] <= MAX_CHUNK:
-            raise ValueError('Expected FP16 x[1,S,hidden] with 1 <= S <= 2048')
+        maximum = 8192 if self.integer_grouping else MAX_CHUNK
+        if x.dtype != torch.float16 or x.ndim != 3 or x.shape[0] != 1 or x.shape[2] != self.hidden or not 1 <= x.shape[1] <= maximum:
+            raise ValueError(f'Expected FP16 x[1,S,hidden] with 1 <= S <= {maximum}')
         if x.shape[1] == 1:
             return self.decode(x)[:3]
         count = x.shape[1]
@@ -130,8 +136,14 @@ class ChunkQ4MoE(torch.nn.Module):
         # Ties can occur between token assignments to the same expert. Stable
         # sorting preserves token order; routing ties themselves were resolved
         # by explicit lowest expert ID before this execution-only permutation.
-        permutation, inverse = grouping_permutations(flat_ids, self.experts)
-        sorted_ids = torch.index_select(flat_ids, 0, permutation)
+        if self.integer_grouping:
+            from coreai_expert_grouping import integer_grouping
+            permutation, inverse, sorted_ids = integer_grouping(flat_ids, self.experts)
+            # The grouping contract stays I32; PyTorch gather indexing uses I64.
+            permutation, inverse = permutation.long(), inverse.long()
+        else:
+            permutation, inverse = grouping_permutations(flat_ids, self.experts)
+            sorted_ids = torch.index_select(flat_ids, 0, permutation)
         tokens = torch.div(permutation, self.top_k, rounding_mode='floor')
         ordered_x = torch.index_select(x.reshape(count, self.hidden), 0, tokens)
         plan = make_plan(sorted_ids, self.experts, self.block)

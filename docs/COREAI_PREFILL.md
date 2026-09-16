@@ -83,3 +83,12 @@ PLE大批量SSD读取对重复行去重，并以最多8个worker执行pread；S1
 生产`.resident`因此改为逐张量直接pread到独立shared MTLBuffer，文件仍按原offset读取；`.residentFile`保留旧分配方式供对照，`.mapped`保留实验用途。41项实际生产loader检查通过，包含三种模式、视图持有生命周期，以及填充区损坏时的整文件哈希拒绝。
 
 相同11,057-token完整模型两轮prefill为**19.33s/571.9token/s**与**17.64s/626.6token/s**，模型加载8.07s，采样峰值80.31GiB。两轮均重新计算完整prompt，无KV/prefix命中、无MTP；第二轮OS文件缓存热。两轮重置输出一致，decode单步分别0.148s/0.123s，单步不能视为稳态decode吞吐。短尾块S32/S16/S1降到约0.24/0.20/0.16s，消除了原来接近9s/块的固定开销。**完整prefill仍未达1000token/s**；下一步测试更大块及其独立kernel。证据`full-agent-11k-per-tensor.json`、`full-agent-11k-per-tensor-memory.json`及`external-layer0/flat-buffer-layout-summary.json`。
+
+
+### 更大块与整数专家分组
+
+共享导出器支持`--integer-grouping --chunk 4096`或`8192`，可与`--flat-q4 --metal-head true`组合。三步I32分组通过block histogram、exclusive prefix和原序scatter生成permutation/inverse/sorted IDs，避免FP32唯一排序键的精度上限；路由本身不变。529、40960、81920项分别测试混合ID、单专家与降序重复输入，三项设备输出均与独立整数稳定排序参考完全一致。大块导出重新生成匹配的embedding/head入口，Swift只在manifest明确声明整数分组时接受大于2048的主块。
+
+完整11K测试中，4096主块热态18.739s/590.1token/s，8192主块23.143s/477.8token/s，均未优于2048主块17.645s/626.6token/s。采样峰值分别88.02GiB和101.22GiB；不据此认定具体内存或算力瓶颈。大块能力保留为可选实验，不提升为性能默认配置。所有场景均重算完整prompt，两轮文本输出一致；这仍不是源模型质量验收。
+
+进一步head诊断中，两实现返回的FP16 mixed逐值一致；用实际mixed和真实权重进行FP32 CPU线性重放，Metal logits的relative L2为1.31e-7，而原图内投影为1.70e-4。新kernel符合声明的FP16输入边界；原图内部为何与显式边界重放不同仍未定位，不宣称已证明某种编译融合机制。设备mixed相对CPU HC仍有差异，需独立的整模型质量验收。证据`head-mixed-diagnostic/cpu-device-mixed-replay.json`。

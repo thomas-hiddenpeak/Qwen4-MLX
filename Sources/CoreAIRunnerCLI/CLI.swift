@@ -67,8 +67,8 @@ struct CoreAIRunnerCLI {
     #if canImport(CoreAI)
     private static func prefillChunkOption(_ options: [String: String]) throws -> Int {
         guard let value = Int(options["--prefill-chunk"] ?? "0"),
-              [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048].contains(value) else {
-            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic) or an exported size: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, or 2048")
+              [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192].contains(value) else {
+            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic) or an exported size: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, or 8192")
         }
         guard value <= 1 || options["--pd-manifest"]?.isEmpty == false else {
             throw NativeCLIError.invalid("Chunked prefill requires a PD manifest")

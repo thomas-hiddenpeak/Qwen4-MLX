@@ -60,8 +60,14 @@ def matrix_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.linear(x.float(), weight.float()).half()
 
 
-@cache
 def get_tensor_kernel(tile_m: int = 32, tile_n: int = 64):
+    # Normalize defaults before caching. () and (32, 64) must not register two
+    # different TorchMetalKernel objects under the same torch custom-op name.
+    return _tensor_kernel(tile_m, tile_n)
+
+
+@cache
+def _tensor_kernel(tile_m: int, tile_n: int):
     from coreai.authoring import MetalParameter
     from coreai_torch import TorchMetalKernel
     if tile_m not in (16, 32, 64) or tile_n not in (32, 64):
