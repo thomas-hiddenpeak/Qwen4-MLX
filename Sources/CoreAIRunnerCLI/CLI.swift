@@ -20,15 +20,16 @@ struct CoreAIRunnerCLI {
                 coreai-runner generate --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH --prompt TEXT \
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
-                  [--pd-manifest PATH] [--prefill-chunk 1|4] [--compare-prefill true]
+                  [--pd-manifest PATH] [--prefill-chunk 0|1|PRIMARY] [--compare-prefill true]
                 coreai-runner serve --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
                   [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
                   [--request-timeout-seconds 1800] [--max-pending-requests 2]
-                  [--pd-manifest PATH] [--prefill-chunk 0|1|4]
+                  [--pd-manifest PATH] [--prefill-chunk 0|1|PRIMARY]
                 Complete CoreAI text inference. CPU handles tokenization, SSD rows and greedy selection.
                 Requires macOS 27. The selected manifest sets context capacity.
-                generate accepts --prompt-file instead of --prompt. Compare runs S1/S4/S4/S1.
+                generate accepts --prompt-file instead of --prompt. Chunk 0 selects the manifest primary.
+                Primary chunks: 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048. Compare runs S1/primary/primary/S1.
                 """)
                 return
             }
@@ -62,8 +63,20 @@ struct CoreAIRunnerCLI {
     }
 
     #if canImport(CoreAI)
+    private static func prefillChunkOption(_ options: [String: String]) throws -> Int {
+        guard let value = Int(options["--prefill-chunk"] ?? "0"),
+              [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048].contains(value) else {
+            throw NativeCLIError.invalid("prefill-chunk must be 0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, or 2048")
+        }
+        guard value <= 1 || options["--pd-manifest"]?.isEmpty == false else {
+            throw NativeCLIError.invalid("Chunked prefill requires a PD manifest")
+        }
+        return value
+    }
+
     @available(macOS 27.0, *)
     private static func serve(_ options: [String: String]) async throws {
+        let requestedChunk = try prefillChunkOption(options)
         func path(_ key: String) throws -> URL {
             guard let value = options[key], !value.isEmpty else { throw NativeCLIError.invalid("Missing \(key)") }
             return URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath()
@@ -81,11 +94,7 @@ struct CoreAIRunnerCLI {
             maxPendingRequests: number("--max-pending-requests", 2, 1...8),
             maxOutputBytes: number("--max-output-bytes", 65_536, 4096...1_048_576))
         if options["--pd-manifest"] != nil { configuration.pdManifest = try path("--pd-manifest") }
-        configuration.prefillChunk = try number("--prefill-chunk", 0, 0...4)
-        guard [0, 1, 4].contains(configuration.prefillChunk),
-              configuration.pdManifest != nil || configuration.prefillChunk != 4 else {
-            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic), 1, or 4 with a PD manifest")
-        }
+        configuration.prefillChunk = requestedChunk
         let host = options["--host"] ?? "127.0.0.1"
         guard ["127.0.0.1", "0.0.0.0"].contains(host) else {
             throw NativeCLIError.invalid("--host must be 127.0.0.1 or 0.0.0.0")
@@ -115,6 +124,10 @@ struct CoreAIRunnerCLI {
               ["true", "false"].contains(options["--compare-prefill"] ?? "false") else {
             throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...4, raw-prompt true/false")
         }
+        let requestedChunk = try prefillChunkOption(options)
+        guard options["--compare-prefill"] != "true" || options["--pd-manifest"]?.isEmpty == false else {
+            throw NativeCLIError.invalid("compare-prefill requires a PD manifest")
+        }
         let directory = URL(fileURLWithPath: try require("--model-dir")).standardizedFileURL.resolvingSymlinksInPath()
         let config = try QwenConfiguration(modelDirectory: directory)
         let tokenizer = try QwenTokenizer(modelDirectory: directory)
@@ -138,11 +151,6 @@ struct CoreAIRunnerCLI {
               table.scale == Float(config.ngramScale), config.pleLayerIndices == [1] else {
             throw NativeCLIError.invalid("PLE table does not match model configuration")
         }
-        let chunk = Int(options["--prefill-chunk"] ?? (options["--pd-manifest"] == nil ? "1" : "4")) ?? 0
-        guard chunk == 1 || (chunk == 4 && options["--pd-manifest"] != nil),
-              options["--compare-prefill"] != "true" || options["--pd-manifest"] != nil else {
-            throw NativeCLIError.invalid("S4 and compare-prefill require a PD manifest; prefill-chunk must be 1 or 4")
-        }
         let loadStart = DispatchTime.now().uptimeNanoseconds
         progress("Loading CoreAI runtime")
         let model = try await CoreAITextRuntime(
@@ -158,9 +166,7 @@ struct CoreAIRunnerCLI {
             throw NativeCLIError.invalid("Model identity mismatch or prompt/output exceeds exported capacity")
         }
         let loadSeconds = seconds(loadStart)
-        guard chunk == 1 || chunk == model.prefillChunkSize else {
-            throw NativeCLIError.invalid("prefill-chunk must be 1 or the exported chunk size")
-        }
+        let chunk = try model.resolvedPrefillChunkSize(requested: requestedChunk)
         let chunks = options["--compare-prefill"] == "true" ? [1, model.prefillChunkSize, model.prefillChunkSize, 1] : Array(repeating: chunk, count: repeats)
         var runs = [[String: Any]](), first = [Int32](), firstLogits = [Float]()
         for run in chunks.indices {
@@ -181,7 +187,7 @@ struct CoreAIRunnerCLI {
             var logits = [Float]()
             var position = 0, chunkCount = 0
             while position < tokens.count {
-                let count = tokens.count - position >= chunks[run] ? chunks[run] : 1
+                let count = try model.nextPrefillChunkSize(remaining: tokens.count - position, limit: chunks[run])
                 let batch = Array(tokens[position..<position + count])
                 logits = try await model.prefill(tokens: batch, pleEmbedding: embedding(batch))
                 position += count; chunkCount += 1
@@ -237,6 +243,7 @@ struct CoreAIRunnerCLI {
             "model_directory": directory.path,
             "quality_acceptance": false, "performance_acceptance": false,
             "prefill_chunk_size": model.prefillChunkSize, "independent_pd_functions": model.usesIndependentPhases,
+            "supported_prefill_chunks": model.supportedPrefillChunks,
             "limitations": "Explicit serial phase execution; group times are awaited function wall time, not device kernel profiling. Source BF16 quality equivalence remains unverified."]
         var data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         data.append(0x0a)

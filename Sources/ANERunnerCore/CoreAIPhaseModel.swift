@@ -46,6 +46,7 @@ private struct PhaseManifest: Decodable {
     let completeModelLayerSet: Bool
     let capacity: Int
     let tokenChunk: Int
+    let tailChunks: [Int]?
     let hiddenSize: Int
     let streamCount: Int
     let vocabularySize: Int
@@ -55,7 +56,7 @@ private struct PhaseManifest: Decodable {
     let layers: [Layer]
 }
 
-/// Independent state at a completed S1/S4 boundary. Prompt IDs, CPU n-gram
+/// Independent state at a completed token/chunk boundary. Prompt IDs, CPU n-gram
 /// history and the last logits remain the caller's responsibility.
 @available(macOS 27.0, *)
 public struct CoreAIPhaseSnapshot: Sendable {
@@ -69,7 +70,7 @@ public struct CoreAIPhaseSnapshot: Sendable {
     public let logicalByteCount: Int
 }
 
-/// Complete CoreAI execution with fixed S1 and S4 functions sharing each asset's
+/// Complete CoreAI execution with fixed token/chunk functions sharing each asset's
 /// AIModel owner. Both phases use the same explicit state tensors. Intermediate
 /// activations remain NDArrays; only logits and QSA counters reach the CPU.
 /// Operations are serial and fail closed after a partially completed forward.
@@ -77,8 +78,14 @@ public struct CoreAIPhaseSnapshot: Sendable {
 public final class CoreAIPhaseModel {
     private struct Functions {
         let decode: CoreAIBlockRunner
-        let prefill: CoreAIBlockRunner
-        func runner(count: Int) -> CoreAIBlockRunner { count == 1 ? decode : prefill }
+        let countFunctions: [Int: CoreAIBlockRunner]
+        func runner(count: Int) throws -> CoreAIBlockRunner {
+            if count == 1 { return decode }
+            guard let runner = countFunctions[count] else {
+                throw CoreAIBlockRunnerError.invalidFixture("No CoreAI phase function for \(count) tokens")
+            }
+            return runner
+        }
     }
     private final class LoadedLayer {
         let spec: PhaseManifest.Layer
@@ -95,6 +102,8 @@ public final class CoreAIPhaseModel {
     public let capacity: Int
     public let vocabularySize: Int
     public let tokenChunk: Int
+    /// Descending static chunk sizes, including S1 for every unpadded tail.
+    public let supportedPrefillChunks: [Int]
     public let manifestModelDirectory: URL
     public let sourceConfigSHA256: String
     public let modelLoadMilliseconds: Double
@@ -121,17 +130,25 @@ public final class CoreAIPhaseModel {
             throw CoreAIBlockRunnerError.invalidModel("CoreAI phase manifest must be a local file")
         }
         let manifest = try JSONDecoder().decode(PhaseManifest.self, from: Data(contentsOf: manifestURL))
+        let tailChunks = manifest.tailChunks ?? []
+        let allowedPrimary: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+        let allowedTails: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
         guard manifest.version == 1, manifest.backend == "native-coreai-pd", manifest.status == "complete",
               manifest.completeModelLayerSet, manifest.layers.count == 48,
               Set(manifest.layers.map(\.index)) == Set(0..<48),
-              manifest.tokenChunk == 4, manifest.hiddenSize == 2560, manifest.streamCount == 4,
+              allowedPrimary.contains(manifest.tokenChunk),
+              Set(tailChunks).count == tailChunks.count,
+              tailChunks.allSatisfy({ allowedTails.contains($0) && $0 < manifest.tokenChunk }),
+              manifest.hiddenSize == 2560, manifest.streamCount == 4,
               manifest.vocabularySize == 248320, manifest.capacity > 0,
+              manifest.capacity >= manifest.tokenChunk,
               manifest.capacity <= Int(Int32.max), manifest.capacity.isMultiple(of: 4),
               manifest.modelDirectory.hasPrefix("/"), manifest.configSHA256.count == 64,
               manifest.configSHA256.allSatisfy({ "0123456789abcdef".contains($0) }),
               Set(manifest.assets.keys) == Set(["embedding", "head"]) else {
-            throw CoreAIBlockRunnerError.invalidModel("CoreAI phase execution requires complete S1/S4 assets for all 48 layers")
+            throw CoreAIBlockRunnerError.invalidModel("CoreAI phase execution requires complete supported token/chunk assets for all 48 layers")
         }
+        let supportedCounts = ([1, manifest.tokenChunk] + tailChunks).sorted(by: >)
         let source = URL(fileURLWithPath: manifest.modelDirectory).standardizedFileURL.resolvingSymlinksInPath()
         let configData = try Data(contentsOf: source.appendingPathComponent("config.json"))
         let digest = SHA256.hash(data: configData).map { String(format: "%02x", $0) }.joined()
@@ -164,13 +181,18 @@ public final class CoreAIPhaseModel {
             try Task.checkCancellation()
             let decode = try await CoreAIBlockRunner(modelURL: assetURL(spec), functionName: spec.function,
                                                     computeUnits: computeUnits)
-            let prefill = try CoreAIBlockRunner(sharing: decode, functionName: spec.prefillFunction)
-            for runner in [decode, prefill] {
+            try Self.validateFeatures(decode, spec: spec)
+            var countFunctions: [Int: CoreAIBlockRunner] = [:]
+            for count in supportedCounts where count > 1 {
+                try Task.checkCancellation()
+                let name = count == manifest.tokenChunk ? spec.prefillFunction : "prefill_s\(count)"
+                let runner = try CoreAIBlockRunner(sharing: decode, functionName: name)
                 try Self.validateFeatures(runner, spec: spec)
+                countFunctions[count] = runner
             }
             completed += 1
             progress?(completed, 50)
-            return Functions(decode: decode, prefill: prefill)
+            return Functions(decode: decode, countFunctions: countFunctions)
         }
         let embedding = try await load(manifest.assets["embedding"]!)
         let head = try await load(manifest.assets["head"]!)
@@ -180,7 +202,7 @@ public final class CoreAIPhaseModel {
               manifest.assets["head"]!.outputNames == ["logits"] else {
             throw CoreAIBlockRunnerError.invalidModel("CoreAI phase embedding/head names do not match the runtime")
         }
-        for count in [1, manifest.tokenChunk] {
+        for count in supportedCounts {
             try Self.require(embedding.runner(count: count), input: "token", shape: [count], type: .int32)
             try Self.require(embedding.runner(count: count), output: "stream", shape: [1, count, 10240], type: .float16)
             try Self.require(head.runner(count: count), input: "stream", shape: [1, count, 10240], type: .float16)
@@ -189,8 +211,8 @@ public final class CoreAIPhaseModel {
         var loaded: [LoadedLayer] = []
         for spec in manifest.layers.sorted(by: { $0.index < $1.index }) {
             let functions = try await load(spec.asset)
-            for count in [1, manifest.tokenChunk] {
-                let runner = functions.runner(count: count)
+            for count in supportedCounts {
+                let runner = try functions.runner(count: count)
                 try Self.require(runner, input: "stream", shape: [1, count, 10240], type: .float16)
                 try Self.require(runner, output: "stream_out", shape: [1, count, 10240], type: .float16)
                 if spec.hasPLE {
@@ -209,14 +231,15 @@ public final class CoreAIPhaseModel {
         self.layers = loaded
         self.capacity = manifest.capacity
         self.tokenChunk = manifest.tokenChunk
+        self.supportedPrefillChunks = supportedCounts
         self.vocabularySize = manifest.vocabularySize
         self.manifestModelDirectory = source
         self.sourceConfigSHA256 = digest
         self.modelLoadMilliseconds = CoreAIBlockRunner.milliseconds(since: started)
     }
 
-    /// PLE rows are token-major, 2560 values per token. S4 is for prompt chunks;
-    /// S1 handles prompt remainders and autoregressive decode without padding.
+    /// PLE rows are token-major, 2560 values per token. Every call consumes one
+    /// exported chunk exactly; S1 handles autoregressive decode and small tails.
     public func forward(tokens: [Int32], pleEmbedding: [Float]) async throws -> [Float] {
         try beginOperation()
         defer { endOperation() }
@@ -225,12 +248,12 @@ public final class CoreAIPhaseModel {
         }
         let count = tokens.count
         let unsupported = Set<Int32>([248053, 248054, 248055, 248056, 248057, 248070, 248071, 248076])
-        guard count == 1 || count == tokenChunk,
+        guard supportedPrefillChunks.contains(count),
               offset >= 0, offset <= capacity - count,
               tokens.allSatisfy({ $0 >= 0 && Int($0) < vocabularySize && !unsupported.contains($0) }),
               pleEmbedding.count == count * 2560,
               pleEmbedding.allSatisfy({ $0.isFinite && Float16($0).isFinite }) else {
-            throw CoreAIBlockRunnerError.invalidFixture("Expected S1/S4 supported tokens, finite PLE rows and available context capacity")
+            throw CoreAIBlockRunnerError.invalidFixture("Expected an exported chunk of supported tokens, finite PLE rows and available context capacity")
         }
         try Task.checkCancellation()
         let started = DispatchTime.now().uptimeNanoseconds

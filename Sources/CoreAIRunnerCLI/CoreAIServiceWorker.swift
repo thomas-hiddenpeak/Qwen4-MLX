@@ -50,6 +50,7 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
         var decodeGroupMilliseconds: [String: Double] = [:]
         var independentPDFunctions = false
         var prefillChunkSize = 1
+        var supportedPrefillChunks = [1]
         var progressCompleted = 0
         var progressTotal = 0
         var lastError: String?
@@ -95,6 +96,7 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
         data["prefill_policy"] = status.prefillChunkSize == 1 ? "tokenwise" : "chunked"
         data["independent_pd_functions"] = status.independentPDFunctions
         data["prefill_chunk_size"] = status.prefillChunkSize
+        data["supported_prefill_chunks"] = status.supportedPrefillChunks
         data["pd_scheduling"] = "serial"
         data["prefill_group_milliseconds"] = status.prefillGroupMilliseconds
         data["decode_group_milliseconds"] = status.decodeGroupMilliseconds
@@ -183,6 +185,7 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
                 $0.status.ready = true; $0.status.capacity = session.model.capacity; $0.status.phase = "idle"
                 $0.status.independentPDFunctions = session.model.usesIndependentPhases
                 $0.status.prefillChunkSize = session.prefillChunk
+                $0.status.supportedPrefillChunks = session.model.supportedPrefillChunks
             }
             for await _ in stream {
                 while !Task.isCancelled, let entry = queue.takeNext() {
@@ -286,6 +289,10 @@ private final class CoreAIServiceSession {
 
     init(configuration: CoreAIServiceConfiguration) async throws {
         self.configuration = configuration
+        guard [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048].contains(configuration.prefillChunk),
+              configuration.prefillChunk <= 1 || configuration.pdManifest != nil else {
+            throw QwenGenerationError.invalidRequest("Invalid prefill chunk or missing PD manifest")
+        }
         let directory = configuration.modelDirectory
         let config = try QwenConfiguration(modelDirectory: directory)
         tokenizer = try QwenTokenizer(modelDirectory: directory)
@@ -303,14 +310,7 @@ private final class CoreAIServiceSession {
         model = try await CoreAITextRuntime(attentionManifest: configuration.attentionManifest,
             denseManifest: configuration.denseManifest, moeManifest: configuration.moeManifest,
             pdManifest: configuration.pdManifest)
-        if configuration.prefillChunk == 0 {
-            prefillChunk = model.prefillChunkSize
-        } else if configuration.prefillChunk == 1 || configuration.prefillChunk == model.prefillChunkSize {
-            prefillChunk = configuration.prefillChunk
-        } else {
-            throw QwenGenerationError.invalidRequest(
-                "prefillChunk must be 0 (automatic), 1, or the loaded model chunk \(model.prefillChunkSize)")
-        }
+        prefillChunk = try model.resolvedPrefillChunkSize(requested: configuration.prefillChunk)
         let configSHA = SHA256.hash(data: try Data(contentsOf: directory.appendingPathComponent("config.json")))
             .map { String(format: "%02x", $0) }.joined()
         guard model.manifestModelDirectory == directory, model.sourceConfigSHA256 == configSHA else {
@@ -391,7 +391,8 @@ private final class CoreAIServiceSession {
             try cancellation.check()
             let remaining = tokens.count - position
             let beforeSystemBoundary = systemCount > position ? systemCount - position : remaining
-            let count = remaining >= prefillChunk && beforeSystemBoundary >= prefillChunk ? prefillChunk : 1
+            let count = try model.nextPrefillChunkSize(remaining: remaining, limit: prefillChunk,
+                                                      boundary: beforeSystemBoundary)
             let chunk = Array(tokens[position..<position + count])
             let lookup = try pleRows(tokens: chunk, history: history)
             try cancellation.check()

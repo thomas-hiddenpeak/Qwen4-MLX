@@ -121,6 +121,36 @@ public final class CoreAITextRuntime {
         }
     }
 
+    /// Available functions in descending order; every backend includes S1.
+    public var supportedPrefillChunks: [Int] {
+        switch backend {
+        case .token: return [1]
+        case .phase(let model): return model.supportedPrefillChunks
+        }
+    }
+
+    /// Zero selects the primary chunk. Explicit limits preserve the public
+    /// tokenwise/primary policy; exported smaller functions handle its tails.
+    public func resolvedPrefillChunkSize(requested: Int) throws -> Int {
+        if requested == 0 { return prefillChunkSize }
+        guard requested == 1 || requested == prefillChunkSize else {
+            throw CoreAIBlockRunnerError.invalidFixture(
+                "prefill-chunk must be 0 (automatic), 1, or the exported primary chunk \(prefillChunkSize)")
+        }
+        return requested
+    }
+
+    /// Selects an existing function without padding or crossing a caller-owned
+    /// boundary, such as the end of a system prefix that must be checkpointed.
+    public func nextPrefillChunkSize(remaining: Int, limit: Int, boundary: Int? = nil) throws -> Int {
+        let available = min(remaining, min(limit, boundary ?? remaining))
+        guard remaining > 0, limit > 0, available > 0,
+              let count = supportedPrefillChunks.first(where: { $0 <= available }) else {
+            throw CoreAIBlockRunnerError.invalidFixture("No nonempty prefill chunk fits the remaining tokens and boundary")
+        }
+        return count
+    }
+
     public var usesIndependentPhases: Bool {
         if case .phase = backend { return true }
         return false
@@ -134,13 +164,13 @@ public final class CoreAITextRuntime {
         }
     }
 
-    /// Exactly one S1 or fixed prefill chunk. PLE rows are token-major and pass
+    /// Exactly one exported prefill chunk. PLE rows are token-major and pass
     /// through unchanged. The caller owns tail scheduling; no padding or hidden
     /// token loop changes the model offset or the reported phase call counts.
     public func prefill(tokens: [Int32], pleEmbedding: [Float]) async throws -> [Float] {
-        guard tokens.count == 1 || tokens.count == prefillChunkSize else {
+        guard supportedPrefillChunks.contains(tokens.count) else {
             throw CoreAIBlockRunnerError.invalidFixture(
-                "CoreAI prefill requires one token or exactly \(prefillChunkSize) tokens")
+                "CoreAI prefill requires one exported chunk from \(supportedPrefillChunks)")
         }
         switch backend {
         case .token(let model): return try await model.forward(token: tokens[0], pleEmbedding: pleEmbedding)

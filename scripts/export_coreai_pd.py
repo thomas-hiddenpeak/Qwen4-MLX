@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Author fused CoreAI decoder layers with shared S1/decode and S4/prefill weights.
+"""Author fused CoreAI decoder layers with shared decode and fixed-size prefill weights.
 
 CPU export only. Full expert banks retain original affine Q4 bytes. The last-token
 head avoids vocabulary projection for intermediate prompt positions. State is
@@ -20,6 +20,14 @@ from export_coreai_hybrid import prepare_layer, state_metadata, atomic_manifest
 from export_coreai_q4_moe import load_layer, PROJECTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def phase_linear(x, weight):
+    """Large prompts use TensorOps; S1 retains the existing dense decode path."""
+    if x.shape[1] == 1:
+        return torch.nn.functional.linear(x.float(), weight.float()).half()
+    from coreai_tensor_matmul import tensor_linear
+    return tensor_linear(x, weight)
+
 
 def stable_qsa_linear(self, x, name):
     from coreai_dense_metal import dense_linear
@@ -93,7 +101,14 @@ def export_shared(module, examples, output_names, path, custom_kernels=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--chunk', type=int, default=4, choices=(4, 8, 16))
+    parser.add_argument('--chunk', type=int, default=4, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048))
+    parser.add_argument('--tail-chunks', type=int, nargs='*', default=None,
+                        help='Optional smaller prefill entrypoints; tensor mode defaults to 4/16/64 below main size')
+    parser.add_argument('--prefill-kernels', choices=('reference','tensor'), default='reference',
+                        help='Experimental batched TensorOps, grouped Q4, register GDN and incremental QSA pool')
+    parser.add_argument('--prefill-sdpa', choices=('float32','float16'), default='float32',
+                        help='Tensor prefill SDPA operand type; decode remains float32')
+    parser.add_argument('--fused-gateup', action='store_true', help='Fuse grouped expert gate/up and activation in tensor prefill')
     parser.add_argument('--capacity', type=int, default=4096)
     parser.add_argument('--q4-kernel', choices=('reference', 'metal'), default='reference',
                         help='reference expands selected weights; metal directly computes from packed Q4')
@@ -111,8 +126,18 @@ def main():
     layers = list(range(48)) if args.layers is None else [int(x) for x in args.layers.split(',')]
     if len(set(layers)) != len(layers) or any(x < 0 or x >= 48 for x in layers):
         raise ValueError('Invalid layer subset')
-    if args.capacity < args.chunk or args.capacity > 4096 or args.capacity % 4:
-        raise ValueError('Initial PD capacity must be a multiple of4 no larger than4096')
+    tails = args.tail_chunks if args.tail_chunks is not None else ([s for s in (4,8,16,32,64,128,256,512,1024) if s < args.chunk] if args.prefill_kernels == 'tensor' else [])
+    if len(set(tails)) != len(tails) or any(s not in (4,8,16,32,64,128,256,512,1024) or s >= args.chunk for s in tails):
+        raise ValueError('Tail chunks must be unique supported sizes below the primary chunk')
+    if args.prefill_kernels == 'tensor' and (args.q4_kernel != 'metal' or args.stable_projections):
+        raise ValueError('Tensor prefill requires packed Metal Q4 and excludes stable GEMV projections')
+    if args.prefill_kernels != 'tensor' and (args.prefill_sdpa != 'float32' or args.fused_gateup):
+        raise ValueError('SDPA precision and grouped fusion require tensor prefill')
+    if args.chunk > 16 and args.prefill_kernels != 'tensor':
+        raise ValueError('Large chunks require tensor prefill kernels')
+    if args.capacity < args.chunk or args.capacity > 16384 or args.capacity % 4:
+        raise ValueError('PD capacity must be a multiple of4 no larger than16384')
+    phase_sizes = [('main',1),('prefill',args.chunk)] + [(f'prefill_s{s}',s) for s in sorted(tails)]
     if args.output.exists(): raise FileExistsError('Use a fresh output directory')
     estimated = len(layers) * 1_650_000_000 if 'layers' in args.components else 0
     ancestor = args.output.parent
@@ -121,7 +146,7 @@ def main():
         raise ValueError('Insufficient space for full original-Q4 assets')
     args.output.mkdir(parents=True)
     manifest = {'version':1,'backend':'native-coreai-pd','status':'exporting','completeModelLayerSet':False,
-        'capacity':args.capacity,'tokenChunk':args.chunk,'hiddenSize':c.hidden,'streamCount':c.streams,
+        'capacity':args.capacity,'tokenChunk':args.chunk,'tailChunks':sorted(tails),'prefillKernels':args.prefill_kernels,'prefillSDPA':args.prefill_sdpa,'fusedGateUp':args.fused_gateup,'moeTile':[16,32,64],'hiddenSize':c.hidden,'streamCount':c.streams,
         'vocabularySize':c.vocabulary,'modelDirectory':str(source.directory),'configSHA256':sha256_file(config_path),
         'assets':{},'layers':[], 'exporterSHA256':sha256_file(Path(__file__)), 'q4Kernel':args.q4_kernel,
         'stableProjections':args.stable_projections,
@@ -134,6 +159,19 @@ def main():
         manifest['q4KernelSHA256'] = sha256_file(Path(__file__).with_name('coreai_q4_metal.py'))
     else:
         manifest['limitations'].append('Reference Q4 selected-bank unpack remains unfused.')
+    if args.prefill_kernels == 'tensor':
+        from coreai_tensor_matmul import get_tensor_kernel
+        from coreai_gdn_chunk_metal import get_gdn_recurrence_kernel
+        from coreai_q4_grouped import get_plan_kernel, get_grouped_kernel
+        from coreai_moe_chunk import ChunkQ4MoE
+        from coreai_gdn_chunk import GDNRegisterPrefill
+        from coreai_qsa_chunk import QwenQSAChunk, get_pool_kernel
+        custom_kernels += [get_tensor_kernel(),get_gdn_recurrence_kernel(),get_plan_kernel(),get_grouped_kernel(16,32,64)]
+        if args.fused_gateup:
+            from coreai_q4_gateup import get_gateup_kernel
+            custom_kernels.append(get_gateup_kernel(16,32,64))
+        manifest['prefillKernelSHA256'] = {name:sha256_file(Path(__file__).with_name(name+'.py')) for name in
+            ('coreai_tensor_matmul','coreai_gdn_chunk','coreai_gdn_chunk_metal','coreai_moe_chunk','coreai_q4_grouped','coreai_q4_gateup','coreai_qsa_chunk')}
     if args.stable_projections:
         from coreai_dense_metal import get_dense_kernel
         custom_kernels.append(get_dense_kernel())
@@ -163,14 +201,26 @@ def main():
                         'norm_key.weight','norm_query.weight','norm_conv.weight','conv1d.weight')})
                     states['ple_state'] = torch.zeros(1,c.ple_history,c.width,dtype=torch.float16)
                     bindings['ple_state'] = 'next_ple_state'
+                layer_kernels = list(custom_kernels)
+                if args.prefill_kernels == 'tensor':
+                    moe = ChunkQ4MoE(moe, columns=32, inner=64, fuse_gateup=args.fused_gateup)
+                    if kind == 'gdn':
+                        attention.linear = phase_linear
+                        attention = GDNRegisterPrefill(attention)
+                    else:
+                        attention = QwenQSAChunk(attention, prefill_sdpa_fp16=args.prefill_sdpa == 'float16')
+                        layer_kernels += attention.custom_kernels()[1:]
+                    read_attention.linear = phase_linear
+                    read_moe.linear = phase_linear
+                    if ple is not None: ple.linear = phase_linear
                 module = DecoderLayer(attention,read_attention,moe,read_moe,HCWrite(c),state_count,ple).eval()
                 if args.stable_projections: install_stable_projections(module)
                 examples = {}
-                for name, size in [('main',1),('prefill',args.chunk)]:
+                for name, size in phase_sizes:
                     inputs = {'stream':torch.zeros(1,size,c.width,dtype=torch.float16)}
                     if ple is not None: inputs['ple_embedding'] = torch.zeros(1,size,c.ple_dim,dtype=torch.float16)
                     examples[name] = {**inputs,**states}
-                asset = export_shared(module,examples,('stream_out',*bindings.values()),args.output/f'layer-{layer:02d}-{kind}.aimodel',custom_kernels)
+                asset = export_shared(module,examples,('stream_out',*bindings.values()),args.output/f'layer-{layer:02d}-{kind}.aimodel',layer_kernels)
                 asset.update(index=layer,kind=kind,inputName='stream',outputName='stream_out',expertCount=512,
                     topK=10,completeExpertBank=True,stateBindings=bindings,initialState=state_metadata(states),hasPLE=ple is not None)
                 manifest['layers'].append(asset)
@@ -184,13 +234,13 @@ def main():
             if component == 'embedding':
                 source.prefix=''
                 module=Embedding(c,source.read('language_model.model.embed_tokens.weight')).eval()
-                examples={name:{'token':torch.zeros(size,dtype=torch.int32)} for name,size in [('main',1),('prefill',args.chunk)]}
+                examples={name:{'token':torch.zeros(size,dtype=torch.int32)} for name,size in phase_sizes}
                 names=('stream',)
             else:
                 hc=read_hc(source,'language_model.model.hyper_connection_mixer',with_injection=False)
                 source.prefix=''
                 module=LastHead(Head(c,hc,source.read('language_model.lm_head.weight'))).eval()
-                examples={name:{'stream':torch.zeros(1,size,c.width,dtype=torch.float16)} for name,size in [('main',1),('prefill',args.chunk)]}
+                examples={name:{'stream':torch.zeros(1,size,c.width,dtype=torch.float16)} for name,size in phase_sizes}
                 names=('logits',)
             if args.stable_projections: install_stable_projections(module)
             asset=export_shared(module,examples,names,args.output/f'{component}.aimodel',custom_kernels)
