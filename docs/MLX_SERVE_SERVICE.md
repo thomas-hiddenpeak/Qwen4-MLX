@@ -1,6 +1,6 @@
 # mlx-serve 本机业务服务
 
-2026-09-10。此处是原作者 mlx-serve 的常驻本机服务，独立 Swift/MLX runner 继续独立开发。原生模型配置 `max_position_embeddings=262144`，对应 256 Ki tokens；不是 265000 tokens。上下文是输入与输出的总预算。
+2026-09-10建立，2026-09-16更新监听配置。此处是原作者 mlx-serve 的常驻服务，独立 Swift/MLX runner 继续独立开发。原生模型配置 `max_position_embeddings=262144`，对应 256 Ki tokens；不是 265000 tokens。上下文是输入与输出的总预算。
 
 ## 固定配置
 
@@ -8,7 +8,8 @@
 
 | 参数 | 值与用途 |
 | --- | --- |
-| 地址 | `http://127.0.0.1:11235/v1`，仅本机 |
+| 监听 | `0.0.0.0:11235`，按用户要求直接监听所有IPv4网卡 |
+| 客户端地址 | 本机 `http://127.0.0.1:11235/v1`；其他设备 `http://<Mac局域网IP>:11235/v1` |
 | 模型 | `Qwen3.8-Flash-Next-MLX-SSD-Stream`，4-bit，外置 SSD n-gram |
 | 上下文 | `--ctx-size 262144` |
 | Prefill | `--prefill-chunk 512` |
@@ -19,6 +20,10 @@
 | 投机与观测 | `--no-mtp --no-drafter --no-pld --metrics` |
 
 `/v1/chat/completions` 支持流式输出与 `usage.prompt_tokens_details.cached_tokens`。`/metrics.json` 同时记录实际 prefill token、缓存 token 和分阶段耗时。当前 `/v1/completions` 的流式 usage 未提供缓存明细，验证时使用独占请求期间的指标差值，不伪造请求字段。
+
+`0.0.0.0`是服务端监听配置，不是设备应填写的目标地址；设备上的`127.0.0.1`指设备自己。当前未配置API鉴权，客户端必填API Key时可用`mlx-serve`占位。局域网IP可能随网络变化，应以本机当前地址为准。此前仅绑定局域网IP的11237临时转发已停止，统一使用11235。若环境设置HTTP代理，本机/局域网请求应走直连，例如`curl --noproxy '*' http://127.0.0.1:11235/v1/models`。
+
+2026-09-16切换前核对原服务空闲，只改变host，保留全部模型、262144上下文及缓存参数。新PID51451监听`*:11235`；通过局域网地址串行发送两个相同211-token chat请求，两次均返回`OK`。cold为0 cached/211实际prefill，repeat为180 cached/31实际prefill；usage与metrics差值一致，第二次cache hits增加1。请求墙钟分别约1.510s/0.224s，仅作连通性与有效命中验证。8条/10GiB RAM prefix缓存已启用，SSD prefix缓存仍关闭；重启会清空RAM缓存，本次验证重新填入一份短前缀。记录位于`results/mlx-business-listen-20260916/`，当前恢复ledger指针已同步到业务status，后续实验应保留新的通配监听参数。
 
 模型含 36 层 GDN、12 层 Attention/QSA 和 PLE；缓存必须连同匹配位置的混合检查点一起恢复。满上下文仅 BF16 K/V 约 6 GiB，每个近尾部的混合检查点约 1.04 GiB，故不沿用默认 2 GiB 缓存和最多 32 个检查点。当前限制优先支持顺序追加与重复请求；较早位置的分叉可能找不到保留的检查点而需要重算。缓存配额不是整个进程的物理内存上限。
 

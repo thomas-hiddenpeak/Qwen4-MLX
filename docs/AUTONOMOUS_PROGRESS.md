@@ -1,5 +1,7 @@
 # 自主研究与开发接续
 
+2026-09-16业务配置更新：用户要求mlx-serve直接监听`0.0.0.0:11235`，已写入`config/mlx-serve-business.json`并仅改host重启为PID51451。RAM prefix仍为8项/10GiB、SSD prefix关闭；两次211-token chat实测第二次命中180、实算31，usage/metrics一致。11237临时转发已停止。当前ledger是`results/mlx-business-listen-20260916/run-ledger.json`，且已同步到`../qwen38-ssd/results/experiment-status.json`的`reference_ledger`；后续恢复必须沿用最新记录，下面9月14日的PID及loopback-only配置均为历史。详见[业务服务](MLX_SERVE_SERVICE.md)。
+
 04:53 收尾：本轮已验证的最后代码与结果已提交并推送 `da8f42e2255dd434c7a50c3a86b9bc9a6c08ebca`，远端 `codex/runner-baseline` SHA已核对。没有继续启动模型实验；05:00授权上限前完成服务恢复与收尾，既有 `qwen4-mlx` heartbeat 已通过应用工具设为PAUSED并读回确认。新自主窗口从下述待办继续，不重复执行本轮已完成的长测试。
 
 04:52:09最后服务复核：原作者业务服务PID80349、`127.0.0.1:11235/v1`可访问，argv与本轮最新恢复ledger完全相等，running/waiting0，MTP/drafter关闭；本轮两个Swift测试进程已退出。原始结果 `results/night-final-small-v1/final-service-verification.json`，最新恢复ledger仍是该目录的`run-ledger.json`。用户业务服务保留262144总上下文、chunk512、并发1、8项/10GB RAM前缀缓存、SSD/MTP/drafter/PLD关闭。源码与测试在最后实模冻结后未再改动，仅补正文档的SSD优先级与单tensor暂存边界。

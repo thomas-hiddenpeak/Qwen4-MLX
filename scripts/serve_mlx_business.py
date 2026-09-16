@@ -45,8 +45,9 @@ def main():
         return
     if not os.access(argv[0], os.X_OK):
         parser.error('Configured mlx-serve binary is not built or executable')
+    probe_host = '127.0.0.1' if config['host'] == '0.0.0.0' else config['host']
     try:
-        with socket.create_connection((config['host'], config['port']), timeout=2):
+        with socket.create_connection((probe_host, config['port']), timeout=2):
             parser.error('Service port is occupied; retain or stop the existing service first')
     except ConnectionRefusedError:
         pass
