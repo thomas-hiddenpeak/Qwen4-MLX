@@ -205,13 +205,22 @@ struct CoreAIRunnerCLI {
                     let groups = timingDelta(model.predictionMillisecondsByGroup, since: groupsBefore)
                     let ssdSeconds = readSeconds - readSecondsBefore
                     let functionSeconds = groups.values.reduce(0, +) * 0.001
-                    chunkProfiles.append([
+                    let chunkProfile: [String: Any] = [
                         "tokens": count, "offset_before": position, "offset_after": model.offset,
                         "wall_seconds": chunkSeconds, "ssd_read_seconds": ssdSeconds,
                         "function_await_seconds": functionSeconds,
                         "wall_minus_function_and_ssd_seconds": chunkSeconds - functionSeconds - ssdSeconds,
                         "group_milliseconds": groups,
-                        "layer_milliseconds": timingDelta(model.predictionMillisecondsByLayer, since: layersBefore)])
+                        "layer_milliseconds": timingDelta(model.predictionMillisecondsByLayer, since: layersBefore)]
+                    chunkProfiles.append(chunkProfile)
+                    // Keep completed measurements even if a later chunk fails
+                    // or an oversized experiment must be stopped.
+                    var liveProfile = chunkProfile
+                    liveProfile["event"] = "prefill_chunk"
+                    liveProfile["run"] = run + 1
+                    var liveData = try JSONSerialization.data(withJSONObject: liveProfile, options: [.sortedKeys])
+                    liveData.append(0x0a)
+                    FileHandle.standardError.write(liveData)
                 }
                 position += count; chunkCount += 1
                 if position % 32 == 0 || position == tokens.count { progress("Prefill \(position)/\(tokens.count), run \(run + 1), chunk \(chunks[run])") }

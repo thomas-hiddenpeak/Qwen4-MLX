@@ -42,3 +42,17 @@ GDN小尺寸状态连续/重置/恢复检查通过；QSA真实offset8192的chunk
 `coreai-runner generate --profile-prefill true`记录每块token数、起止offset、墙钟时间、SSD读取、分组函数等待时间和48层明细。层时间已经包含在分组时间内，不能重复相加；这些都是宿主等待时间，不是硬件计数器。`--prefill-chunk`可选择任意已导出的块大小，便于在同一份资产上比较。
 
 导出器只对含SDPA的模块启用externalization，避免其他模块被SDK重复追踪。长导出中断后，可保持原参数并加`--resume`续导；它校验已有资产文件和已记录的配置/源码哈希。仅导出器自身修改时需要显式`--resume-exporter-change`并记录版本关系，其他kernel变化不允许混用。未登记的残留资产会报错，需移开后继续，不会自动删除。
+
+## 稀疏QSA候选与当前内存限制
+
+`--prefill-sdpa float16`是主导出器的可选精度配置；独立QSA导出脚本对应`--prefill-sdpa-fp16`，均保持S1的FP32 SDPA。新实验`coreai_qsa_sparse.py`直接读取选中的块，以MPP QK/PV tile和FP32在线softmax/累计避免全局K/V展开；`coreai_qsa_sparse_full.py`仅替换prefill注意力，保留原索引选择、六项状态、诊断mask和S1路径。**稀疏候选未接入默认导出或服务**。大尺寸`--reference-only`仅生成原FP32参考，不代表已执行候选CPU计算。
+
+| 新测量 | 热态时间 | 结论边界 |
+| --- | ---: | --- |
+| 同输入真实S512注意力 | 稀疏5.2869ms / native FP16复测5.4792ms | 约3.5%孤立算子收益；早先6.10ms基线不能用来宣称稳定13%收益 |
+| 完整真实S512 QSA | 稀疏17.63ms / 较早native FP16 19.44ms | 尚未做交替配对复测，不能当作确定收益 |
+| 合成S2048稀疏注意力 | 21.1136ms | 真实尺寸、top512规模；无同输入配对基线 |
+
+五种小尺寸设备场景均通过；真实S512孤立算子relative L2为0.00008285、maxAbs为0.001953，整层状态连续、重置、checkpoint恢复检查通过。7项CPU测试包含新增整层封装测试，覆盖早期稠密、稀疏、尾块、未来位置、选择顺序和S1保持。实际层输入重放来自既有layer0 MoE捕获，不能称为原生layer3整模型轨迹。证据为`qsa-sparse-smoke-summary.json`、`qsa-sparse-real-s512-device.json`、`qsa-sparse-full-real-s512-device.json`及`qsa-sparse-synthetic-s2048-device.json`；均位于上述results目录。这里没有整模型质量或吞吐验收。
+
+完整11,057-token测试在观测到10,752个token后停止：进程physical footprint达到139.3GB，未取得完整prefill结果。单层仅加载的对照中，包含10个函数的资产graphics footprint约2.36GB；只保留main为0.211GB、只保留prefill为1.067GB、两者共存为1.278GB。权重文件映射规模基本相同，说明保留的函数执行资源/工作区是更强的排查方向，**尚未证明运行时重复了整份权重，也未定位到具体内存arena**。当前优先研究共享通用图与外部权重的所有权和约束，再恢复整模型测量。证据见`full-agent-11k-v1-stopped.json`、`layer0-constant-memory-diagnosis.md`和`footprint-main-prefill.json`。

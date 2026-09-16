@@ -1,6 +1,6 @@
 # CoreAI 本机 Prefill / Decode
 
-这条路径为完整 48 层模型提供两个独立的 CoreAI 函数：`prefill` 一次处理 4 个真实 token，`main` 一次处理 1 个 token。它们共用同一个 `AIModel` 和显式状态，不加载两个完整模型。没有对尾部补假 token；不足 4 个以及 system 前缀快照边界使用 S1。
+这条路径为完整 48 层模型提供独立的 CoreAI 函数：`prefill` 处理导出的主块，`main` 一次处理 1 个 token。它们共用同一个 `AIModel` 和显式状态，不加载两个完整模型。初版主块为S4；当前实验支持S4至S2048及较小尾块函数，按剩余长度和system前缀快照边界选择，不补假token。大块kernel与1000 token/s目标见[Prefill优化](COREAI_PREFILL.md)。
 
 服务内部将 prefill 与 decode 分成独立操作，以一次性 handoff 交接模型 offset、最终 logits、n-gram history 和阶段统计。handoff 绑定会话与请求，取消或 reset 后不可使用。当前调度仍是**单请求串行**：`pd_scheduling=serial`，没有多请求交错、独立部署或跨进程状态传输。
 
@@ -30,7 +30,7 @@ GDN 在块内顺序更新 recurrent state；QSA 为每个位置保持正确 mask
   --compare-prefill true --output results/coreai-pd/compare.json
 ```
 
-指定 PD manifest 时只加载该 manifest 的资产，旧三份 manifest 不额外加载。初版 CLI 仍保留其参数位置。运行时当前只接受完整 S4 资产；导出器额外允许 S8/S16 用于局部实验，不等于服务支持。
+指定 PD manifest 时只加载该 manifest 的资产，旧三份 manifest 不额外加载。CLI仍保留其参数位置。运行时校验完整48层以及全部主块、尾块和S1函数。S32至S2048需用实验性`--prefill-kernels tensor --q4-kernel metal`导出；支持加载不等于完成质量、性能或服务验收。
 
 `--compare-prefill true` 在同一模型实例按 S1、S4、S4、S1 跑四轮，每轮重置所有状态与 n-gram history。报告包含最终 prefill logits 的相对 L2/最大绝对误差、输出 token 是否一致，以及独立的 prefill/decode 耗时。首轮调用可能包含系统编译开销，不能混入热态吞吐比较。
 
@@ -57,4 +57,4 @@ M5 Max / macOS 27，完整 48 层、512 专家、capacity4096。原始文件在�
 
 固定归约对照已完成整模型测试：同一120-token提示词，S1/S4/S4/S1预填分别13.22/4.79/4.82/12.24秒，答案仍为47，但S4/S1最终logits相对L2为0.1171，最大绝对误差1.2753，反而高于普通投影路径。证据 `results/coreai-pd/stable-short.json`。因此保留为关闭的诊断选项，不作为数值修复或吞吐优化路线。
 
-2026-09-17优先级调整：先达到 **10K以上提示词、前缀缓存未命中的完整CoreAI prefill至少1000 token/s**，decode单独统计。S4约23 token/s尚未满足目标。当前推进S128/S256/S512矩阵投影、按专家分组的Q4矩阵乘法、单次调用内完成的GDN递推与QSA增量更新；单kernel通过不等于整模型达到目标。其它性能方向暂缓。
+2026-09-17优先级调整：先达到 **10K以上提示词、前缀缓存未命中的完整CoreAI prefill至少1000 token/s**，decode单独统计。S4约23 token/s尚未满足目标。当前推进大块矩阵投影、按专家分组的Q4矩阵乘法、单次调用内完成的GDN递推与QSA增量更新；单kernel通过不等于整模型达到目标。其它性能方向暂缓，最新结果统一记录在[Prefill优化](COREAI_PREFILL.md)。
