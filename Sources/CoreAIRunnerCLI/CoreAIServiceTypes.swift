@@ -10,6 +10,23 @@ struct CoreAIServiceResult: Sendable {
     let cachedTokens: Int
     let prefillSeconds: Double
     let decodeSeconds: Double
+    let prefillGroupMilliseconds: [String: Double]
+    let decodeGroupMilliseconds: [String: Double]
+
+    init(text: String, finishReason: String, promptTokens: Int, completionTokens: Int,
+         cachedTokens: Int, prefillSeconds: Double, decodeSeconds: Double,
+         prefillGroupMilliseconds: [String: Double] = [:],
+         decodeGroupMilliseconds: [String: Double] = [:]) {
+        self.text = text
+        self.finishReason = finishReason
+        self.promptTokens = promptTokens
+        self.completionTokens = completionTokens
+        self.cachedTokens = cachedTokens
+        self.prefillSeconds = prefillSeconds
+        self.decodeSeconds = decodeSeconds
+        self.prefillGroupMilliseconds = prefillGroupMilliseconds
+        self.decodeGroupMilliseconds = decodeGroupMilliseconds
+    }
 }
 
 enum CoreAIServiceEvent: Sendable {

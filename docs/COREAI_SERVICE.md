@@ -2,7 +2,7 @@
 
 `coreai-runner serve` 为独立 CoreAI runner 提供有限的 OpenAI 兼容 HTTP 接口。全部神经网络计算使用系统 CoreAI；CPU 负责 tokenizer、SSD n-gram 行读取和解码、greedy 选词及网络。可执行目标仅依赖 `ANERunnerCore`，没有 MLX fallback。模型目录名中的 `MLX` 是源资产名称，不表示服务调用 MLX。
 
-当前面向本机和局域网试用：macOS 27、完整模型资产、**4096-token 导出容量、S1 逐 token prefill、单请求串行推理**。容量来自 attention manifest，不是启动参数；4096 资产完整不等于完整模型已通过 4096-token 质量与性能验收。`quality_acceptance` 和 `hardware_placement_verified` 仍为 `false`。原生计算与量化边界见 [CoreAI 原生 runner](COREAI_NATIVE.md)。
+当前面向本机和局域网试用：macOS 27、完整模型资产、**4096-token 导出容量、单请求串行推理**。原组件路径使用 S1 逐 token prefill；可选的[本机 PD 路径](COREAI_PD.md)提供共享权重的 S4 prefill/S1 decode 独立函数。容量来自选用的 manifest，不是启动参数；4096 资产完整不等于完整模型已通过 4096-token 质量与性能验收。`quality_acceptance` 和 `hardware_placement_verified` 仍为 `false`。原生计算与量化边界见 [CoreAI 原生 runner](COREAI_NATIVE.md)。
 
 ## 启动
 
@@ -23,6 +23,8 @@
 
 默认监听 `127.0.0.1:11236`；上例显式使用 `0.0.0.0`，其他设备应连接这台 Mac 的局域网 IP，例如 `http://<Mac局域网IP>:11236/v1`。`0.0.0.0` 是监听地址；其他设备的 `127.0.0.1` 指向设备自身。服务当前不提供 TLS 或 API key 校验。
 
+使用本机 PD 资产时在上述命令中追加 `--pd-manifest results/coreai-pd/fused-s4-metal/manifest.json --prefill-chunk 4`。此时只加载 PD 资产，旧三份资产不会同时加载。`--prefill-chunk 1` 可强制使用该资产的 S1 入口做对照。
+
 加载期间 HTTP listener 可以响应健康查询，但推理请求返回 503。必须等待 `/health` 的 `ready` 为 `true`。加载时会核对源目录、配置 SHA256、完整 48 层、512 专家库和资产接口；smoke 或部分层资产不能代替完整模型。
 
 CLI 只接受唯一的 `--option value` 参数对；未知或重复选项报错。主要服务参数如下：
@@ -31,6 +33,8 @@ CLI 只接受唯一的 `--option value` 参数对；未知或重复选项报错�
 | --- | ---: | --- |
 | `--host` | `127.0.0.1` | 仅 `127.0.0.1` 或 `0.0.0.0` |
 | `--port` | 11236 | 1024…65535 |
+| `--pd-manifest` | 无 | 完整共享权重 PD 资产；省略时使用原组件路径 |
+| `--prefill-chunk` | 0 | 自动选择；支持 1，或配合 PD manifest 使用 4 |
 | `--prefix-cache-bytes` | 536870912 | 0…2147483648；默认 512 MiB |
 | `--prefix-cache-entries` | 2 | 0…8；任一缓存额度为 0 即禁用 |
 | `--max-pending-requests` | 2 | 1…8；包含当前执行和等待的请求 |
@@ -62,7 +66,10 @@ curl -sS http://127.0.0.1:11236/v1/models
 | `cacheEntries`、`cacheBytes` | 最近一次请求清理后记录的缓存条目和逻辑字节数 |
 | `cacheHits`、`cachedTokens` | 成功请求的累计命中次数和复用 token 数 |
 | `prefillTokensProcessed`、`prefillSeconds`、`decodeSeconds` | 成功请求的累计阶段统计 |
-| `backend`、`prefill_policy` | 当前分别为 `native-coreai`、`tokenwise` |
+| `backend`、`prefill_policy` | `native-coreai`，以及 `tokenwise` 或 `chunked` |
+| `independent_pd_functions`、`prefill_chunk_size` | 是否加载独立 PD 函数，以及当前预填块大小 |
+| `pd_scheduling` | 当前为 `serial`，没有多请求交错执行 |
+| `prefill_group_milliseconds`、`decode_group_milliseconds` | 成功请求的独立阶段函数墙钟累计值，非 GPU kernel 时间 |
 | `compute_preference` | 当前为 `gpu`；不证明算子实际硬件归属 |
 | `quality_acceptance`、`hardware_placement_verified` | 当前均为 `false` |
 | `mlx_runtime_loaded` | 当前为 `false`；worker 初始化时检查动态库 |
@@ -139,7 +146,7 @@ curl -N -sS http://127.0.0.1:11236/v1/chat/completions \
 
 ## 取消、超时和错误
 
-网络关闭、发送失败或超时会设置该请求的取消标志。推理在 token 边界协作检查；已经提交的 CoreAI 调用不承诺立即中断。TCP 请求写端的正常半关闭允许服务器继续返回结果；连接真正不可读的情形依靠发送失败、连接状态或 deadline 识别。
+网络关闭、发送失败或超时会设置该请求的取消标志。推理在 token/预填块边界协作检查；已经提交的 CoreAI 调用不承诺立即中断。TCP 请求写端的正常半关闭允许服务器继续返回结果；连接真正不可读的情形依靠发送失败、连接状态或 deadline 识别。
 
 总请求 deadline 默认 1800 秒，从连接建立开始计算，包含排队和 prefill；慢请求体接收的 deadline 固定为 15 秒，单次发送等待固定为 15 秒。超时尚能发送时返回 408，流式响应已经开始则发送错误事件；已有发送阻塞时可能直接关闭连接。网络确认取消后，尚未执行的排队请求立即从有界 FIFO 移除并释放名额；已开始执行的请求仍需等待 token 边界和 reset 才释放。唤醒流不保存请求内容，因此反复取消不会遗留占位。正常 TCP 写端半关闭不等于取消。
 
@@ -161,7 +168,7 @@ Prefill 和 decode 单独统计。health 的 `prefillSeconds` 包含缓存恢复
 
 `decodeSeconds` 累计后续生成 token 的 forward 与对应 SSD 读取时间，不含全部选词、网络等待或端到端延迟。第一个输出来自最后一次 prefill logits，最后一个输出 token 不再 forward；因此 decode forward 次数通常比生成 token 数少 1。需要逐步 profile 时使用 `coreai-runner generate` 的 `prefill_seconds`、`prefill_coreai_calls`、`decode_forward_steps`、`decode_forward_seconds` 和 `decode_step_seconds`，不要把两个阶段合并成单一吞吐。
 
-当前 prefill 与 decode 只有阶段区分，使用同一套 S1 函数逐 token 执行；没有批量/分块 prefill kernel，也没有两个阶段独立部署。服务不支持 262K 上下文、工具调用、MTP 或多请求批量推理。GPU preference 不是 ANE 使用证明；更大容量、数值质量、缓存生命周期和性能均需各自验收，不能由 HTTP 可连接或能生成文本推定完成。
+指定 PD manifest 后，prefill/decode 拥有独立函数与一次性状态交接，S4 预填可批量执行投影和路由；S1 尾部仍按业务归入 prefill 统计。当前请求调度仍串行，没有两个阶段独立部署。服务不支持 262K 上下文、工具调用、MTP 或多请求批量推理。GPU preference 不是 ANE 使用证明；更大容量、数值质量、缓存生命周期和性能均需各自验收，不能由 HTTP 可连接或能生成文本推定完成。
 
 ## 运行验证
 

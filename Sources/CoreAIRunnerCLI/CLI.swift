@@ -20,20 +20,23 @@ struct CoreAIRunnerCLI {
                 coreai-runner generate --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH --prompt TEXT \
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
+                  [--pd-manifest PATH] [--prefill-chunk 1|4] [--compare-prefill true]
                 coreai-runner serve --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
                   [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
                   [--request-timeout-seconds 1800] [--max-pending-requests 2]
+                  [--pd-manifest PATH] [--prefill-chunk 0|1|4]
                 Complete CoreAI text inference. CPU handles tokenization, SSD rows and greedy selection.
-                Requires macOS 27. The exported attention manifest sets context capacity.
+                Requires macOS 27. The selected manifest sets context capacity.
+                generate accepts --prompt-file instead of --prompt. Compare runs S1/S4/S4/S1.
                 """)
                 return
             }
             guard let command = arguments.first, ["generate", "serve"].contains(command), arguments.count % 2 == 1 else {
                 throw NativeCLIError.invalid("Use generate or serve followed by unique --option value pairs")
             }
-            var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest"]
-            allowed.formUnion(command == "generate" ? ["--prompt", "--max-tokens", "--repeat", "--raw-prompt", "--output"] :
+            var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest", "--pd-manifest", "--prefill-chunk"]
+            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill"] :
                 ["--host", "--port", "--prefix-cache-bytes", "--prefix-cache-entries", "--request-timeout-seconds",
                  "--max-pending-requests", "--max-connections", "--max-body-bytes", "--max-output-bytes"])
             var options: [String: String] = [:]
@@ -71,12 +74,18 @@ struct CoreAIRunnerCLI {
             }
             return value
         }
-        let configuration = try CoreAIServiceConfiguration(modelDirectory: path("--model-dir"),
+        var configuration = try CoreAIServiceConfiguration(modelDirectory: path("--model-dir"),
             attentionManifest: path("--attention-manifest"), denseManifest: path("--dense-manifest"), moeManifest: path("--moe-manifest"),
             cacheBytes: number("--prefix-cache-bytes", 536_870_912, 0...2_147_483_648),
             cacheEntries: number("--prefix-cache-entries", 2, 0...8),
             maxPendingRequests: number("--max-pending-requests", 2, 1...8),
             maxOutputBytes: number("--max-output-bytes", 65_536, 4096...1_048_576))
+        if options["--pd-manifest"] != nil { configuration.pdManifest = try path("--pd-manifest") }
+        configuration.prefillChunk = try number("--prefill-chunk", 0, 0...4)
+        guard [0, 1, 4].contains(configuration.prefillChunk),
+              configuration.pdManifest != nil || configuration.prefillChunk != 4 else {
+            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic), 1, or 4 with a PD manifest")
+        }
         let host = options["--host"] ?? "127.0.0.1"
         guard ["127.0.0.1", "0.0.0.0"].contains(host) else {
             throw NativeCLIError.invalid("--host must be 127.0.0.1 or 0.0.0.0")
@@ -101,14 +110,20 @@ struct CoreAIRunnerCLI {
             return value
         }
         guard let maximum = Int(options["--max-tokens"] ?? "32"), (1...256).contains(maximum),
-              let repeats = Int(options["--repeat"] ?? "1"), (1...3).contains(repeats),
-              ["true", "false"].contains(options["--raw-prompt"] ?? "false") else {
-            throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...3, raw-prompt true/false")
+              let repeats = Int(options["--repeat"] ?? "1"), (1...4).contains(repeats),
+              ["true", "false"].contains(options["--raw-prompt"] ?? "false"),
+              ["true", "false"].contains(options["--compare-prefill"] ?? "false") else {
+            throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...4, raw-prompt true/false")
         }
         let directory = URL(fileURLWithPath: try require("--model-dir")).standardizedFileURL.resolvingSymlinksInPath()
         let config = try QwenConfiguration(modelDirectory: directory)
         let tokenizer = try QwenTokenizer(modelDirectory: directory)
-        let prompt = try require("--prompt")
+        guard options["--prompt"] == nil || options["--prompt-file"] == nil else {
+            throw NativeCLIError.invalid("Choose prompt or prompt-file")
+        }
+        let prompt: String
+        if let file = options["--prompt-file"] { prompt = try String(contentsOfFile: file, encoding: .utf8) }
+        else { prompt = try require("--prompt") }
         let rendered = options["--raw-prompt"] == "true" ? prompt : try tokenizer.renderChat(messages: [.init(role: "user", content: prompt)])
         let tokens = try tokenizer.encode(rendered)
         guard !tokens.isEmpty else { throw NativeCLIError.invalid("Prompt must contain tokens") }
@@ -123,13 +138,19 @@ struct CoreAIRunnerCLI {
               table.scale == Float(config.ngramScale), config.pleLayerIndices == [1] else {
             throw NativeCLIError.invalid("PLE table does not match model configuration")
         }
+        let chunk = Int(options["--prefill-chunk"] ?? (options["--pd-manifest"] == nil ? "1" : "4")) ?? 0
+        guard chunk == 1 || (chunk == 4 && options["--pd-manifest"] != nil),
+              options["--compare-prefill"] != "true" || options["--pd-manifest"] != nil else {
+            throw NativeCLIError.invalid("S4 and compare-prefill require a PD manifest; prefill-chunk must be 1 or 4")
+        }
         let loadStart = DispatchTime.now().uptimeNanoseconds
-        let model = try await CoreAINativeModel(
+        progress("Loading CoreAI runtime")
+        let model = try await CoreAITextRuntime(
             attentionManifest: URL(fileURLWithPath: require("--attention-manifest")),
             denseManifest: URL(fileURLWithPath: require("--dense-manifest")),
-            moeManifest: URL(fileURLWithPath: require("--moe-manifest")), computeUnits: .gpu) { kind, current, total in
-                if current % 4 == 0 || current == total { progress("Loaded \(kind) \(current)/\(total)") }
-            }
+            moeManifest: URL(fileURLWithPath: require("--moe-manifest")),
+            pdManifest: options["--pd-manifest"].map { URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath() },
+            computeUnits: .gpu)
         let configSHA = SHA256.hash(data: try Data(contentsOf: directory.appendingPathComponent("config.json")))
             .map { String(format: "%02x", $0) }.joined()
         guard model.manifestModelDirectory == directory, model.sourceConfigSHA256 == configSHA,
@@ -137,27 +158,45 @@ struct CoreAIRunnerCLI {
             throw NativeCLIError.invalid("Model identity mismatch or prompt/output exceeds exported capacity")
         }
         let loadSeconds = seconds(loadStart)
-        var runs = [[String: Any]](), first = [Int32]()
-        for run in 0..<repeats {
+        guard chunk == 1 || chunk == model.prefillChunkSize else {
+            throw NativeCLIError.invalid("prefill-chunk must be 1 or the exported chunk size")
+        }
+        let chunks = options["--compare-prefill"] == "true" ? [1, model.prefillChunkSize, model.prefillChunkSize, 1] : Array(repeating: chunk, count: repeats)
+        var runs = [[String: Any]](), first = [Int32](), firstLogits = [Float]()
+        for run in chunks.indices {
             if run > 0 { try model.reset() }
             var history = hash.initialHistory, logicalBytes = 0, readSeconds = 0.0
-            func embedding(_ token: Int32) throws -> [Float] {
-                let rows = try hash.rowIDs(previousTokens: history, tokens: [UInt32(token)])
+            func embedding(_ input: [Int32]) throws -> [Float] {
+                let sequence = input.map(UInt32.init)
+                let rows = try hash.rowIDs(previousTokens: history, tokens: sequence)
                 let started = DispatchTime.now().uptimeNanoseconds
                 let values = try table.readRows(rows)
                 readSeconds += seconds(started)
-                history = try hash.history(after: [UInt32(token)], previousTokens: history)
+                history = try hash.history(after: sequence, previousTokens: history)
                 logicalBytes += rows.count * table.dimension
                 return values
             }
             let initialCalls = model.successfulCalls
             let start = DispatchTime.now().uptimeNanoseconds
             var logits = [Float]()
-            for (index, token) in tokens.enumerated() {
-                logits = try await model.forward(token: token, pleEmbedding: embedding(token))
-                if (index + 1) % 8 == 0 || index + 1 == tokens.count { progress("Prefill \(index + 1)/\(tokens.count), run \(run + 1)") }
+            var position = 0, chunkCount = 0
+            while position < tokens.count {
+                let count = tokens.count - position >= chunks[run] ? chunks[run] : 1
+                let batch = Array(tokens[position..<position + count])
+                logits = try await model.prefill(tokens: batch, pleEmbedding: embedding(batch))
+                position += count; chunkCount += 1
+                if position % 32 == 0 || position == tokens.count { progress("Prefill \(position)/\(tokens.count), run \(run + 1), chunk \(chunks[run])") }
             }
             let prefillSeconds = seconds(start), prefillCalls = model.successfulCalls - initialCalls
+            let prefillGroups = model.predictionMillisecondsByGroup
+            let prefillSSDSeconds = readSeconds
+            if run == 0 { firstLogits = logits }
+            var errorSquared = 0.0, referenceSquared = 0.0, maximumError = 0.0
+            for (a, b) in zip(logits, firstLogits) {
+                let delta = Double(a) - Double(b)
+                errorSquared += delta * delta; referenceSquared += Double(b) * Double(b)
+                maximumError = max(maximumError, abs(delta))
+            }
             var output = [Int32](), decodeDurations = [Double](), stop = "length"
             for step in 0..<maximum {
                 let selected = try greedy(logits, excluding: tokenizer.reservedOutputTokenIDs)
@@ -166,18 +205,26 @@ struct CoreAIRunnerCLI {
                 progress("Generated \(output.count): \(try tokenizer.decode(output))")
                 if step + 1 < maximum {
                     let started = DispatchTime.now().uptimeNanoseconds
-                    logits = try await model.forward(token: selected, pleEmbedding: embedding(selected))
+                    logits = try await model.forward(token: selected, pleEmbedding: embedding([selected]))
                     decodeDurations.append(seconds(started))
                 }
             }
             if run == 0 { first = output }
-            guard first == output else { throw NativeCLIError.invalid("Reset replay generated different token IDs") }
+            let decodeGroups = model.predictionMillisecondsByGroup.mapValues { $0 }
+                .map { key, value in (key, value - (prefillGroups[key] ?? 0)) }
             runs.append(["run": run + 1, "text": try tokenizer.decode(output, skipSpecialTokens: true),
                 "generated_token_ids": output, "stop_reason": stop, "reset_tokens_match": output == first,
                 "prefill_tokens": tokens.count, "prefill_seconds": prefillSeconds, "prefill_coreai_calls": prefillCalls,
+                "prefill_chunk_size": chunks[run], "prefill_chunks": chunkCount,
+                "prefill_logits_relative_l2": sqrt(errorSquared / max(referenceSquared, 1e-30)),
+                "prefill_logits_max_abs": maximumError,
+                "prefill_group_milliseconds": prefillGroups,
+                "decode_group_milliseconds": Dictionary(uniqueKeysWithValues: decodeGroups),
+                "prefill_ssd_read_seconds": prefillSSDSeconds, "decode_ssd_read_seconds": readSeconds - prefillSSDSeconds,
                 "decode_forward_steps": decodeDurations.count, "decode_forward_seconds": decodeDurations.reduce(0, +),
                 "decode_step_seconds": decodeDurations, "total_coreai_calls": model.successfulCalls - initialCalls,
                 "final_state_offset": model.offset, "ssd_logical_bytes": logicalBytes, "ssd_read_seconds": readSeconds])
+            progress("Run \(run + 1): prefill \(prefillSeconds)s, decode \(decodeDurations.reduce(0, +))s, output matches first: \(output == first)")
         }
         let images = (0..<_dyld_image_count()).compactMap { _dyld_get_image_name($0).map { String(cString: $0) } }
         let mlxImages = images.filter { URL(fileURLWithPath: $0).lastPathComponent.lowercased().contains("mlx") }
@@ -189,7 +236,8 @@ struct CoreAIRunnerCLI {
             "cpu_operations": ["tokenization", "n-gram hash", "SSD row reads and FP8 unpack", "greedy token selection"],
             "model_directory": directory.path,
             "quality_acceptance": false, "performance_acceptance": false,
-            "limitations": "S1 short-context integration, explicit CoreAI state; server/prefix/SSD KV cache migration remains separate."]
+            "prefill_chunk_size": model.prefillChunkSize, "independent_pd_functions": model.usesIndependentPhases,
+            "limitations": "Explicit serial phase execution; group times are awaited function wall time, not device kernel profiling. Source BF16 quality equivalence remains unverified."]
         var data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         data.append(0x0a)
         if let path = options["--output"] {

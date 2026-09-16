@@ -116,6 +116,8 @@ class Q4MoE(torch.nn.Module):
         return ids, (scores / denominator).half()
 
     def forward(self, x):
+        if x.shape[1] != 1:
+            return self.prefill(x)
         ids, scores = self.routing(x)
         expanded = x.reshape(1, 1, self.hidden).expand(self.top_k, 1, self.hidden)
         gate = self.gate_proj(expanded, ids)
@@ -131,6 +133,46 @@ class Q4MoE(torch.nn.Module):
         shared_score = self.linear(x, self.shared_router).sigmoid()
         output = (routed + (shared_down * shared_score).half()).half()
         result = (output, ids.reshape(1, 1, self.top_k), scores.reshape(1, 1, self.top_k))
+        if self.diagnostics:
+            return result + (gate, up, active, down, routed, shared_gate, shared_up, shared_active, shared_down, shared_score)
+        return result
+
+    def prefill(self, x):
+        """Vectorized token routing and selected expert projections, bounded by S.
+
+        Each token retains its own ordered top-k and FP16 score normalization.
+        Only S*top_k expert matrices are materialized, never the full bank.
+        """
+        count = x.shape[1]
+        logits = self.linear(x, self.router).reshape(count, self.experts)
+        remaining = logits.float()
+        selected = []
+        for _ in range(self.top_k):
+            maximum = remaining.amax(dim=-1, keepdim=True)
+            chosen = torch.where(remaining == maximum, self.expert_ids, self.experts).amin(dim=-1)
+            selected.append(chosen)
+            remaining = torch.where(self.expert_ids == chosen[:, None], float("-inf"), remaining)
+        ids = torch.stack(selected, dim=-1)
+        scores = torch.gather(logits.float().softmax(-1).half(), -1, ids.long())
+        denominator = scores[:, 0]
+        for slot in range(1, self.top_k):
+            denominator = (denominator + scores[:, slot]).half()
+        scores = (scores / denominator[:, None]).half()
+        expanded = x.reshape(count, 1, self.hidden).expand(count, self.top_k, self.hidden)
+        expanded = expanded.reshape(count * self.top_k, 1, self.hidden)
+        flat_ids = ids.reshape(-1)
+        gate = self.gate_proj(expanded, flat_ids)
+        up = self.up_proj(expanded, flat_ids)
+        active = ((gate * gate.sigmoid()).half() * up).half()
+        down = self.down_proj(active, flat_ids).reshape(count, self.top_k, self.hidden)
+        routed = (down * scores[:, :, None]).half().float().sum(1).half().reshape(1, count, self.hidden)
+        shared_gate = self.linear(x, self.shared_gate_proj)
+        shared_up = self.linear(x, self.shared_up_proj)
+        shared_active = ((shared_gate * shared_gate.sigmoid()).half() * shared_up).half()
+        shared_down = self.linear(shared_active, self.shared_down_proj)
+        shared_score = self.linear(x, self.shared_router).sigmoid()
+        output = (routed + (shared_down * shared_score).half()).half()
+        result = (output, ids.reshape(1, count, self.top_k), scores.reshape(1, count, self.top_k))
         if self.diagnostics:
             return result + (gate, up, active, down, routed, shared_gate, shared_up, shared_active, shared_down, shared_score)
         return result

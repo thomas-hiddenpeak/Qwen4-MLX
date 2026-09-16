@@ -77,12 +77,13 @@ def silu(x):
 
 
 def group_norm(x, weight, config):
-    grouped = x.reshape(1, 1, config.streams, config.hidden)
+    grouped = x.reshape(1, x.shape[1], config.streams, config.hidden)
     normalized = (grouped.float() * torch.rsqrt(grouped.float().square().mean(-1, keepdim=True) + config.epsilon)).half()
     return (normalized * weight.reshape(config.streams, config.hidden)).half()
 
 
 class HCRead(torch.nn.Module):
+    linear = staticmethod(linear)
     def __init__(self, config, weights, with_injection=True):
         super().__init__()
         self.config, self.with_injection = config, with_injection
@@ -97,15 +98,16 @@ class HCRead(torch.nn.Module):
 
     def forward(self, stream):
         c = self.config
+        count = stream.shape[1]
         normalized = group_norm(stream, self.norm, c)
-        flat = normalized.reshape(1, 1, c.width)
-        activated = silu(linear(flat, self.down))
-        logits = linear(activated, self.up).reshape(1, 1, c.streams, c.hidden)
+        flat = normalized.reshape(1, count, c.width)
+        activated = silu(self.linear(flat, self.down))
+        logits = self.linear(activated, self.up).reshape(1, count, c.streams, c.hidden)
         weighted = (normalized * torch.sigmoid(logits)).half()
         mixed = weighted.float().mean(2).half()
         if not self.with_injection:
             return mixed
-        injection = (torch.sigmoid(linear(flat, self.inject)) * 2).half().reshape(1, 1, c.streams, 1)
+        injection = (torch.sigmoid(self.linear(flat, self.inject)) * 2).half().reshape(1, count, c.streams, 1)
         return mixed, injection
 
 
@@ -116,11 +118,13 @@ class HCWrite(torch.nn.Module):
 
     def forward(self, stream, output, injection):
         c = self.config
-        update = (output.reshape(1, 1, 1, c.hidden) * injection).half()
-        return (stream.reshape(1, 1, c.streams, c.hidden) + update).half().reshape(1, 1, c.width)
+        count = stream.shape[1]
+        update = (output.reshape(1, count, 1, c.hidden) * injection).half()
+        return (stream.reshape(1, count, c.streams, c.hidden) + update).half().reshape(1, count, c.width)
 
 
 class PLE(torch.nn.Module):
+    linear = staticmethod(linear)
     def __init__(self, config, weights):
         super().__init__()
         self.config = config
@@ -134,22 +138,23 @@ class PLE(torch.nn.Module):
 
     def forward(self, stream, embedding, conv_state):
         c = self.config
-        key = group_norm(linear(embedding, self.key_proj_weight), self.norm_key_weight, c)
-        value = linear(embedding, self.value_proj_weight)
+        count = stream.shape[1]
+        key = group_norm(self.linear(embedding, self.key_proj_weight), self.norm_key_weight, c)
+        value = self.linear(embedding, self.value_proj_weight)
         query = group_norm(stream, self.norm_query_weight, c)
         products = (key * query).half()
         gate = (products.float().sum(-1, keepdim=True).half() * self.gate_scale).half()
         signed_root = (torch.sqrt(torch.clamp(torch.abs(gate), min=1e-6)).half() * torch.sign(gate)).half()
-        gated = (torch.sigmoid(signed_root) * value.reshape(1, 1, 1, c.hidden)).half().reshape(1, 1, c.width)
-        normalized = group_norm(gated, self.norm_conv_weight, c).reshape(1, 1, c.width)
+        gated = (torch.sigmoid(signed_root) * value.reshape(1, count, 1, c.hidden)).half().reshape(1, count, c.width)
+        normalized = group_norm(gated, self.norm_conv_weight, c).reshape(1, count, c.width)
         joined = torch.cat((conv_state, normalized), dim=1)
-        convolution = joined[:, :1].float() * self.conv1d_weight[:, 0, 0].float()
+        convolution = joined[:, :count].float() * self.conv1d_weight[:, 0, 0].float()
         for tap in range(1, c.ple_kernel):
             index = tap * c.ple_dilation
-            convolution = convolution + joined[:, index:index + 1].float() * self.conv1d_weight[:, tap, 0].float()
+            convolution = convolution + joined[:, index:index + count].float() * self.conv1d_weight[:, tap, 0].float()
         addition = (gated + silu(convolution.half())).half()
         stream_out = (stream + addition).half()
-        next_conv = joined[:, 1:1 + c.ple_history]
+        next_conv = joined[:, count:count + c.ple_history]
         return stream_out, next_conv
 
 
@@ -160,7 +165,7 @@ class Embedding(torch.nn.Module):
         self.register_buffer("weight", half_weight(weight, (config.vocabulary, config.hidden), "embedding"))
 
     def forward(self, token):
-        return F.embedding(token.long(), self.weight).reshape(1, 1, self.config.hidden).repeat(1, 1, self.config.streams)
+        return F.embedding(token.long(), self.weight).reshape(1, token.shape[0], self.config.hidden).repeat(1, 1, self.config.streams)
 
 
 class Head(torch.nn.Module):

@@ -100,6 +100,24 @@ public final class CoreAIBlockRunner {
         self.modelLoadMilliseconds = Self.milliseconds(since: start)
     }
 
+    /// Load another entrypoint from the same runtime model and weight owner.
+    /// This does not construct another AIModel or reload its asset.
+    public init(sharing owner: CoreAIBlockRunner, functionName: String) throws {
+        let started = DispatchTime.now().uptimeNanoseconds
+        guard !functionName.isEmpty,
+              let descriptor = owner.model.functionDescriptor(for: functionName),
+              descriptor.stateNames.isEmpty,
+              let function = try owner.model.loadFunction(named: functionName) else {
+            throw CoreAIBlockRunnerError.invalidModel("Missing or unsupported shared entrypoint '\(functionName)'")
+        }
+        self.model = owner.model
+        self.function = function
+        self.modelURL = owner.modelURL
+        self.computeUnits = owner.computeUnits
+        self.options = owner.options
+        self.modelLoadMilliseconds = Self.milliseconds(since: started)
+    }
+
     public static func validateIterations(warmups: Int, runs: Int) throws {
         guard (0...1000).contains(warmups), (1...10000).contains(runs) else {
             throw CoreAIBlockRunnerError.invalidFixture("warmups must be 0...1000 and runs must be 1...10000")

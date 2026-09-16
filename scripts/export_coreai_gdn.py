@@ -97,13 +97,20 @@ class GDN(torch.nn.Module):
             result = result * weight.float()
         return result.to(x.dtype)
 
-    def forward(self, hidden, conv_history, recurrent_state):
+    def project_inputs(self, hidden):
+        """Original four projections; the default S1 and chunk graphs are unchanged."""
         c = self.config
         sequence = hidden.shape[1]
         qkv = self.linear(hidden, self.in_proj_qkv_weight)
         z = self.linear(hidden, self.in_proj_z_weight).reshape(1, sequence, c.value_heads, c.value_dim)
         a = self.linear(hidden, self.in_proj_a_weight)
         b = self.linear(hidden, self.in_proj_b_weight)
+        return qkv, z, a, b
+
+    def forward(self, hidden, conv_history, recurrent_state):
+        c = self.config
+        sequence = hidden.shape[1]
+        qkv, z, a, b = self.project_inputs(hidden)
         conv_input = torch.cat((conv_history, qkv), dim=1)
         next_history = conv_input[:, sequence:sequence + c.kernel - 1, :]
         # The exact causal depthwise convolution as a fixed sum of shifted
@@ -136,6 +143,55 @@ class GDN(torch.nn.Module):
         gated = self.norm(y, self.norm_weight) * z.sigmoid()
         output = self.linear(gated.reshape(1, sequence, c.value_heads * c.value_dim), self.out_proj_weight)
         return output, next_history, state
+
+
+class GDNPrefill(GDN):
+    """Chunk prefill with an optional fused input projection, identical state I/O.
+
+    The default shares the original GDN buffers and equations. It is suitable
+    for separate S1/S4 functions whose weights can be deduplicated. Explicitly
+    enabling fusion concatenates qkv/z/a/b rows into one constant and reduces
+    the five projection GEMMs (four input, one output) to two per chunk. That
+    packed constant is extra storage if the original decode module is retained;
+    this class does not claim cross-function deduplication or a speedup.
+
+    Projection, convolution, normalization and output projection cover all S
+    tokens. Only the FP32 recurrent update is sequential; final state remains
+    [batch,value_head,value_dim,key_dim], independent of chunk length.
+    """
+
+    INPUT_PROJECTION_NAMES = ("in_proj_qkv_weight", "in_proj_z_weight",
+                              "in_proj_a_weight", "in_proj_b_weight")
+
+    def __init__(self, source: GDN, *, fuse_input_projections=False):
+        # Reuse immutable buffers instead of reading/converting a layer twice.
+        # Never retain source as a submodule: that would duplicate named weights.
+        torch.nn.Module.__init__(self)
+        self.config = source.config
+        self.fuse_input_projections = bool(fuse_input_projections)
+        missing = [name for name in self.INPUT_PROJECTION_NAMES if not hasattr(source, name)]
+        if missing:
+            raise ValueError(f"GDNPrefill requires the original GDN projection buffers: {missing}")
+        for name, value in source.named_buffers(recurse=False):
+            if not self.fuse_input_projections or name not in self.INPUT_PROJECTION_NAMES:
+                self.register_buffer(name, value)
+        if self.fuse_input_projections:
+            self.register_buffer("in_proj_combined_weight", torch.cat(
+                [getattr(source, name) for name in self.INPUT_PROJECTION_NAMES], dim=0).contiguous())
+        self.train(source.training)
+
+    @classmethod
+    def from_gdn(cls, source: GDN, *, fuse_input_projections=False):
+        return cls(source, fuse_input_projections=fuse_input_projections)
+
+    def project_inputs(self, hidden):
+        if not self.fuse_input_projections:
+            return super().project_inputs(hidden)
+        c = self.config
+        projected = self.linear(hidden, self.in_proj_combined_weight)
+        qkv, z, a, b = torch.split(projected,
+            (c.channels, c.value_heads * c.value_dim, c.value_heads, c.value_heads), dim=-1)
+        return qkv, z.reshape(1, hidden.shape[1], c.value_heads, c.value_dim), a, b
 
 
 def as_json(tensor):
@@ -213,6 +269,8 @@ def arguments(argv=None):
     parser.add_argument("--output", type=Path, default=ROOT / "results/coreai-stateful/gdn")
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--prefill", type=int, default=4, choices=range(1, 17), metavar="1..16")
+    parser.add_argument("--prefill-fused-projections", action="store_true",
+                        help="Use one packed qkv/z/a/b projection for the prefill asset only; S1 decode remains original")
     parser.add_argument("--decode-steps", type=int, default=3, choices=range(1, 9), metavar="1..8")
     parser.add_argument("--capture", type=Path, default=ROOT / "fixtures/moe-real/prefill.safetensors")
     parser.add_argument("--source-oracle", type=Path, default=ROOT / "fixtures/gpu-sequence-reference")
@@ -222,6 +280,8 @@ def arguments(argv=None):
 
 def main(argv=None):
     args = arguments(argv)
+    if args.prefill_fused_projections and args.prefill == 1:
+        raise ValueError("Fused prefill requires S>1 so its asset cannot replace the original S1 decode function")
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
     output = args.output.resolve()
@@ -236,6 +296,7 @@ def main(argv=None):
     source.prefix = f"language_model.model.layers.{args.layer}.linear_attn."
     weights = {name: source.read(name) for name in config.weight_shapes}
     model = GDN(config, weights).eval()
+    prefill_model = GDNPrefill.from_gdn(model, fuse_input_projections=args.prefill_fused_projections).eval()
     input_all, evidence = capture_input(args.capture.resolve(), args.prefill + args.decode_steps, config.hidden)
     history = torch.zeros(1, config.kernel - 1, config.channels, dtype=torch.float16)
     state = torch.zeros(1, config.value_heads, config.value_dim, config.key_dim, dtype=torch.float32)
@@ -253,6 +314,8 @@ def main(argv=None):
                 "input_names": INPUT_NAMES, "output_names": OUTPUT_NAMES, "state_bindings": STATE_BINDINGS,
                 "recurrence_state_layout": "batch,value_head,value_dim,key_dim", "recurrence_state_dtype": "float32",
                 "activation_and_weight_storage_dtype": "float16", "projection_and_conv_accumulation_dtype": "float32",
+                "prefill_fused_input_projections": args.prefill_fused_projections,
+                "prefill_projection_gemms_per_chunk": 2 if args.prefill_fused_projections else 5,
                 "input_provenance": evidence, "source_records": source.records,
                 "config_file": {"path": str(config_path), "sha256": sha256_file(config_path)},
                 "exporter": {"path": str(Path(__file__).resolve()), "sha256": sha256_file(Path(__file__))},
@@ -272,7 +335,7 @@ def main(argv=None):
             hidden = input_all[:, offset:offset + length]
             inputs = (hidden, history, state)
             examples.setdefault(length, tuple(value.clone() for value in inputs))
-            values = model(*inputs)
+            values = (prefill_model if index == 0 else model)(*inputs)
             finite_outputs(values)
             fixture_path = output / f"step-{index}.json"
             write_json(fixture_path, {"inputs": {"hidden": as_json(hidden)},
@@ -298,7 +361,8 @@ def main(argv=None):
     for length, example in examples.items():
         path = output / f"layer{args.layer}-gdn-s{length}.aimodel"
         started = time.perf_counter()
-        files = [] if args.reference_only else export_asset(model, example, path)
+        asset_model = prefill_model if length == args.prefill and length > 1 else model
+        files = [] if args.reference_only else export_asset(asset_model, example, path)
         manifest["exports"].append({"length": length, "model": str(path), "model_files": files,
                                     "model_bytes": sum(row["bytes"] for row in files),
                                     "authoring_seconds": time.perf_counter() - started})

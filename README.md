@@ -6,7 +6,7 @@ GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经�
 
 KV cache 是既有服务的重点。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；各项实现和验收进度在能力计划中分别记录。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
 
-macOS 27 上已跑通 [完整 CoreAI 文本生成](docs/COREAI_NATIVE.md)：独立 `coreai-runner` 将 embedding、HC、36 层 GDN、12 层 QSA、全部路由/共享专家、PLE 投影与卷积、输出头交给系统 CoreAI。CPU 负责分词、SSD 行读取/解包及 greedy 选词；可执行程序不链接 MLX。现已提供 [CoreAI HTTP 试用服务](docs/COREAI_SERVICE.md)，接入 JSON/SSE、取消恢复与完整混合状态 RAM 前缀缓存，使用4096容量资产。仍为逐 token prefill，主干采用 FP16/部分 FP32；源 BF16 质量等价、性能、262K及SSD KV cache尚未完成验收。此前的[混合生成](docs/COREAI_HYBRID.md)、[子图结果](docs/COREAI_BACKEND.md)与[连续状态验证](docs/COREAI_STATEFUL.md)保留追溯。
+macOS 27 上已跑通 [完整 CoreAI 文本生成](docs/COREAI_NATIVE.md)：独立 `coreai-runner` 将 embedding、HC、36 层 GDN、12 层 QSA、全部路由/共享专家、PLE 投影与卷积、输出头交给系统 CoreAI。CPU 负责分词、SSD 行读取/解包及 greedy 选词；可执行程序不链接 MLX。现已提供 [CoreAI HTTP 试用服务](docs/COREAI_SERVICE.md)，接入 JSON/SSE、取消恢复与完整混合状态 RAM 前缀缓存，使用4096容量资产。新增可选[本机 PD 计算路径](docs/COREAI_PD.md)，共享权重的 S4 prefill/S1 decode 与直接 Q4 Metal kernel 已通过功能回归，分块数值一致性仍在验证；请求调度仍串行。主干采用 FP16/部分 FP32；源 BF16 质量等价、性能、262K及SSD KV cache尚未完成验收。此前的[混合生成](docs/COREAI_HYBRID.md)、[子图结果](docs/COREAI_BACKEND.md)与[连续状态验证](docs/COREAI_STATEFUL.md)保留追溯。
 
 ## 构建与生成
 

@@ -204,25 +204,59 @@ def initial_state(module, seeded=None):
     return state
 
 
-def export_asset(module, count, destination):
+def _export_entrypoints(module, entrypoints, destination):
+    """One archive can expose decode and prefill functions with identical state I/O.
+
+    Archive constant deduplication and runtime memory residency are distinct:
+    loading each function through a separate model instance may duplicate weights.
+    The caller should retain one asset/model and obtain its function handles.
+    """
     import coreai_torch
     from coreai_torch.composite_ops import SDPA
+    if not entrypoints or any(type(count) is not int or not 1 <= count <= module.capacity
+                              for count in entrypoints.values()):
+        raise ValueError("Every exported token count must be within the fixed cache capacity")
     state = initial_state(module)
-    example = {"x": torch.zeros(1, count, module.hidden, dtype=torch.float16), **state}
     converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
-    converter.add_pytorch_module(module, input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
-        externalize_modules=[coreai_torch.ExternalizeSpec(target_class=SDPA, composite_op_name="scaled_dot_product_attention",
-                                                        composite_attrs=["scale", "is_causal", "window_size"])],
-        export_fn=lambda m: torch.export.export(m, args=tuple(example[n] for n in INPUT_NAMES)).run_decompositions(coreai_torch.get_decomp_table()))
+    for name, count in entrypoints.items():
+        example = {"x": torch.zeros(1, count, module.hidden, dtype=torch.float16), **state}
+        args = tuple(example[n] for n in INPUT_NAMES)
+        converter.add_pytorch_module(module, input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
+            entrypoint_name=name,
+            externalize_modules=[coreai_torch.ExternalizeSpec(target_class=SDPA, composite_op_name="scaled_dot_product_attention",
+                                                            composite_attrs=["scale", "is_causal", "window_size"])],
+            export_fn=lambda m, args=args: torch.export.export(m, args=args).run_decompositions(coreai_torch.get_decomp_table()))
     program = converter.to_coreai()
     program.optimize()
     program.save_asset(destination)
-    return {"path": str(destination), "sequence": count, "files": [
-        {"path": str(p.relative_to(destination)), "bytes": p.stat().st_size, "sha256": sha256_file(p)}
-        for p in sorted(destination.rglob("*")) if p.is_file()]}
+    files = [{"path": str(p.relative_to(destination)), "bytes": p.stat().st_size, "sha256": sha256_file(p)}
+             for p in sorted(destination.rglob("*")) if p.is_file()]
+    return {"path": str(destination), "functions": entrypoints, "files": files,
+            "modelBytes": sum(item["bytes"] for item in files)}
 
 
-def save_sequence(directory, name, module, chunks, seeded=None, references=None):
+def export_asset(module, count, destination):
+    """Existing single-function API used by the complete attention exporter."""
+    return {**_export_entrypoints(module, {"main": count}, destination), "sequence": count}
+
+
+def export_chunk_asset(module, counts, destination):
+    """Export S1 plus selected fixed prefill chunks without separate model files.
+
+    The six persistent state names/shapes/dtypes are unchanged between functions;
+    only x, y and attention_mask's query dimension depend on the token count.
+    S1 retains the existing function name `main`; prefill uses `prefill_s<count>`.
+    """
+    counts = tuple(counts)
+    if not counts or any(type(count) is not int or count not in (1, 4, 8, 16) for count in counts):
+        raise ValueError("Chunk counts must be selected from 1, 4, 8, 16")
+    if len(set(counts)) != len(counts) or 1 not in counts:
+        raise ValueError("Chunk asset requires S1 and unique token counts")
+    functions = {"main" if count == 1 else f"prefill_s{count}": count for count in sorted(counts)}
+    return _export_entrypoints(module, functions, destination)
+
+
+def save_sequence(directory, name, module, chunks, seeded=None, references=None, models=None):
     state = initial_state(module, seeded)
     initial = {k: tensor_json(v) for k, v in state.items()}
     steps, evidence = [], []
@@ -253,8 +287,8 @@ def save_sequence(directory, name, module, chunks, seeded=None, references=None)
     initial_path = directory / f"{name}-initial-state.json"
     write_json(initial_path, initial)
     sequence = {"version": 1, "initialState": initial_path.name, "stateBindings": BINDINGS, "steps": steps,
-                "models": {f"s{count}": {"path": f"attention-c{module.capacity}-s{count}.aimodel", "function": "main"}
-                           for count in sorted({x.shape[1] for x in chunks})},
+                "models": models or {f"s{count}": {"path": f"attention-c{module.capacity}-s{count}.aimodel", "function": "main"}
+                                     for count in sorted({x.shape[1] for x in chunks})},
                 "tolerances": {"maximumAbsoluteError": 0.02, "relativeL2Error": 0.005}}
     write_json(directory / f"{name}-sequence.json", sequence)
     return {"name": name, "sequence": str(directory / f"{name}-sequence.json"), "steps": evidence}

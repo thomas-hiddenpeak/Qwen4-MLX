@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from export_coreai_gdn import GDN, GDNConfig
+from export_coreai_gdn import GDN, GDNConfig, GDNPrefill
 
 
 class GDNExportTests(unittest.TestCase):
@@ -13,12 +13,12 @@ class GDNExportTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
 
-    def model(self):
+    def model(self, dtype=torch.float32):
         config = GDNConfig(hidden=5, key_heads=2, value_heads=6, key_dim=3, value_dim=4, kernel=4, epsilon=1e-6)
         rng = np.random.default_rng(37)
         weights = {name: (rng.standard_normal(shape) * 0.2).astype(np.float32)
                    for name, shape in config.weight_shapes.items()}
-        return GDN(config, weights, dtype=torch.float32).eval()
+        return GDN(config, weights, dtype=dtype).eval()
 
     def inputs(self, model, length=7):
         c = model.config
@@ -90,6 +90,72 @@ class GDNExportTests(unittest.TestCase):
         weights["in_proj_qkv.weight"] = np.zeros((2, 5), np.float32)
         with self.assertRaisesRegex(ValueError, "in_proj_qkv"):
             GDN(model.config, weights)
+
+    def test_unfused_prefill_shares_original_buffers_and_export_graph(self):
+        model = self.model()
+        prefill = GDNPrefill.from_gdn(model)
+        original = dict(model.named_buffers())
+        copied = dict(prefill.named_buffers())
+        self.assertEqual(set(original), set(copied))
+        for name, tensor in original.items():
+            self.assertEqual(tensor.data_ptr(), copied[name].data_ptr())
+        example = self.inputs(model, length=4)
+        baseline = torch.export.export(model, example)
+        candidate = torch.export.export(prefill, example)
+        self.assertEqual(baseline.graph_module.code, candidate.graph_module.code)
+
+    def test_fused_prefill_exports_two_projection_gemms_instead_of_five(self):
+        model = self.model()
+        prefill = GDNPrefill.from_gdn(model, fuse_input_projections=True)
+        names = GDNPrefill.INPUT_PROJECTION_NAMES
+        torch.testing.assert_close(prefill.in_proj_combined_weight,
+                                   torch.cat([getattr(model, name) for name in names]), rtol=0, atol=0)
+        self.assertFalse(any(name in dict(prefill.named_buffers()) for name in names))
+        self.assertEqual(prefill.out_proj_weight.data_ptr(), model.out_proj_weight.data_ptr())
+        for length in (1, 4, 8, 16):
+            example = self.inputs(model, length=length)
+            graph = torch.export.export(prefill, example).graph
+            linears = [node for node in graph.nodes if node.target == torch.ops.aten.linear.default]
+            self.assertEqual(len(linears), 2)
+            self.assertEqual(list(linears[0].args[0].meta["val"].shape), [1, length, model.config.hidden])
+        baseline = torch.export.export(model, self.inputs(model, length=4)).graph
+        self.assertEqual(sum(node.target == torch.ops.aten.linear.default for node in baseline.nodes), 5)
+
+    def test_chunk4_8_16_then_decode_preserves_nonzero_state_and_s1_semantics(self):
+        for dtype in (torch.float32, torch.float16):
+            model = self.model(dtype=dtype)
+            for chunk in (4, 8, 16):
+                hidden, history, state = self.inputs(model, length=2 * chunk + 3)
+                hidden, history = hidden.to(dtype), history.to(dtype)
+                original_history, original_state = history.clone(), state.clone()
+                scalar = []
+                scalar_history, scalar_state = history, state
+                for position in range(hidden.shape[1]):
+                    result = model(hidden[:, position:position+1], scalar_history, scalar_state)
+                    scalar.append(result[0])
+                    scalar_history, scalar_state = result[1:]
+                expected = (torch.cat(scalar, dim=1), scalar_history, scalar_state)
+                for fused in (False, True):
+                    with self.subTest(dtype=dtype, chunk=chunk, fused=fused):
+                        prefill = GDNPrefill.from_gdn(model, fuse_input_projections=fused)
+                        offset = 0
+                        pieces = []
+                        next_history, next_state = history, state
+                        for length in (chunk, chunk, 1, 1, 1):
+                            stage = prefill if length > 1 else model
+                            result = stage(hidden[:, offset:offset+length], next_history, next_state)
+                            pieces.append(result[0])
+                            next_history, next_state = result[1:]
+                            offset += length
+                        actual = (torch.cat(pieces, dim=1), next_history, next_state)
+                        for value, target in zip(actual, expected):
+                            torch.testing.assert_close(value, target,
+                                rtol=5e-3 if dtype == torch.float16 else 5e-5,
+                                atol=2e-4 if dtype == torch.float16 else 1e-6)
+                        self.assertEqual(next_state.dtype, torch.float32)
+                        self.assertEqual(next_history.dtype, dtype)
+                torch.testing.assert_close(history, original_history, rtol=0, atol=0)
+                torch.testing.assert_close(state, original_state, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
