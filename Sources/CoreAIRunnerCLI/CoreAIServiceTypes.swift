@@ -24,7 +24,19 @@ enum CoreAIServiceEvent: Sendable {
 
 final class CoreAIRequestCancellation: Sendable {
     private let cancelled = Mutex(false)
-    func cancel() { cancelled.withLock { $0 = true } }
+    private let onCancel: @Sendable () -> Void
+
+    init(onCancel: @escaping @Sendable () -> Void = {}) { self.onCancel = onCancel }
+
+    func cancel() {
+        let first = cancelled.withLock { value in
+            guard !value else { return false }
+            value = true
+            return true
+        }
+        // The callback may acquire the worker lock. Never invoke it under ours.
+        if first { onCancel() }
+    }
     var isCancelled: Bool { cancelled.withLock { $0 } }
     func check() throws {
         if isCancelled || Task.isCancelled { throw CancellationError() }

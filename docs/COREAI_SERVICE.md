@@ -55,7 +55,8 @@ curl -sS http://127.0.0.1:11236/v1/models
 | `ready`、`stopping`、`phase` | 就绪、停止中，以及 loading/idle/prefill/decode/stopped 阶段 |
 | `capacity` | 已加载模型的上下文容量；加载完成前为 0 |
 | `progressCompleted`、`progressTotal` | 当前阶段的 token 进度；idle 时归零 |
-| `requests_in_flight` | 已准入且尚未释放的推理请求数 |
+| `requests_in_flight`、`active_requests`、`queued_requests` | 已准入总数、执行中数量、排队数量 |
+| `max_pending_requests` | 执行中加排队请求的总限额 |
 | `completed`、`cancelled`、`failed`、`lastError` | 累计请求结果及最近错误 |
 | `prefix_cache_enabled`、`prefix_cache_limit_bytes` | 缓存配置 |
 | `cacheEntries`、`cacheBytes` | 最近一次请求清理后记录的缓存条目和逻辑字节数 |
@@ -140,7 +141,7 @@ curl -N -sS http://127.0.0.1:11236/v1/chat/completions \
 
 网络关闭、发送失败或超时会设置该请求的取消标志。推理在 token 边界协作检查；已经提交的 CoreAI 调用不承诺立即中断。TCP 请求写端的正常半关闭允许服务器继续返回结果；连接真正不可读的情形依靠发送失败、连接状态或 deadline 识别。
 
-总请求 deadline 默认 1800 秒，从连接建立开始计算，包含排队和 prefill；慢请求体接收的 deadline 固定为 15 秒，单次发送等待固定为 15 秒。超时尚能发送时返回 408，流式响应已经开始则发送错误事件；已有发送阻塞时可能直接关闭连接。取消后队列名额在 worker 清理完成时释放，不保证客户端断开即刻释放。
+总请求 deadline 默认 1800 秒，从连接建立开始计算，包含排队和 prefill；慢请求体接收的 deadline 固定为 15 秒，单次发送等待固定为 15 秒。超时尚能发送时返回 408，流式响应已经开始则发送错误事件；已有发送阻塞时可能直接关闭连接。网络确认取消后，尚未执行的排队请求立即从有界 FIFO 移除并释放名额；已开始执行的请求仍需等待 token 边界和 reset 才释放。唤醒流不保存请求内容，因此反复取消不会遗留占位。正常 TCP 写端半关闭不等于取消。
 
 SIGINT/SIGTERM 停止接收新请求、关闭连接、取消请求，并等待 worker 清理。模型归单一推理任务持有，HTTP 的健康查询不进入模型执行器。
 
@@ -164,7 +165,7 @@ Prefill 和 decode 单独统计。health 的 `prefillSeconds` 包含缓存恢复
 
 ## 运行验证
 
-2026-09-17，M5 Max / macOS27，以4096 attention、既有完整dense和Q4 MoE资产测试。最终服务二进制SHA256为 `5d3498b3b84f771a8b1e5703a4aab4f1866f55aec0512a50ab34ee6822adeb9a`。
+2026-09-17，M5 Max / macOS27，以4096 attention、既有完整dense和Q4 MoE资产测试。首版验证二进制SHA256为 `5d3498b3b84f771a8b1e5703a4aab4f1866f55aec0512a50ab34ee6822adeb9a`；后续排队取消修复版另行记录于下文。
 
 - `results/coreai-service/http-final.json`：16项通过。实际模型覆盖JSON/SSE、37-token完整缓存命中、system前缀复用、47/83不同系统消息隔离、多轮53、参数拒绝、预填中断及后续请求恢复。最终ready、在途请求0。
 - `results/coreai-service/transport-cpu/repository-tool-report.json`：18项CPU fake-backend网络检查通过，覆盖限制、合法TCP半关闭、断连、慢读、deadline、连接上限和SIGTERM。这些网络时延不是实际模型性能。
@@ -179,6 +180,21 @@ python3 scripts/check_coreai_service.py \
 
 python3 scripts/check_coreai_http_transport.py \
   --port 11239 --output results/local-coreai-transport.json
+
+python3 scripts/check_coreai_request_queue.py \
+  --output results/local-coreai-queue.json
 ```
 
-完整2064-token稀疏边界与热恢复请求正在另行验证，结果完成后补入；当前上述通过结论仅对应已记录的短请求和CPU网络检查。
+上述 `5d3498b3…2adeb9a` 二进制还完成了真实2064-token冷请求和完整前缀恢复：`results/coreai-service/long-acceptance.json` 的5项检查通过，两次均输出47、completion计数3（含EOS），热请求命中2064/2064。冷请求804.79s，重复请求0.857s，都是端到端HTTP耗时；没有把缓存命中折算成kernel吞吐。这个prompt跨过QSA稀疏切换边界，但不等于4096全容量或普遍长文本质量验收。
+
+长请求已经直观显示S1首次prefill的性能限制；服务可用于功能试用，尚不适合agent长系统提示词业务。
+
+
+排队取消修复版二进制为 `7edd1c57ef5d676be5f5e5934915c5cd73767ea40a56637a32c1e8b3062c0726`。修复将请求载荷移出不可撤回的stream缓冲，使用独立有界FIFO和合并唤醒；网络确认取消时，queued请求立即移除，active请求仍需reset。模型计算、attention资产和checkpoint格式未改变；上面的2064-token测试对应前一二进制，没有把它伪记成修复版重新执行。
+
+- `results/coreai-service/http-queue-final.json`：17/17通过。新增实模A持续prefill、B尚未收到响应头就RST取消、C在满队列时429的三轮验证；每轮取消后inflight回到1、queued回到0，后续短请求输出51。最终cancelled=5（1个原active检查，加新检查的3个queued和1个active），没有遗留请求。`failed=1`来自故意越界的400检查，并非模型执行异常。
+- `results/coreai-service/request-queue-cpu/report.json`：7/7通过，含5000次取消后复用、900个并发请求核账、FIFO与stop竞态。这是队列检查，不是模型并发吞吐。
+- `results/coreai-service/transport-cpu/queue-version-report.json`：当前源文件的18/18 CPU网络检查复过。
+- 独立CoreAI产品及原有 `ane-runner` release产品均构建成功；本轮没有运行XCTest。短请求回归后服务ready、active/queued均为0、缓存开启。
+
+修复版另做两条普通文本人工核对（`results/coreai-service/language-examples.json`）：中文一句话解释缓存，31个prompt tokens、37个completion tokens、25.23s；Python加法函数，41个prompt tokens、18个completion tokens、17.54s，复用11个system tokens。两者均正常EOS，中文可读且回答问题，代码AST确认为 `def add(a,b): return a+b`。这是两个功能示例，不是全面代码能力或源模型质量等价评测。

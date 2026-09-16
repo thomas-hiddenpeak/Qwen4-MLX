@@ -55,13 +55,16 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
     private let configuration: CoreAIServiceConfiguration
     private let state = Mutex(Shared())
     private let task = Mutex<Task<Void, Never>?>(nil)
-    private let stream: AsyncStream<Job>
-    private let continuation: AsyncStream<Job>.Continuation
+    private let queue: CoreAIRequestQueue<Job>
+    // Coalesced wakeups carry no request payload; queued jobs can be removed.
+    private let stream: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
 
     init(configuration: CoreAIServiceConfiguration) {
         self.configuration = configuration
         modelID = configuration.modelID
-        (stream, continuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingOldest(configuration.maxPendingRequests))
+        queue = CoreAIRequestQueue(limit: configuration.maxPendingRequests)
+        (stream, continuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
     }
 
     func start() {
@@ -72,11 +75,14 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
     }
 
     func health() -> Data {
-        let (status, count) = state.withLock { ($0.status, $0.jobs.count) }
+        let (status, count, queueState) = state.withLock { ($0.status, $0.jobs.count, queue.snapshot) }
         var data = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(status))) as? [String: Any] ?? [:]
         data["backend"] = "native-coreai"
         data["model"] = modelID
         data["requests_in_flight"] = count
+        data["active_requests"] = queueState.activeCount
+        data["queued_requests"] = queueState.queuedCount
+        data["max_pending_requests"] = queueState.limit
         data["prefix_cache_enabled"] = configuration.cacheBytes > 0 && configuration.cacheEntries > 0
         data["prefix_cache_limit_bytes"] = configuration.cacheBytes
         data["prefill_policy"] = "tokenwise"
@@ -92,34 +98,51 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
         guard request.mtpDepth == 0, !request.parsesTools, request.tools.isEmpty else {
             throw QwenHTTPProtocolError(statusCode: 400, message: "CoreAI currently supports text AR requests; tools and MTP are unavailable")
         }
-        let id = UUID(), cancellation = CoreAIRequestCancellation()
+        let id = UUID()
+        let cancellation = CoreAIRequestCancellation { [weak self] in self?.cancelQueued(id) }
+        let job = Job(id: id, request: request, cancellation: cancellation, emit: onEvent)
         try state.withLock { value in
             guard value.status.ready, !value.status.stopping else {
                 throw QwenHTTPProtocolError(statusCode: 503, message: "CoreAI model is loading, unavailable or stopping")
             }
-            guard value.jobs.count < configuration.maxPendingRequests else {
+            do { try queue.enqueue(id: id, job: job) }
+            catch CoreAIRequestQueue<Job>.AdmissionError.full {
                 throw QwenHTTPProtocolError(statusCode: 429, message: "CoreAI request queue is full")
+            } catch {
+                throw QwenHTTPProtocolError(statusCode: 503, message: "CoreAI worker is unavailable")
             }
             value.jobs[id] = cancellation
         }
-        let job = Job(id: id, request: request, cancellation: cancellation, emit: onEvent)
-        switch continuation.yield(job) {
-        case .enqueued: return cancellation
-        case .dropped, .terminated:
-            _ = state.withLock { $0.jobs.removeValue(forKey: id) }
+        switch continuation.yield(()) {
+        case .enqueued, .dropped:
+            // A replaced wakeup is harmless: the consumer drains the FIFO.
+            return cancellation
+        case .terminated:
+            cancellation.cancel()
             throw QwenHTTPProtocolError(statusCode: 503, message: "CoreAI worker is unavailable")
         @unknown default:
-            _ = state.withLock { $0.jobs.removeValue(forKey: id) }
+            cancellation.cancel()
             throw QwenHTTPProtocolError(statusCode: 503, message: "CoreAI worker could not admit this request")
         }
     }
 
-    func shutdown() {
+    private func cancelQueued(_ id: UUID) {
         state.withLock { value in
+            // An active job retains its slot until its model state is reset.
+            guard queue.cancelQueued(id: id) != nil else { return }
+            value.jobs.removeValue(forKey: id)
+            value.status.cancelled += 1
+        }
+    }
+
+    func shutdown() {
+        let cancellations = state.withLock { value in
             value.status.stopping = true
             value.status.ready = false
-            for cancellation in value.jobs.values { cancellation.cancel() }
+            return Array(value.jobs.values)
         }
+        // Cancellation callbacks remove queued jobs and acquire state themselves.
+        for cancellation in cancellations { cancellation.cancel() }
         continuation.finish()
         task.withLock { $0?.cancel() }
     }
@@ -136,58 +159,69 @@ final class CoreAIServiceWorker: CoreAIServiceBackend {
                 value.status.ready = false
                 value.status.phase = "stopped"
                 value.jobs.removeAll()
+                _ = queue.stopAndDrain()
+                if let active = queue.snapshot.activeID { _ = queue.finishActive(id: active) }
             }
         }
         do {
             let session = try await CoreAIServiceSession(configuration: configuration)
             try Task.checkCancellation()
-            state.withLock { $0.status.ready = true; $0.status.capacity = session.model.capacity; $0.status.phase = "idle" }
-            for await job in stream {
-                if Task.isCancelled { break }
-                do {
-                    try job.cancellation.check()
-                    let result = try await session.generate(job.request, cancellation: job.cancellation, emit: job.emit) { [self] phase, completed, total in
-                        state.withLock {
-                            $0.status.phase = phase
-                            $0.status.progressCompleted = completed
-                            $0.status.progressTotal = total
+            state.withLock {
+                guard !$0.status.stopping else { return }
+                $0.status.ready = true; $0.status.capacity = session.model.capacity; $0.status.phase = "idle"
+            }
+            for await _ in stream {
+                while !Task.isCancelled, let entry = queue.takeNext() {
+                    let job = entry.job
+                    do {
+                        try job.cancellation.check()
+                        let result = try await session.generate(job.request, cancellation: job.cancellation, emit: job.emit) { [self] phase, completed, total in
+                            state.withLock {
+                                $0.status.phase = phase
+                                $0.status.progressCompleted = completed
+                                $0.status.progressTotal = total
+                            }
                         }
+                        try await job.emit(.completed(result))
+                        state.withLock { value in
+                            value.status.completed += 1
+                            value.status.cachedTokens += result.cachedTokens
+                            if result.cachedTokens > 0 { value.status.cacheHits += 1 }
+                            value.status.prefillTokensProcessed += result.promptTokens - result.cachedTokens
+                            value.status.prefillSeconds += result.prefillSeconds
+                            value.status.decodeSeconds += result.decodeSeconds
+                        }
+                    } catch {
+                        let cancelled = job.cancellation.isCancelled || error is CancellationError || Task.isCancelled
+                        state.withLock { value in
+                            if cancelled { value.status.cancelled += 1 }
+                            else { value.status.failed += 1; value.status.lastError = error.localizedDescription }
+                        }
+                        let status = (error as? QwenHTTPProtocolError)?.statusCode ?? (cancelled ? 408 : 500)
+                        try? await job.emit(.failed(status: status, message: cancelled ? "Request cancelled" : error.localizedDescription))
                     }
-                    try await job.emit(.completed(result))
+                    // Reset even after partial/failed tokens before accepting the next request.
+                    try session.model.reset()
                     state.withLock { value in
-                        value.status.completed += 1
-                        value.status.cachedTokens += result.cachedTokens
-                        if result.cachedTokens > 0 { value.status.cacheHits += 1 }
-                        value.status.prefillTokensProcessed += result.promptTokens - result.cachedTokens
-                        value.status.prefillSeconds += result.prefillSeconds
-                        value.status.decodeSeconds += result.decodeSeconds
+                        _ = queue.finishActive(id: job.id)
+                        value.jobs.removeValue(forKey: job.id)
+                        value.status.cacheEntries = session.cacheCount
+                        value.status.cacheBytes = session.cacheBytes
+                        value.status.phase = "idle"
+                        value.status.progressCompleted = 0
+                        value.status.progressTotal = 0
                     }
-                } catch {
-                    let cancelled = job.cancellation.isCancelled || error is CancellationError || Task.isCancelled
-                    state.withLock { value in
-                        if cancelled { value.status.cancelled += 1 }
-                        else { value.status.failed += 1; value.status.lastError = error.localizedDescription }
-                    }
-                    let status = (error as? QwenHTTPProtocolError)?.statusCode ?? (cancelled ? 408 : 500)
-                    try? await job.emit(.failed(status: status, message: cancelled ? "Request cancelled" : error.localizedDescription))
-                }
-                // Reset even after partial/failed tokens before accepting the next request.
-                try session.model.reset()
-                state.withLock { value in
-                    value.jobs.removeValue(forKey: job.id)
-                    value.status.cacheEntries = session.cacheCount
-                    value.status.cacheBytes = session.cacheBytes
-                    value.status.phase = "idle"
-                    value.status.progressCompleted = 0
-                    value.status.progressTotal = 0
                 }
             }
         } catch {
-            state.withLock { $0.status.lastError = error.localizedDescription; $0.status.failed += 1 }
-            // Wake any already admitted callers rather than leaving them queued indefinitely.
+            state.withLock {
+                $0.status.ready = false
+                $0.status.lastError = error.localizedDescription; $0.status.failed += 1
+            }
+            // Atomically close admission, then notify the bounded remaining queue.
             continuation.finish()
-            for await job in stream {
-                try? await job.emit(.failed(status: 503, message: "CoreAI model is unavailable"))
+            for entry in queue.stopAndDrain() {
+                try? await entry.job.emit(.failed(status: 503, message: "CoreAI model is unavailable"))
             }
         }
     }

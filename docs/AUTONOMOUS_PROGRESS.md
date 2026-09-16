@@ -1,6 +1,8 @@
 # 自主研究与开发接续
 
-2026-09-17 CoreAI试用服务：新增独立 `coreai-runner serve`，JSON/SSE、健康查询、单worker有界队列、协作取消/reset，以及512MiB/2条完整状态RAM前缀缓存（system与prompt精确token前缀）。全部48层attention+PLE深拷贝checkpoint/restore、owner与offset校验已接入，4096容量资产导出完成。最终binary `5d3498b3…2adeb9a` 的16项实际HTTP检查和18项CPU网络检查通过；修复状态序列清零7.1s开销，同尺寸批量填充约12–29ms且逐字节全零，热请求由约9.23s降为0.77s。不是decode提速；S1prefill、源BF16质量差异、262K/SSD/PD/工具调用仍有缺口。完整2064token稀疏边界/热缓存正在独立实测，不能提前称为通过。mlx-serve继续关闭，详情与复跑见[CoreAI服务](COREAI_SERVICE.md)。
+2026-09-17 CoreAI试用服务：新增独立 `coreai-runner serve`，JSON/SSE、健康查询、单worker有界队列、协作取消/reset，以及512MiB/2条完整状态RAM前缀缓存。48层attention+PLE深拷贝checkpoint/restore、owner与offset校验已接入，4096容量资产导出完成。修复状态序列清零7.1s开销，同尺寸批量填充约12–29ms且逐字节全零，首版热请求约9.23s→0.77s，属于请求清理改善而非decode提速。
+
+首版 `5d3498b3…2adeb9a` 的16项HTTP与完整2064-token稀疏边界/热恢复5项通过；两条长请求都输出47，冷804.79s、热命中2064/2064并耗时0.857s。后续修复“取消的queued请求在active长预填期间占坑”：可移除FIFO+无载荷合并唤醒，cancel回调锁外执行，active名额保持到reset。当前 `7edd1c57…62c0726` 实模17项、CPU网络18项、队列7项通过，含三轮queued RST立即释放与后续推理恢复；新旧产品release均构建通过。2064长测试未在只改队列的版本重复执行。完整证据、API和复跑见[CoreAI服务](COREAI_SERVICE.md)。仍是4K容量/S1prefill的功能试用版，源BF16质量等价、262K/SSD/PD/工具调用尚未迁移；MTP后置，mlx-serve继续关闭。
 
 2026-09-17 完整 CoreAI 迁移：按用户“完全迁移”新增独立 `coreai-runner`，无 MLX/CMLX 链接或回退。embedding、96 HC read、共享 HC write、48 attention、48 全512专家 MoE、PLE与head均在CoreAI执行；CPU保留分词/SSD FP8行读取/greedy及QSA标量计数校验。原 Q4 字节以I16视图规避本机GPU I32解包低位错误，完整layer0对同FP16边界CPU误差relative L2 0.000461、路由精确；所有模型资产已导出约77.88GB，没有全专家dense展开。
 
