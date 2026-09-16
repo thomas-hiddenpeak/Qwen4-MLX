@@ -148,6 +148,22 @@ public final class CoreAIHybridAttention {
     /// Failures poison the session because earlier layers of the same token may
     /// already have advanced. Call reset() and replay the prompt before continuing.
     public func forward(layer: Int, input: [Float], offset: Int) async throws -> [Float] {
+        let result = try await execute(layer: layer, input: .host(input), offset: offset)
+        return result.host!
+    }
+
+    /// Native activation handoff for a complete CoreAI graph chain. It does not
+    /// materialize intermediate activations or persistent state on the CPU.
+    public func forwardArray(layer: Int, input: NDArray, offset: Int) async throws -> NDArray {
+        try await execute(layer: layer, input: .native(input), offset: offset).array
+    }
+
+    private enum ActivationInput {
+        case host([Float])
+        case native(NDArray)
+    }
+
+    private func execute(layer: Int, input: ActivationInput, offset: Int) async throws -> (array: NDArray, host: [Float]?) {
         try beginOperation()
         defer { endOperation() }
         guard !isPoisoned else {
@@ -160,13 +176,24 @@ public final class CoreAIHybridAttention {
             guard offset >= 0, offset < capacity, offset == loaded.nextOffset else {
                 throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer): offset \(offset) must equal \(loaded.nextOffset) and be below capacity \(capacity)")
             }
-            guard input.count == 2560, input.allSatisfy({ $0.isFinite && Float16($0).isFinite }) else {
-                throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer): input must contain 2560 finite FP16-representable values")
-            }
             let descriptor = loaded.runner.function.descriptor
             let prepareStart = DispatchTime.now().uptimeNanoseconds
-            let tensor = CoreMLTensor(shape: [1, 1, 2560], dtype: .float16, values: input.map(Double.init))
-            let inputs = try loaded.runner.makeInputs([loaded.spec.inputName: tensor], retainedInputs: loaded.states)
+            let inputs: [String: NDArray]
+            let materializeActivation: Bool
+            switch input {
+            case .host(let values):
+                guard values.count == 2560, values.allSatisfy({ $0.isFinite && Float16($0).isFinite }) else {
+                    throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer): input must contain 2560 finite FP16-representable values")
+                }
+                let tensor = CoreMLTensor(shape: [1, 1, 2560], dtype: .float16, values: values.map(Double.init))
+                inputs = try loaded.runner.makeInputs([loaded.spec.inputName: tensor], retainedInputs: loaded.states)
+                materializeActivation = true
+            case .native(let array):
+                var retained = loaded.states
+                retained[loaded.spec.inputName] = array
+                inputs = try loaded.runner.makeInputs([:], retainedInputs: retained)
+                materializeActivation = false
+            }
             let prepareTime = CoreAIBlockRunner.milliseconds(since: prepareStart)
             try Task.checkCancellation()
             let runStart = DispatchTime.now().uptimeNanoseconds
@@ -179,9 +206,14 @@ public final class CoreAIHybridAttention {
                 throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer): output names or activation output differ from descriptor")
             }
             try CoreAIBlockRunner.validate(output, descriptor: outputDescriptor, name: loaded.spec.outputName)
-            let result = try CoreAIBlockRunner.read(output, name: loaded.spec.outputName)
-            guard result.shape == [1, 1, 2560], result.dtype == .float16 else {
+            guard output.shape == [1, 1, 2560], output.scalarType == .float16 else {
                 throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer): activation output must be FP16 [1,1,2560]")
+            }
+            let host: [Float]?
+            if materializeActivation {
+                host = try CoreAIBlockRunner.read(output, name: loaded.spec.outputName).values.map(Float.init)
+            } else {
+                host = nil
             }
             var nextStates: [String: NDArray] = [:]
             for (inputName, outputName) in loaded.spec.stateBindings {
@@ -215,7 +247,7 @@ public final class CoreAIHybridAttention {
             totalPredictionMilliseconds += predictionTime
             totalOutputMilliseconds += readTime
             lastPredictionMilliseconds = predictionTime
-            return result.values.map(Float.init)
+            return (output, host)
         } catch {
             isPoisoned = true
             poisonReason = "Layer \(layer), offset \(offset): \(error)"

@@ -3,23 +3,7 @@ import Dispatch
 import Foundation
 import Synchronization
 
-public enum QwenGenerationError: Error, LocalizedError, Equatable {
-    case invalidRequest(String)
-    case busy
-    case resourceLimit(String)
-    case cancelled
-    case unavailable(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .invalidRequest(let reason): return "Invalid generation request: \(reason)"
-        case .resourceLimit(let reason): return "State capacity unavailable: \(reason)"
-        case .busy: return "This model is already processing a generation request"
-        case .cancelled: return "Generation was cancelled"
-        case .unavailable(let reason): return "Generation is unavailable: \(reason)"
-        }
-    }
-}
+public typealias QwenGenerationError = ANERunnerCore.QwenGenerationError
 
 /// Token-only, greedy text generation. Validation never touches the GPU.
 public struct QwenGenerationRequest: Sendable {

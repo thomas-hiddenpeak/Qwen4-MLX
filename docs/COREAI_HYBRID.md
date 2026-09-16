@@ -1,5 +1,7 @@
 # CoreAI / MLX 完整模型混合生成
 
+此页保留混合阶段结果。后续已完成独立、无 MLX 链接的[完整 CoreAI 计算路径](COREAI_NATIVE.md)，新的生成与迁移边界以该文档为准；本页结果仍仅适用于当时的混合实现。
+
 目标先从真实文本输入走通全部 48 层并连续生成，再逐步迁移和优化。`generate-coreai-hybrid` 是独立 Swift 诊断入口，运行期间不启动 Python 或原作者 mlx-serve。
 
 ## 2026-09-17 实际结果
@@ -70,4 +72,4 @@ xcrun swift build -c release
 
 MLX 的执行流绑定原生线程，普通 Swift async 函数在 CoreAI 调用返回后可能切换线程。完整命令将模型加载、MLX 运算、CoreAI await 后续算、reset 和基线对照放在专用原生线程执行器上。库调用者也须遵守该约束；模型在每次恢复后检查线程，不能仅靠串行 DispatchQueue 或单请求来保证。
 
-下一步以真实生成结果决定：先修任何完整链路或累计精度问题，再扩展 CoreAI 的 MoE/HC/PLE 覆盖、减少桥接与优化 prefill。MTP 保持后置。
+后续的 MoE/HC/PLE 与输出头迁移已进入[完整 CoreAI 入口](COREAI_NATIVE.md)。源模型累计精度、性能与服务状态接入继续独立验收，MTP 保持后置。

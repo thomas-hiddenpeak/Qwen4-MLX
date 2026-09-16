@@ -1,16 +1,23 @@
 # Qwen4-MLX
 
-面向 Apple Silicon 的独立 Swift / MLX 推理工程，当前适配 **Qwen3.8 Flash-Next 的完整48层文本模型**，主要在 M5 Max 上验证。原始 Q4 专家与 BF16 主干常驻统一内存，51.2B n-gram 表通过 SSD 按需读取。MLX C / Metal 执行计算，Swift 管理分词、状态、读取、调度与服务；推理不需要 Python 进程或作者 HTTP 服务。
+面向 Apple Silicon 的独立 Swift 推理工程，当前适配 **Qwen3.8 Flash-Next 的完整48层文本模型**，主要在 M5 Max 上验证。macOS 27 新增不依赖 MLX 的完整 CoreAI 计算路径；既有 MLX C / Metal 后端保留服务与缓存能力。两条路径均保留原始 Q4 专家及 SSD 按需读取的 51.2B n-gram 表，Swift 管理分词与状态，推理不需要 Python 进程或作者 HTTP 服务。
 
 GitHub 默认分支为 `codex/runner-baseline`。实验分支的阶段成果经验证后及时纳入该分支；[主线整合记录](docs/MAINLINE_INTEGRATION.md)区分可用能力、显式候选和默认行为。
 
 KV cache 是既有服务的重点。[关键能力计划](docs/KV_CACHE_CAPABILITIES.md)依据 vLLM、SGLang、LMCache、DwarfStar 与 MLX LM 的固定源码快照，安排完整会话复用、真实内存压力控制、SSD 调度及有效收益指标，再推进物理页共享与增量存储。现有联合状态额度、同前缀请求合并、可选持久化 SSD 和已验证范围见[缓存可靠性](docs/KV_CACHE_RELIABILITY.md)；各项实现和验收进度在能力计划中分别记录。**MTP 性能优化放到计划后段**，已有显式 MTP 的正确性和状态隔离要求不变。
 
-macOS 27 上已跑通 [CoreAI / MLX 混合的完整 48 层文本生成](docs/COREAI_HYBRID.md)：36 层 GDN、12 层 Attention/QSA 使用系统 CoreAI，原 Q4 专家、HC、SSD PLE 与输出头复用独立 MLX 实现。新入口当前为256-token容量、逐 token prefill 的实验路径，尚非纯 CoreAI 或服务替代。此前的[子图结果](docs/COREAI_BACKEND.md)与[连续状态验证](docs/COREAI_STATEFUL.md)保留；后续先完善完整链路，再迁移其余模块和优化。
+macOS 27 上已跑通 [完整 CoreAI 文本生成](docs/COREAI_NATIVE.md)：独立 `coreai-runner` 将 embedding、HC、36 层 GDN、12 层 QSA、全部路由/共享专家、PLE 投影与卷积、输出头交给系统 CoreAI。CPU 负责分词、SSD 行读取/解包及 greedy 选词；可执行程序不链接 MLX。当前为256-token容量、逐 token prefill，主干采用 FP16/部分 FP32；已观察到相对 BF16 源模型的输出差异，尚未完成质量或性能验收，HTTP 与 prefix/SSD KV cache 也尚未迁移。此前的[混合生成](docs/COREAI_HYBRID.md)、[子图结果](docs/COREAI_BACKEND.md)与[连续状态验证](docs/COREAI_STATEFUL.md)保留追溯。
 
 ## 构建与生成
 
-需要兼容的外部 MLX / MLX C 原生库。现有工作区默认位置为 `../qwen38-ssd/runtime/mlx-serve/lib/mlx`，也可设置 `ANERUNNER_MLX_ROOT`；版本、库布局和完整用法见 [GPU runner](GPU_RUNNER.md)。Package 最低目标为 macOS 26.2，已有 macOS 26.6.2 / Swift 6.3.3 构建记录，当前 MLX 路径不要求 macOS 27。
+新 CoreAI 入口使用 macOS 27 / SDK 27，单独构建不需要 MLX：
+
+```sh
+xcrun swift build -c release --product coreai-runner
+.build/release/coreai-runner help
+```
+
+首次运行需离线导出完整 CoreAI 资产，导出与生成命令见[CoreAI完整迁移](docs/COREAI_NATIVE.md)。下面的既有 MLX 入口需要兼容的外部 MLX / MLX C 原生库。现有工作区默认位置为 `../qwen38-ssd/runtime/mlx-serve/lib/mlx`，也可设置 `ANERUNNER_MLX_ROOT`；版本、库布局和完整用法见 [GPU runner](GPU_RUNNER.md)。Package 最低目标为 macOS 26.2，已有 macOS 26.6.2 / Swift 6.3.3 构建记录，MLX 路径不要求 macOS 27。
 
 从本仓库目录执行，模型目录按实际安装位置替换：
 
@@ -27,6 +34,8 @@ xcrun swift build -c release
 已提供 [11k agent 输入](fixtures/gpu-agent-11k/provenance.json)，可用 `--tokens-file fixtures/gpu-agent-11k/prompt-token-ids.json` 替换 `--prompt`，保持 `--context 16384`。生成报告保存完整输出 token IDs 及分阶段成本。运行整模型实验时应安排独占模型资源；原作者 mlx-serve 默认关闭，需要对照时再按[参考服务配置](docs/MLX_SERVE_SERVICE.md)启动。[实验控制器](docs/EXPERIMENT_CONTROLLER.md)只清理其拥有的进程，默认不在结束后重启参考服务。
 
 ## 当前默认与能力状态
+
+下表及后续 HTTP / cache 能力属于既有 MLX 后端，不能据此推断新 CoreAI 入口已支持这些能力。
 
 | 项目 | 当前行为 |
 | --- | --- |
@@ -113,7 +122,7 @@ ANERUNNER_GATEUP_LIBRARY="$PWD/results/local-moe-native/lib/libanemlx_moe_gateup
 ## 文档、历史与来源
 
 - [KV cache关键能力](docs/KV_CACHE_CAPABILITIES.md)、[主线吸收计划](docs/UPSTREAM_ADOPTION_PLAN.md)、[缓存可靠性验收](docs/KV_CACHE_RELIABILITY.md)、[MTP发布条件](docs/MTP_RELEASE_CRITERIA.md)：区分当前计划、实际完成与发布门槛。早期[精确前缀设计](docs/EXACT_PREFIX_CHECKPOINT_DESIGN.md)及[首轮缓存验收](docs/AR_PREFIX_CACHE.md)保留追溯。
-- [CoreAI后端](docs/COREAI_BACKEND.md)：macOS 27 系统运行时、真实权重子图与整模型接入计划；[Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)保留早期局部数值、硬件证据和负结果。完整MLX生成当前不使用ANE。
+- [CoreAI完整迁移](docs/COREAI_NATIVE.md)：独立无 MLX 可执行程序、原 Q4 压缩专家和实际完整生成；[CoreAI后端](docs/COREAI_BACKEND.md)与[Core ML / ANE历史实验](docs/COREML_ANE_HISTORY.md)保留早期局部数值、硬件证据和负结果。CoreAI 当前选择 GPU 偏好，尚无 ANE 驻留证据。
 - [上游许可](UPSTREAM-LICENSE)与[garnermccloud/mlx-serve固定源码](https://github.com/garnermccloud/mlx-serve/blob/7dbcba04c98e4fd3bcc533c63e645547f13cc3b1/src/qwen4_exp.zig)：复用与移植文件保留来源和许可；vLLM、SGLang、DwarfStar的借鉴范围见吸收计划。
 
 本仓库提交源码、测试、脚本、文档与文本fixture。模型权重、大型张量、`results/`和构建产物不随克隆提供，文档中的历史本地结果链接需要对应实验产物。Swift推理不启动Python；Python用于插件构建、离线转换和验证。

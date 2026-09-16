@@ -18,10 +18,12 @@ let package = Package(
         .library(name: "ANERunnerCore", targets: ["ANERunnerCore"]),
         .library(name: "ANERunnerGPU", targets: ["ANERunnerGPU"]),
         .executable(name: "ane-runner", targets: ["ANERunnerCLI"]),
+        .executable(name: "coreai-runner", targets: ["CoreAIRunnerCLI"]),
         .executable(name: "ane-telemetry", targets: ["ANERunnerTelemetry"]),
     ],
     targets: [
         .target(name: "ANERunnerCore"),
+        .executableTarget(name: "CoreAIRunnerCLI", dependencies: ["ANERunnerCore"]),
         .executableTarget(name: "ANERunnerTelemetry",
             cSettings: [.unsafeFlags(["-fobjc-arc", "-fblocks"])],
             linkerSettings: [.linkedFramework("Foundation"), .linkedFramework("IOKit"), .linkedLibrary("IOReport")]),

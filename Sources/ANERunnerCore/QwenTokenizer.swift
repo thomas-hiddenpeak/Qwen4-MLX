@@ -1,4 +1,3 @@
-import ANERunnerCore
 import Foundation
 import CoreFoundation
 
@@ -100,12 +99,12 @@ public final class QwenTokenizer {
               stages[1]["type"] as? String == "ByteLevel", stages[1]["add_prefix_space"] as? Bool == false,
               stages[1]["use_regex"] as? Bool == false,
               let normalizer = root["normalizer"] as? [String: Any], normalizer["type"] as? String == "NFC" else {
-            throw GPUWeightError.invalid("Unsupported Qwen tokenizer structure")
+            throw QwenModelDataError.invalid("Unsupported Qwen tokenizer structure")
         }
         guard model["dropout"] == nil || model["dropout"] is NSNull,
               model["byte_fallback"] as? Bool == false, model["ignore_merges"] as? Bool == false,
               model["continuing_subword_prefix"] as? String == "", model["end_of_word_suffix"] as? String == "" else {
-            throw GPUWeightError.invalid("Unsupported BPE modifiers")
+            throw QwenModelDataError.invalid("Unsupported BPE modifiers")
         }
         split = try NSRegularExpression(pattern: regex)
         var vocab: [String: Int32] = [:]
@@ -113,7 +112,7 @@ public final class QwenTokenizer {
         vocab.reserveCapacity(rawVocab.count + addedRaw.count)
         for (token, rawID) in rawVocab {
             let id = try Self.tokenID(rawID)
-            guard ids.insert(id).inserted else { throw GPUWeightError.invalid("Duplicate BPE token ID") }
+            guard ids.insert(id).inserted else { throw QwenModelDataError.invalid("Duplicate BPE token ID") }
             vocab[token] = id
         }
         // GPT-2's byte-to-Unicode bijection, over Unicode SCALARS, not Swift
@@ -130,7 +129,7 @@ public final class QwenTokenizer {
         var byteIDs: [Int32] = []
         for (byte, scalar) in byteScalars.enumerated() {
             inverse[scalar] = UInt8(byte)
-            guard let unicode = Unicode.Scalar(scalar), let id = vocab[String(unicode)] else { throw GPUWeightError.invalid("Incomplete BPE byte alphabet") }
+            guard let unicode = Unicode.Scalar(scalar), let id = vocab[String(unicode)] else { throw QwenModelDataError.invalid("Incomplete BPE byte alphabet") }
             byteIDs.append(id)
         }
         bytesToIDs = byteIDs
@@ -140,11 +139,11 @@ public final class QwenTokenizer {
                   let rawID = entry["id"], let special = entry["special"] as? Bool,
                   entry["lstrip"] as? Bool == false, entry["rstrip"] as? Bool == false,
                   entry["single_word"] as? Bool == false, entry["normalized"] as? Bool == false else {
-                throw GPUWeightError.invalid("Unsupported added-token matching flags")
+                throw QwenModelDataError.invalid("Unsupported added-token matching flags")
             }
             let id = try Self.tokenID(rawID)
-            if let old = vocab[token], old != id { throw GPUWeightError.invalid("Conflicting added token") }
-            if vocab[token] == nil && !ids.insert(id).inserted { throw GPUWeightError.invalid("Duplicate added-token ID") }
+            if let old = vocab[token], old != id { throw QwenModelDataError.invalid("Conflicting added token") }
+            if vocab[token] == nil && !ids.insert(id).inserted { throw QwenModelDataError.invalid("Duplicate added-token ID") }
             vocab[token] = id
             allAdded.append(Added(text: token, id: id, special: special))
         }
@@ -174,7 +173,7 @@ public final class QwenTokenizer {
             else {
                 var bytes: [UInt8] = []
                 for scalar in token.unicodeScalars {
-                    guard let byte = inverse[scalar.value] else { throw GPUWeightError.invalid("Invalid byte-level BPE vocabulary symbol") }
+                    guard let byte = inverse[scalar.value] else { throw QwenModelDataError.invalid("Invalid byte-level BPE vocabulary symbol") }
                     bytes.append(byte)
                 }
                 decoded[id] = bytes
@@ -187,12 +186,12 @@ public final class QwenTokenizer {
             let parts: [String]
             if let string = raw as? String { parts = string.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false).map(String.init) }
             else if let pair = raw as? [String] { parts = pair }
-            else { throw GPUWeightError.invalid("Invalid BPE merge") }
+            else { throw QwenModelDataError.invalid("Invalid BPE merge") }
             guard parts.count == 2, let left = vocab[parts[0]], let right = vocab[parts[1]], let result = vocab[parts[0] + parts[1]] else {
-                throw GPUWeightError.invalid("BPE merge references missing vocabulary")
+                throw QwenModelDataError.invalid("BPE merge references missing vocabulary")
             }
             let key = Self.pair(left, right)
-            guard rules[key] == nil else { throw GPUWeightError.invalid("Duplicate BPE merge pair") }
+            guard rules[key] == nil else { throw QwenModelDataError.invalid("Duplicate BPE merge pair") }
             rules[key] = Merge(rank: rank, token: result)
         }
         merges = rules
@@ -224,7 +223,7 @@ public final class QwenTokenizer {
         var bytes: [UInt8] = []
         for id in ids {
             if skipSpecialTokens && specialIDs.contains(id) { continue }
-            guard let token = tokenBytes[id] else { throw GPUWeightError.invalid("Unknown token ID \(id)") }
+            guard let token = tokenBytes[id] else { throw QwenModelDataError.invalid("Unknown token ID \(id)") }
             bytes.append(contentsOf: token)
         }
         return bytes
@@ -239,19 +238,19 @@ public final class QwenTokenizer {
     /// Historical assistant reasoning is preserved as the template defaults to.
     public func renderChat(messages: [ChatMessage], addGenerationPrompt: Bool = true) throws -> String {
         guard !messages.isEmpty, messages.contains(where: { $0.role == "user" && !(Self.trim($0.content).hasPrefix("<tool_response>") && Self.trim($0.content).hasSuffix("</tool_response>")) }) else {
-            throw GPUWeightError.invalid("Chat requires a user query")
+            throw QwenModelDataError.invalid("Chat requires a user query")
         }
         var rendered = ""
         for (index, message) in messages.enumerated() {
             let content = Self.trim(message.content)
             switch message.role {
             case "system":
-                guard index == 0 else { throw GPUWeightError.invalid("System message must be first") }
+                guard index == 0 else { throw QwenModelDataError.invalid("System message must be first") }
                 if !content.isEmpty { rendered += "<|im_start|>system\n" + content + "<|im_end|>\n" }
             case "user": rendered += "<|im_start|>user\n" + content + "<|im_end|>\n"
             case "assistant":
                 rendered += "<|im_start|>assistant\n<think>\n" + Self.trim(message.reasoningContent ?? "") + "\n</think>\n\n" + content + "<|im_end|>\n"
-            default: throw GPUWeightError.invalid("Text runner supports system/user/assistant only; unsupported role \(message.role)")
+            default: throw QwenModelDataError.invalid("Text runner supports system/user/assistant only; unsupported role \(message.role)")
             }
         }
         if addGenerationPrompt { rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n" }
@@ -369,7 +368,7 @@ public final class QwenTokenizer {
     private static func trim(_ text: String) -> String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
     private static func tokenID(_ raw: Any) throws -> Int32 {
         guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), let id = Int32(n.stringValue), id >= 0 else {
-            throw GPUWeightError.invalid("Invalid tokenizer ID")
+            throw QwenModelDataError.invalid("Invalid tokenizer ID")
         }
         return id
     }

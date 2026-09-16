@@ -27,7 +27,7 @@ public struct QwenConfiguration {
         self.modelDirectory = modelDirectory
         guard let root = try JSONSerialization.jsonObject(with: Data(contentsOf: modelDirectory.appendingPathComponent("config.json"))) as? [String: Any],
               root["model_type"] as? String == "qwen4_exp", let t = root["text_config"] as? [String: Any] else {
-            throw GPUWeightError.invalid("Expected qwen4_exp config with text_config")
+            throw QwenModelDataError.invalid("Expected qwen4_exp config with text_config")
         }
         raw = root; text = t
         func integer(_ key: String) throws -> Int { try Self.integer(t, key) }
@@ -54,7 +54,7 @@ public struct QwenConfiguration {
         guard let ids = t["ple_layer_ids"] as? [Int], ids.allSatisfy({ $0 > 0 && $0 <= validatedLayerCount }),
               let types = t["layer_types"] as? [String], types.count == layerCount,
               types.allSatisfy({ $0 == "full_attention" || $0 == "linear_attention" }) else {
-            throw GPUWeightError.invalid("Invalid Qwen layer_types/ple_layer_ids")
+            throw QwenModelDataError.invalid("Invalid Qwen layer_types/ple_layer_ids")
         }
         pleLayerIDs = ids; layerTypes = types
         rmsNormEpsilon = try Self.number(t, "rms_norm_eps")
@@ -63,14 +63,14 @@ public struct QwenConfiguration {
         partialRotaryFactor = try Self.number(rope, "partial_rotary_factor")
         guard let q = root["quantization"] as? [String: Any], let mode = q["mode"] as? String,
               let table = root["ngram_table"] as? [String: Any], let tableFile = table["file"] as? String,
-              table["format"] as? String == "fp8_e4m3fn" else { throw GPUWeightError.invalid("Missing quantization/ngram configuration") }
+              table["format"] as? String == "fp8_e4m3fn" else { throw QwenModelDataError.invalid("Missing quantization/ngram configuration") }
         quantizationBits = try Self.integer(q, "bits"); quantizationGroupSize = try Self.integer(q, "group_size")
         quantizationMode = mode; ngramTableFile = tableFile; ngramScale = try Self.number(table, "scale")
         guard expertsPerToken <= expertCount, attentionHeads % keyValueHeads == 0,
               linearValueHeads % linearKeyHeads == 0, partialRotaryFactor <= 1,
               mode == "affine", quantizationBits == 4, quantizationGroupSize == 64,
               t["hidden_act"] as? String == "silu", t["output_gate_type"] as? String == "sigmoid" else {
-            throw GPUWeightError.invalid("Unsupported Qwen architecture/quantization combination")
+            throw QwenModelDataError.invalid("Unsupported Qwen architecture/quantization combination")
         }
     }
 
@@ -78,12 +78,12 @@ public struct QwenConfiguration {
     public func number(_ key: String) throws -> Double { try Self.number(text, key) }
     private static func integer(_ object: [String: Any], _ key: String) throws -> Int {
         guard let n = object[key] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
-              let value = Int(n.stringValue), value > 0 else { throw GPUWeightError.invalid("Missing/invalid positive integer \(key)") }
+              let value = Int(n.stringValue), value > 0 else { throw QwenModelDataError.invalid("Missing/invalid positive integer \(key)") }
         return value
     }
     private static func number(_ object: [String: Any], _ key: String) throws -> Double {
         guard let n = object[key] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
-              n.doubleValue.isFinite, n.doubleValue > 0 else { throw GPUWeightError.invalid("Missing/invalid positive number \(key)") }
+              n.doubleValue.isFinite, n.doubleValue > 0 else { throw QwenModelDataError.invalid("Missing/invalid positive number \(key)") }
         return n.doubleValue
     }
 }

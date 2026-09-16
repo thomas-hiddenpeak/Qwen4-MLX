@@ -1,11 +1,9 @@
+import ANERunnerCore
 import Foundation
 import CoreFoundation
 import CMLX
 
-public enum GPUWeightError: Error, CustomStringConvertible {
-    case invalid(String)
-    public var description: String { switch self { case .invalid(let message): return message } }
-}
+public typealias GPUWeightError = ANERunnerCore.QwenModelDataError
 
 /// Confined to the model's inference thread. MLX owns tensor storage; this class
 /// never expands BF16 or packed U32 weights into a second host copy.

@@ -1,5 +1,9 @@
 # 自主研究与开发接续
 
+2026-09-17 完整 CoreAI 迁移：按用户“完全迁移”新增独立 `coreai-runner`，无 MLX/CMLX 链接或回退。embedding、96 HC read、共享 HC write、48 attention、48 全512专家 MoE、PLE与head均在CoreAI执行；CPU保留分词/SSD FP8行读取/greedy及QSA标量计数校验。原 Q4 字节以I16视图规避本机GPU I32解包低位错误，完整layer0对同FP16边界CPU误差relative L2 0.000461、路由精确；所有模型资产已导出约77.88GB，没有全专家dense展开。
+
+两条实际请求各reset重放一次，共4次EOS、41,322次CoreAI调用；介绍27 tokens、算术3 tokens含EOS，reset精确相同、实际运行MLX镜像为空。介绍第17token与源BF16参考分歧，不能称质量等价；算术输出51与源参考一致。介绍decode两遍2.68/2.72 token/s、每步291次调用，只作为当前未优化功能基线；仍是容量256/S1 prefill，尚未迁移HTTP、PD调度、prefix/SSD KV cache或262K。完整release、无MLX路径独立product构建、16项CPU测试、3项不完整manifest拒绝检查通过；未运行XCTest。下一步先定位累计精度与算子开销，再扩展prefill/状态及服务，MTP后置，mlx-serve继续关闭。复跑与证据见[完整CoreAI路径](COREAI_NATIVE.md)。
+
 2026-09-17 完整链路阶段：按用户“先完整跑通再逐步优化”新增 `generate-coreai-hybrid`。真实48层中36个GDN、12个QSA使用CoreAI，Q4 MoE/HC/SSD PLE/head沿用MLX；两条短请求各reset重放一遍，4次正常EOS、5952次实际CoreAI调用，独立逐token MLX基线21/21 greedy选择相同。修复async切线程与MLX stream绑定冲突，固定线程CPU及实际生成验证通过。原始logits relative L2最高0.14467，完整质量尚未验收；当前256-token、S1 prefill，非纯CoreAI或服务替代。接下来先扩大完整链路/质量验证，再逐步迁移其余模块与优化，MTP后置；详情和复跑见[CoreAI混合生成](COREAI_HYBRID.md)。mlx-serve继续关闭。
 
 2026-09-17 CoreAI 状态阶段：新增 `CoreAIStateSession` 和 `probe-coreai-sequence`，真实权重 GDN S4+3S1、QSA 短序列及2051→2056稀疏边界在系统CoreAI/GPU偏好下共46步、298项输出/状态对照通过。reset与同一checkpoint两次续算的逻辑值逐位一致；状态用NDArray连续传递，不回灌CPU参考。FP16/FP32候选对原BF16源仍有单独误差，尚非整层/全模型验收；下一步完整decoder/量化MoE连接，详见[CoreAI连续状态](COREAI_STATEFUL.md)。参考服务保持关闭。
