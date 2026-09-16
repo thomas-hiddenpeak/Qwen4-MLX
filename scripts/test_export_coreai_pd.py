@@ -5,15 +5,19 @@ load, CoreAI runtime execution, server, or accelerator is required. Registration
 checks author only tiny temporary assets and remove them when the test finishes.
 """
 from pathlib import Path
+from copy import deepcopy
+import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from export_coreai_dense import DenseConfig, Embedding, HCRead, HCWrite, Head, PLE
 from export_coreai_gdn import GDN, GDNConfig
-from export_coreai_pd import DecoderLayer, LastHead, export_shared, install_stable_projections
+from export_coreai_pd import DecoderLayer, LastHead, export_shared, install_stable_projections, resume_manifest
+from export_moe import sha256_file
 from export_coreai_q4_moe import PROJECTIONS, Q4MoE
 
 
@@ -305,6 +309,120 @@ class CoreAIPrefillTests(unittest.TestCase):
                     self.assertTrue((path / "main.mlirb").is_file())
                     self.assertEqual(asset["inputNames"], list(examples["main"]))
                     self.assertEqual(asset["outputNames"], list(outputs))
+
+
+class ExportResumeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(2)
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='coreai-pd-resume-test-')
+        self.addCleanup(self.temporary.cleanup)
+        self.output = Path(self.temporary.name)
+        asset = self.output / 'layer-00-gdn.aimodel'
+        asset.mkdir()
+        model = asset / 'main.mlirb'
+        model.write_bytes(b'bounded completed asset fixture')
+        self.expected = {
+            'version': 1, 'backend': 'native-coreai-pd', 'status': 'exporting',
+            'completeModelLayerSet': False, 'capacity': 16384, 'tokenChunk': 2048,
+            'tailChunks': [4, 16, 32, 64, 128, 256, 512, 1024],
+            'prefillKernels': 'tensor', 'prefillSDPA': 'float16', 'fusedGateUp': True,
+            'modelDirectory': '/test/source', 'configSHA256': 'a' * 64,
+            'exporterSHA256': 'b' * 64, 'q4KernelSHA256': 'c' * 64,
+            'prefillKernelSHA256': {'grouped': 'd' * 64},
+            'requestedLayers': list(range(48)),
+            'requestedComponents': ['embedding', 'head', 'layers'],
+            'authoringSourceSHA256': {'dense': 'e' * 64},
+            'sourceProvenanceSHA256': 'f' * 64, 'layers': [], 'assets': {},
+        }
+        self.saved = deepcopy(self.expected)
+        self.saved['layers'] = [{'index': 0, 'kind': 'gdn', 'path': asset.name,
+            'function': 'main', 'prefillFunction': 'prefill', 'modelBytes': model.stat().st_size,
+            'files': [{'path': model.name, 'bytes': model.stat().st_size, 'sha256': sha256_file(model)}]}]
+        self.write()
+
+    def write(self):
+        (self.output / 'manifest.json').write_text(json.dumps(self.saved))
+
+    def test_verifies_completed_asset_and_preserves_manifest_until_caller_commits(self):
+        before = (self.output / 'manifest.json').read_bytes()
+        result = resume_manifest(self.output, self.expected, layer_kinds=['gdn'] * 48)
+        self.assertEqual(result['layers'], self.saved['layers'])
+        self.assertEqual(result['resumeHistory'][-1]['validatedLayerIndices'], [0])
+        self.assertEqual(result['originalExporterSHA256'], self.saved['exporterSHA256'])
+        self.assertEqual((self.output / 'manifest.json').read_bytes(), before)
+
+    def test_option_and_source_changes_are_rejected_even_with_exporter_override(self):
+        for key, value in [('capacity', 4096), ('tailChunks', [4]), ('configSHA256', '0' * 64),
+                           ('prefillKernelSHA256', {'grouped': '0' * 64}),
+                           ('authoringSourceSHA256', {'dense': '0' * 64}),
+                           ('sourceProvenanceSHA256', '0' * 64)]:
+            with self.subTest(key=key):
+                changed = deepcopy(self.expected)
+                changed[key] = value
+                with self.assertRaisesRegex(ValueError, key):
+                    resume_manifest(self.output, changed, allow_exporter_change=True)
+
+    def test_exporter_change_requires_opt_in_and_retains_lineage(self):
+        changed = deepcopy(self.expected)
+        changed['exporterSHA256'] = '1' * 64
+        with self.assertRaisesRegex(ValueError, 'resume-exporter-change'):
+            resume_manifest(self.output, changed)
+        result = resume_manifest(self.output, changed, allow_exporter_change=True)
+        entry = result['resumeHistory'][-1]
+        self.assertEqual(entry['previousExporterSHA256'], self.saved['exporterSHA256'])
+        self.assertEqual(entry['currentExporterSHA256'], changed['exporterSHA256'])
+
+    def test_legacy_upgrade_is_explicit_and_cannot_infer_subset_intent(self):
+        keys = ('requestedLayers', 'requestedComponents', 'authoringSourceSHA256', 'sourceProvenanceSHA256')
+        for key in keys:
+            del self.saved[key]
+        self.write()
+        with self.assertRaisesRegex(ValueError, 'Legacy'):
+            resume_manifest(self.output, self.expected)
+        result = resume_manifest(self.output, self.expected, allow_exporter_change=True)
+        self.assertEqual(result['resumeHistory'][-1]['legacyMetadataAddedAtResume'], sorted(keys))
+        subset = deepcopy(self.expected)
+        subset['requestedLayers'] = [0, 3]
+        with self.assertRaisesRegex(ValueError, 'full-model'):
+            resume_manifest(self.output, subset, allow_exporter_change=True)
+
+    def test_damaged_or_unrecorded_assets_fail_without_removal(self):
+        model = self.output / self.saved['layers'][0]['path'] / 'main.mlirb'
+        model.write_bytes(b'x' * model.stat().st_size)
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            resume_manifest(self.output, self.expected)
+        self.assertTrue(model.exists())
+        model.write_bytes(b'bounded completed asset fixture')
+        orphan = self.output / 'layer-01-gdn.aimodel'
+        orphan.mkdir()
+        with self.assertRaisesRegex(FileExistsError, 'Unrecorded/incomplete'):
+            resume_manifest(self.output, self.expected)
+        self.assertTrue(orphan.is_dir())
+
+    def test_duplicate_layers_and_nonexporting_manifests_are_rejected(self):
+        self.saved['layers'] *= 2
+        self.write()
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            resume_manifest(self.output, self.expected)
+        self.saved['layers'] = self.saved['layers'][:1]
+        for status in ('complete', 'failed'):
+            self.saved['status'] = status
+            self.write()
+            with self.assertRaisesRegex(ValueError, 'status=exporting'):
+                resume_manifest(self.output, self.expected)
+
+    def test_non_sdpa_modules_are_traced_once_per_entrypoint(self):
+        class Tiny(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+        original = torch.export.export
+        examples = {name: {'x': torch.zeros(1, count, 4)} for name, count in [('main', 1), ('prefill', 4)]}
+        with patch('export_coreai_pd.torch.export.export', wraps=original) as capture:
+            export_shared(Tiny(), examples, ('output',), self.output / 'tiny.aimodel')
+        self.assertEqual(capture.call_count, 2)
 
 
 if __name__ == "__main__":

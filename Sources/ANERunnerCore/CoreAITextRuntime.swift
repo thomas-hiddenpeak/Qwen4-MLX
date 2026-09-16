@@ -114,6 +114,15 @@ public final class CoreAITextRuntime {
         }
     }
 
+    /// Fused-layer attribution is available for the phase backend. These times
+    /// overlap the group totals and must not be added to them.
+    public var predictionMillisecondsByLayer: [String: Double] {
+        switch backend {
+        case .token: return [:]
+        case .phase(let model): return model.predictionMillisecondsByLayer
+        }
+    }
+
     public var prefillChunkSize: Int {
         switch backend {
         case .token: return 1
@@ -129,13 +138,13 @@ public final class CoreAITextRuntime {
         }
     }
 
-    /// Zero selects the primary chunk. Explicit limits preserve the public
-    /// tokenwise/primary policy; exported smaller functions handle its tails.
+    /// Zero selects the primary chunk. Any exported size may be the chunk limit;
+    /// smaller exported functions handle the remaining unpadded tail.
     public func resolvedPrefillChunkSize(requested: Int) throws -> Int {
         if requested == 0 { return prefillChunkSize }
-        guard requested == 1 || requested == prefillChunkSize else {
+        guard supportedPrefillChunks.contains(requested) else {
             throw CoreAIBlockRunnerError.invalidFixture(
-                "prefill-chunk must be 0 (automatic), 1, or the exported primary chunk \(prefillChunkSize)")
+                "prefill-chunk must be 0 (automatic) or an exported chunk from \(supportedPrefillChunks)")
         }
         return requested
     }

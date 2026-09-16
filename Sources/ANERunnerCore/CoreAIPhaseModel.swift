@@ -113,6 +113,9 @@ public final class CoreAIPhaseModel {
     public private(set) var successfulCalls = 0
     public private(set) var callCounts: [String: Int] = [:]
     public private(set) var predictionMillisecondsByGroup: [String: Double] = [:]
+    /// The same awaited call durations broken down by fused layer. These are a
+    /// separate view of group times, not additional time to sum with them.
+    public private(set) var predictionMillisecondsByLayer: [String: Double] = [:]
     public private(set) var lastForwardMilliseconds = 0.0
     public var totalPredictionMilliseconds: Double { predictionMillisecondsByGroup.values.reduce(0, +) }
 
@@ -278,7 +281,7 @@ public final class CoreAIPhaseModel {
                 inputs["stream"] = stream
                 if layer.spec.hasPLE { inputs["ple_embedding"] = rows }
                 let output = try await call(layer.functions.runner(count: count), inputs: inputs,
-                                            group: "\(phase).\(layer.spec.kind)")
+                                            group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
                 var nextStates: [String: NDArray] = [:]
                 for (name, outputName) in layer.spec.stateBindings {
                     nextStates[name] = try Self.required(output, outputName)
@@ -381,10 +384,12 @@ public final class CoreAIPhaseModel {
         successfulCalls = 0
         callCounts = [:]
         predictionMillisecondsByGroup = [:]
+        predictionMillisecondsByLayer = [:]
         lastForwardMilliseconds = 0
     }
 
-    private func call(_ runner: CoreAIBlockRunner, inputs: [String: NDArray], group: String) async throws -> [String: NDArray] {
+    private func call(_ runner: CoreAIBlockRunner, inputs: [String: NDArray], group: String,
+                      layerIndex: Int? = nil) async throws -> [String: NDArray] {
         try Task.checkCancellation()
         let validated = try runner.makeInputs([:], retainedInputs: inputs)
         let started = DispatchTime.now().uptimeNanoseconds
@@ -406,6 +411,9 @@ public final class CoreAIPhaseModel {
         successfulCalls += 1
         callCounts[group, default: 0] += 1
         predictionMillisecondsByGroup[group, default: 0] += duration
+        if let layerIndex {
+            predictionMillisecondsByLayer["\(group).layer\(layerIndex)", default: 0] += duration
+        }
         return output
     }
 

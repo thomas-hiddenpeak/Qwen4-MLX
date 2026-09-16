@@ -20,16 +20,18 @@ struct CoreAIRunnerCLI {
                 coreai-runner generate --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH --prompt TEXT \
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
-                  [--pd-manifest PATH] [--prefill-chunk 0|1|PRIMARY] [--compare-prefill true]
+                  [--pd-manifest PATH] [--prefill-chunk 0|EXPORTED_SIZE] [--compare-prefill true]
+                  [--profile-prefill true]
                 coreai-runner serve --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
                   [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
                   [--request-timeout-seconds 1800] [--max-pending-requests 2]
-                  [--pd-manifest PATH] [--prefill-chunk 0|1|PRIMARY]
+                  [--pd-manifest PATH] [--prefill-chunk 0|EXPORTED_SIZE]
                 Complete CoreAI text inference. CPU handles tokenization, SSD rows and greedy selection.
                 Requires macOS 27. The selected manifest sets context capacity.
                 generate accepts --prompt-file instead of --prompt. Chunk 0 selects the manifest primary.
-                Primary chunks: 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048. Compare runs S1/primary/primary/S1.
+                Any exported chunk may be the limit; smaller functions handle tails. Compare runs S1/primary/primary/S1.
+                profile-prefill adds per-chunk timing to the report (first 4096 chunks; full layer totals retained).
                 """)
                 return
             }
@@ -37,7 +39,7 @@ struct CoreAIRunnerCLI {
                 throw NativeCLIError.invalid("Use generate or serve followed by unique --option value pairs")
             }
             var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest", "--pd-manifest", "--prefill-chunk"]
-            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill"] :
+            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill", "--profile-prefill"] :
                 ["--host", "--port", "--prefix-cache-bytes", "--prefix-cache-entries", "--request-timeout-seconds",
                  "--max-pending-requests", "--max-connections", "--max-body-bytes", "--max-output-bytes"])
             var options: [String: String] = [:]
@@ -66,7 +68,7 @@ struct CoreAIRunnerCLI {
     private static func prefillChunkOption(_ options: [String: String]) throws -> Int {
         guard let value = Int(options["--prefill-chunk"] ?? "0"),
               [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048].contains(value) else {
-            throw NativeCLIError.invalid("prefill-chunk must be 0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, or 2048")
+            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic) or an exported size: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, or 2048")
         }
         guard value <= 1 || options["--pd-manifest"]?.isEmpty == false else {
             throw NativeCLIError.invalid("Chunked prefill requires a PD manifest")
@@ -121,9 +123,11 @@ struct CoreAIRunnerCLI {
         guard let maximum = Int(options["--max-tokens"] ?? "32"), (1...256).contains(maximum),
               let repeats = Int(options["--repeat"] ?? "1"), (1...4).contains(repeats),
               ["true", "false"].contains(options["--raw-prompt"] ?? "false"),
-              ["true", "false"].contains(options["--compare-prefill"] ?? "false") else {
-            throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...4, raw-prompt true/false")
+              ["true", "false"].contains(options["--compare-prefill"] ?? "false"),
+              ["true", "false"].contains(options["--profile-prefill"] ?? "false") else {
+            throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...4; raw-prompt, compare-prefill and profile-prefill must be true/false")
         }
+        let profilePrefill = options["--profile-prefill"] == "true"
         let requestedChunk = try prefillChunkOption(options)
         guard options["--compare-prefill"] != "true" || options["--pd-manifest"]?.isEmpty == false else {
             throw NativeCLIError.invalid("compare-prefill requires a PD manifest")
@@ -186,15 +190,35 @@ struct CoreAIRunnerCLI {
             let start = DispatchTime.now().uptimeNanoseconds
             var logits = [Float]()
             var position = 0, chunkCount = 0
+            var chunkProfiles = [[String: Any]]()
             while position < tokens.count {
                 let count = try model.nextPrefillChunkSize(remaining: tokens.count - position, limit: chunks[run])
+                let captureProfile = profilePrefill && chunkProfiles.count < 4096
+                let groupsBefore = captureProfile ? model.predictionMillisecondsByGroup : [:]
+                let layersBefore = captureProfile ? model.predictionMillisecondsByLayer : [:]
+                let readSecondsBefore = readSeconds
+                let chunkStart = DispatchTime.now().uptimeNanoseconds
                 let batch = Array(tokens[position..<position + count])
                 logits = try await model.prefill(tokens: batch, pleEmbedding: embedding(batch))
+                let chunkSeconds = seconds(chunkStart)
+                if captureProfile {
+                    let groups = timingDelta(model.predictionMillisecondsByGroup, since: groupsBefore)
+                    let ssdSeconds = readSeconds - readSecondsBefore
+                    let functionSeconds = groups.values.reduce(0, +) * 0.001
+                    chunkProfiles.append([
+                        "tokens": count, "offset_before": position, "offset_after": model.offset,
+                        "wall_seconds": chunkSeconds, "ssd_read_seconds": ssdSeconds,
+                        "function_await_seconds": functionSeconds,
+                        "wall_minus_function_and_ssd_seconds": chunkSeconds - functionSeconds - ssdSeconds,
+                        "group_milliseconds": groups,
+                        "layer_milliseconds": timingDelta(model.predictionMillisecondsByLayer, since: layersBefore)])
+                }
                 position += count; chunkCount += 1
                 if position % 32 == 0 || position == tokens.count { progress("Prefill \(position)/\(tokens.count), run \(run + 1), chunk \(chunks[run])") }
             }
             let prefillSeconds = seconds(start), prefillCalls = model.successfulCalls - initialCalls
             let prefillGroups = model.predictionMillisecondsByGroup
+            let prefillLayers = model.predictionMillisecondsByLayer
             let prefillSSDSeconds = readSeconds
             if run == 0 { firstLogits = logits }
             var errorSquared = 0.0, referenceSquared = 0.0, maximumError = 0.0
@@ -218,7 +242,7 @@ struct CoreAIRunnerCLI {
             if run == 0 { first = output }
             let decodeGroups = model.predictionMillisecondsByGroup.mapValues { $0 }
                 .map { key, value in (key, value - (prefillGroups[key] ?? 0)) }
-            runs.append(["run": run + 1, "text": try tokenizer.decode(output, skipSpecialTokens: true),
+            var runReport: [String: Any] = ["run": run + 1, "text": try tokenizer.decode(output, skipSpecialTokens: true),
                 "generated_token_ids": output, "stop_reason": stop, "reset_tokens_match": output == first,
                 "prefill_tokens": tokens.count, "prefill_seconds": prefillSeconds, "prefill_coreai_calls": prefillCalls,
                 "prefill_chunk_size": chunks[run], "prefill_chunks": chunkCount,
@@ -229,7 +253,14 @@ struct CoreAIRunnerCLI {
                 "prefill_ssd_read_seconds": prefillSSDSeconds, "decode_ssd_read_seconds": readSeconds - prefillSSDSeconds,
                 "decode_forward_steps": decodeDurations.count, "decode_forward_seconds": decodeDurations.reduce(0, +),
                 "decode_step_seconds": decodeDurations, "total_coreai_calls": model.successfulCalls - initialCalls,
-                "final_state_offset": model.offset, "ssd_logical_bytes": logicalBytes, "ssd_read_seconds": readSeconds])
+                "final_state_offset": model.offset, "ssd_logical_bytes": logicalBytes, "ssd_read_seconds": readSeconds]
+            if profilePrefill {
+                runReport["prefill_layer_milliseconds"] = prefillLayers
+                runReport["decode_layer_milliseconds"] = timingDelta(model.predictionMillisecondsByLayer, since: prefillLayers)
+                runReport["prefill_chunk_profiles"] = chunkProfiles
+                runReport["prefill_profile_omitted_chunks"] = chunkCount - chunkProfiles.count
+            }
+            runs.append(runReport)
             progress("Run \(run + 1): prefill \(prefillSeconds)s, decode \(decodeDurations.reduce(0, +))s, output matches first: \(output == first)")
         }
         let images = (0..<_dyld_image_count()).compactMap { _dyld_get_image_name($0).map { String(cString: $0) } }
@@ -244,6 +275,7 @@ struct CoreAIRunnerCLI {
             "quality_acceptance": false, "performance_acceptance": false,
             "prefill_chunk_size": model.prefillChunkSize, "independent_pd_functions": model.usesIndependentPhases,
             "supported_prefill_chunks": model.supportedPrefillChunks,
+            "prefill_profile_enabled": profilePrefill,
             "limitations": "Explicit serial phase execution; group times are awaited function wall time, not device kernel profiling. Source BF16 quality equivalence remains unverified."]
         var data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         data.append(0x0a)
@@ -252,6 +284,13 @@ struct CoreAIRunnerCLI {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
         } else { FileHandle.standardOutput.write(data) }
+    }
+
+    private static func timingDelta(_ current: [String: Double], since baseline: [String: Double]) -> [String: Double] {
+        current.reduce(into: [:]) { result, item in
+            let delta = item.value - (baseline[item.key] ?? 0)
+            if delta > 0 { result[item.key] = delta }
+        }
     }
 
     private static func greedy(_ logits: [Float], excluding: Set<Int32>) throws -> Int32 {

@@ -7,7 +7,9 @@ explicit and identical across entrypoints; no padding can advance model state.
 """
 from __future__ import annotations
 import argparse
+from datetime import datetime, timezone
 import gc
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -20,6 +22,131 @@ from export_coreai_hybrid import prepare_layer, state_metadata, atomic_manifest
 from export_coreai_q4_moe import load_layer, PROJECTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def authoring_source_hashes():
+    """Pin imported authoring math as well as the independently tracked kernels."""
+    names = ('export_moe', 'export_coreai_dense', 'export_coreai_hybrid',
+             'export_coreai_gdn', 'export_coreai_qsa', 'export_coreai_q4_moe',
+             'coreai_q4_metal', 'coreai_dense_metal', 'coreai_tensor_matmul',
+             'coreai_gdn_chunk', 'coreai_gdn_chunk_metal', 'coreai_moe_chunk',
+             'coreai_q4_grouped', 'coreai_q4_gateup', 'coreai_qsa_chunk')
+    return {name: sha256_file(Path(__file__).with_name(name + '.py')) for name in names}
+
+
+def source_provenance_hash(source):
+    """Identity of Source's already verified shard ledger, not a new shard scan."""
+    identity = {'sourceManifest': source.manifest, 'weightIndex': source.index,
+                'verifiedFiles': source.verified}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def verify_recorded_asset(output, asset):
+    """Validate the exact recorded file set before trusting a completed asset."""
+    name = asset.get('path')
+    if not isinstance(name, str) or Path(name).name != name or not name.endswith('.aimodel'):
+        raise ValueError(f'Invalid recorded asset path: {name!r}')
+    directory = output / name
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f'Recorded asset is missing or is a symlink: {directory}')
+    records = asset.get('files', [])
+    if not records or len({record['path'] for record in records}) != len(records):
+        raise ValueError(f'Missing or duplicate file records: {directory}')
+    paths = list(directory.rglob('*'))
+    if any(path.is_symlink() for path in paths):
+        raise ValueError(f'Symlinks are unsupported in a recorded asset: {directory}')
+    actual = {str(path.relative_to(directory)) for path in paths if path.is_file()}
+    if actual != {record['path'] for record in records}:
+        raise ValueError(f'Asset file set differs from its manifest: {directory}')
+    total = 0
+    for record in records:
+        relative = Path(record['path'])
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError(f'Invalid asset file path: {record["path"]!r}')
+        path = directory / relative
+        if path.stat().st_size != record['bytes'] or sha256_file(path) != record['sha256']:
+            raise ValueError(f'Asset size/SHA256 mismatch: {path}')
+        total += record['bytes']
+    if total != asset.get('modelBytes'):
+        raise ValueError(f'Asset byte total differs from its manifest: {directory}')
+
+
+def resume_manifest(output, expected, *, allow_exporter_change=False, layer_kinds=None):
+    """Return a validated resumed manifest; never overwrite or remove an asset.
+
+    Pre-resume manifests lack request/dependency ledgers. Their explicit upgrade
+    accepts only a full-model request, compares every hash they did record, and
+    records which additional metadata starts at this resume boundary.
+    """
+    path = output / 'manifest.json'
+    raw = path.read_bytes()
+    manifest = json.loads(raw)
+    if manifest.get('status') != 'exporting' or manifest.get('completeModelLayerSet') is not False:
+        raise ValueError('Resume requires an incomplete manifest with status=exporting')
+    prior_hash = manifest.get('exporterSHA256')
+    current_hash = expected['exporterSHA256']
+    if not isinstance(prior_hash, str) or len(prior_hash) != 64 or any(c not in '0123456789abcdef' for c in prior_hash):
+        raise ValueError('Resume manifest has no valid prior exporter SHA256')
+    if prior_hash != current_hash and not allow_exporter_change:
+        raise ValueError('Exporter SHA256 changed; review the change and pass --resume-exporter-change explicitly')
+    upgrade_keys = {'requestedLayers', 'requestedComponents', 'authoringSourceSHA256', 'sourceProvenanceSHA256'}
+    added = sorted(upgrade_keys - manifest.keys())
+    if added and (not allow_exporter_change or expected['requestedLayers'] != list(range(48))
+                  or set(expected['requestedComponents']) != {'layers', 'embedding', 'head'}):
+        raise ValueError('Legacy resume metadata requires --resume-exporter-change and the default full-model request')
+    # Compare all recorded numerical/configuration/source choices, including
+    # nested kernel hashes. The exporter exception never permits kernel drift.
+    ignored = {'status', 'completeModelLayerSet', 'layers', 'assets', 'exporterSHA256', 'limitations'}
+    for key, value in expected.items():
+        if key in ignored or key in added:
+            continue
+        if key not in manifest or manifest[key] != value:
+            raise ValueError(f'Resume configuration/source mismatch: {key}')
+    layers = manifest.get('layers', [])
+    assets = manifest.get('assets', {})
+    requested = set(expected['requestedLayers']) if 'layers' in expected['requestedComponents'] else set()
+    indices = [asset.get('index') for asset in layers]
+    if any(type(index) is not int for index in indices) or len(set(indices)) != len(indices) or not set(indices) <= requested:
+        raise ValueError('Resume manifest has duplicate or unrequested layer indices')
+    if not set(assets) <= set(expected['requestedComponents']) - {'layers'}:
+        raise ValueError('Resume manifest has unrequested components')
+    names = []
+    for asset in layers:
+        index, kind = asset['index'], asset.get('kind')
+        if kind not in ('gdn', 'qsa') or (layer_kinds is not None and kind != layer_kinds[index]):
+            raise ValueError(f'Recorded layer {index} has the wrong attention kind')
+        if asset.get('path') != f'layer-{index:02d}-{kind}.aimodel':
+            raise ValueError(f'Recorded layer {index} has the wrong asset path')
+    for component, asset in assets.items():
+        if asset.get('path') != f'{component}.aimodel':
+            raise ValueError(f'Recorded component {component} has the wrong asset path')
+    for asset in [*layers, *assets.values()]:
+        if asset.get('function') != 'main' or asset.get('prefillFunction') != 'prefill':
+            raise ValueError('Recorded asset has unexpected phase functions')
+        names.append(asset['path'])
+        print(f"Verifying completed asset: {asset['path']}", flush=True)
+        verify_recorded_asset(output, asset)
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate recorded asset paths')
+    unrecorded = sorted(str(path) for path in output.glob('*.aimodel') if path.name not in names)
+    if unrecorded:
+        raise FileExistsError('Unrecorded/incomplete asset paths; move these aside before resuming (nothing was removed): '
+                              + ', '.join(unrecorded))
+    if path.read_bytes() != raw:
+        raise ValueError('Manifest changed during resume validation; stop the active exporter before resuming')
+    for key in added:
+        manifest[key] = expected[key]
+    manifest.setdefault('originalExporterSHA256', prior_hash)
+    manifest['exporterSHA256'] = current_hash
+    manifest.setdefault('resumeHistory', []).append({
+        'at': datetime.now(timezone.utc).isoformat(),
+        'previousExporterSHA256': prior_hash, 'currentExporterSHA256': current_hash,
+        'exporterChangeExplicitlyAllowed': allow_exporter_change,
+        'previousManifestSHA256': hashlib.sha256(raw).hexdigest(),
+        'legacyMetadataAddedAtResume': added,
+        'validatedLayerIndices': sorted(indices), 'validatedComponents': sorted(assets),
+    })
+    return manifest
 
 def phase_linear(x, weight):
     """Large prompts use TensorOps; S1 retains the existing dense decode path."""
@@ -82,12 +209,16 @@ def export_shared(module, examples, output_names, path, custom_kernels=()):
     converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
     if custom_kernels:
         converter.register_custom_kernels(list(custom_kernels))
+    # A nonempty unmatched spec still makes the SDK export every entrypoint
+    # twice. GDN/embedding/head have no SDPA and need no externalization pass.
+    externalize = [coreai_torch.ExternalizeSpec(target_class=SDPA,
+        composite_op_name="scaled_dot_product_attention", composite_attrs=["scale", "is_causal", "window_size"])] \
+        if any(isinstance(child, SDPA) for child in module.modules()) else None
     names = list(next(iter(examples.values())))
     for name, inputs in examples.items():
         args = tuple(inputs.values())
         converter.add_pytorch_module(module, entrypoint_name=name, input_names=names, output_names=output_names,
-            externalize_modules=[coreai_torch.ExternalizeSpec(target_class=SDPA,
-                composite_op_name="scaled_dot_product_attention", composite_attrs=["scale", "is_causal", "window_size"])],
+            externalize_modules=externalize,
             export_fn=lambda m, args=args: torch.export.export(m, args=args).run_decompositions(coreai_torch.get_decomp_table()))
     program = converter.to_coreai()
     program.optimize()
@@ -101,6 +232,8 @@ def export_shared(module, examples, output_names, path, custom_kernels=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--resume', action='store_true', help='Verify and continue an existing status=exporting manifest; stop its previous exporter first')
+    parser.add_argument('--resume-exporter-change', action='store_true', help='Explicitly allow only exporter-file changes and record their hash lineage')
     parser.add_argument('--chunk', type=int, default=4, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048))
     parser.add_argument('--tail-chunks', type=int, nargs='*', default=None,
                         help='Optional smaller prefill entrypoints; tensor mode defaults to 4/16/64 below main size')
@@ -117,6 +250,10 @@ def main():
     parser.add_argument('--layers', help='Comma-separated layer subset for smoke; omit for all48')
     parser.add_argument('--components', nargs='+', choices=('layers','embedding','head'), default=['layers','embedding','head'])
     args = parser.parse_args()
+    if args.resume_exporter_change and not args.resume:
+        raise ValueError('--resume-exporter-change requires --resume')
+    if len(set(args.components)) != len(args.components):
+        raise ValueError('Duplicate components are unsupported')
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
     source = Source(0)
@@ -138,18 +275,17 @@ def main():
     if args.capacity < args.chunk or args.capacity > 16384 or args.capacity % 4:
         raise ValueError('PD capacity must be a multiple of4 no larger than16384')
     phase_sizes = [('main',1),('prefill',args.chunk)] + [(f'prefill_s{s}',s) for s in sorted(tails)]
-    if args.output.exists(): raise FileExistsError('Use a fresh output directory')
-    estimated = len(layers) * 1_650_000_000 if 'layers' in args.components else 0
-    ancestor = args.output.parent
-    while not ancestor.exists(): ancestor = ancestor.parent
-    if shutil.disk_usage(ancestor).free < estimated + 4_000_000_000:
-        raise ValueError('Insufficient space for full original-Q4 assets')
-    args.output.mkdir(parents=True)
+    if args.output.exists() and not args.resume:
+        raise FileExistsError('Use a fresh output directory or explicitly pass --resume')
+    if args.resume and not args.output.is_dir():
+        raise FileNotFoundError('Resume output directory does not exist')
     manifest = {'version':1,'backend':'native-coreai-pd','status':'exporting','completeModelLayerSet':False,
         'capacity':args.capacity,'tokenChunk':args.chunk,'tailChunks':sorted(tails),'prefillKernels':args.prefill_kernels,'prefillSDPA':args.prefill_sdpa,'fusedGateUp':args.fused_gateup,'moeTile':[16,32,64],'hiddenSize':c.hidden,'streamCount':c.streams,
         'vocabularySize':c.vocabulary,'modelDirectory':str(source.directory),'configSHA256':sha256_file(config_path),
         'assets':{},'layers':[], 'exporterSHA256':sha256_file(Path(__file__)), 'q4Kernel':args.q4_kernel,
         'stableProjections':args.stable_projections,
+        'requestedLayers':sorted(layers),'requestedComponents':sorted(args.components),
+        'authoringSourceSHA256':authoring_source_hashes(),'sourceProvenanceSHA256':source_provenance_hash(source),
         'limitations':['CPU export only; full runtime numerics/performance require validation.',
             'No BF16 source quality-equivalence claim.']}
     custom_kernels = []
@@ -177,11 +313,25 @@ def main():
         custom_kernels.append(get_dense_kernel())
         manifest['denseKernelSHA256'] = sha256_file(Path(__file__).with_name('coreai_dense_metal.py'))
     output = args.output / 'manifest.json'
+    if args.resume:
+        layer_kinds = ['gdn' if kind == 'linear_attention' else 'qsa' for kind in config['layer_types']]
+        manifest = resume_manifest(args.output, manifest, allow_exporter_change=args.resume_exporter_change,
+                                   layer_kinds=layer_kinds)
+    completed_layers = {asset['index'] for asset in manifest['layers']}
+    estimated = len(set(layers) - completed_layers) * 1_650_000_000 if 'layers' in args.components else 0
+    ancestor = args.output if args.output.exists() else args.output.parent
+    while not ancestor.exists(): ancestor = ancestor.parent
+    if shutil.disk_usage(ancestor).free < estimated + 4_000_000_000:
+        raise ValueError('Insufficient space for remaining original-Q4 assets')
+    args.output.mkdir(parents=True, exist_ok=args.resume)
     atomic_manifest(output, manifest)
     begin = time.perf_counter()
     try:
         if 'layers' in args.components:
             for layer in layers:
+                if layer in completed_layers:
+                    print(f'Skipping verified layer {layer:02d}', flush=True)
+                    continue
                 started = time.perf_counter()
                 source = Source(layer)
                 moe = load_layer(source, 512, config['num_experts_per_tok'])
@@ -230,6 +380,9 @@ def main():
                 gc.collect()
         for component in ('embedding','head'):
             if component not in args.components: continue
+            if component in manifest['assets']:
+                print(f'Skipping verified component {component}', flush=True)
+                continue
             source = Source(0)
             if component == 'embedding':
                 source.prefix=''

@@ -34,3 +34,11 @@ GDN小尺寸状态连续/重置/恢复检查通过；QSA真实offset8192的chunk
 已保留负结果：cooperative-input Q4受SDK矩阵尺寸限制，实测4.25ms比最佳threadgroup路径慢；flatten权重寻址约3.04ms，没有明显收益；S2048改BM32未改善完整MoE。固定归约GEMV也未解决旧S1/S4最终logits差异，见`COREAI_PD.md`。
 
 随后GDN设备分块对照已完成：相同2048-token输入及非零初始状态，单次S2048、连续4×S512、连续32×S64的全部输出、最终卷积状态和FP32 recurrent state **逐值完全一致**。因此当前CPU差异不能归因于这些分块方式的状态交接；CPU/GPU算术路径的差异仍保留，不据此宣称源模型质量等价。证据 `gdn-chunk-equivalence-device.json`。
+
+同一组单层输入继续测量，FP16 QSA的S512/S1024/S2048热态时间分别为19.44/26.73/42.61ms，完整融合MoE分别为10.82/17.94/29.85ms。两者每token成本随块增大而下降；默认块仍须由整模型测量确定。
+
+## 完整模型测量与迭代
+
+`coreai-runner generate --profile-prefill true`记录每块token数、起止offset、墙钟时间、SSD读取、分组函数等待时间和48层明细。层时间已经包含在分组时间内，不能重复相加；这些都是宿主等待时间，不是硬件计数器。`--prefill-chunk`可选择任意已导出的块大小，便于在同一份资产上比较。
+
+导出器只对含SDPA的模块启用externalization，避免其他模块被SDK重复追踪。长导出中断后，可保持原参数并加`--resume`续导；它校验已有资产文件和已记录的配置/源码哈希。仅导出器自身修改时需要显式`--resume-exporter-change`并记录版本关系，其他kernel变化不允许混用。未登记的残留资产会报错，需移开后继续，不会自动删除。
