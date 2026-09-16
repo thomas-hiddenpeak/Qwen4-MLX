@@ -3,6 +3,7 @@ import CoreAI
 import CryptoKit
 import Dispatch
 import Foundation
+import Metal
 
 private struct PhaseZeroState: Decodable {
     let shape: [Int]
@@ -35,6 +36,7 @@ private struct PhaseManifest: Decodable {
         let stateBindings: [String: String]
         let initialState: [String: PhaseZeroState]
         let hasPLE: Bool
+        let weights: CoreAIExternalWeightsSpec?
         var asset: PhaseAsset {
             PhaseAsset(path: path, function: function, prefillFunction: prefillFunction,
                        inputNames: inputNames, outputNames: outputNames)
@@ -90,11 +92,13 @@ public final class CoreAIPhaseModel {
     private final class LoadedLayer {
         let spec: PhaseManifest.Layer
         let functions: Functions
+        let weights: CoreAIExternalWeights?
         var states: [String: NDArray]
         var nextOffset = 0
-        init(spec: PhaseManifest.Layer, functions: Functions, states: [String: NDArray]) {
+        init(spec: PhaseManifest.Layer, functions: Functions, weights: CoreAIExternalWeights?, states: [String: NDArray]) {
             self.spec = spec
             self.functions = functions
+            self.weights = weights
             self.states = states
         }
     }
@@ -116,12 +120,17 @@ public final class CoreAIPhaseModel {
     /// The same awaited call durations broken down by fused layer. These are a
     /// separate view of group times, not additional time to sum with them.
     public private(set) var predictionMillisecondsByLayer: [String: Double] = [:]
+    /// External-weight calls only: `<group>.encode`, `.wait`, and
+    /// `.materialization` partition the timed runtime work. These overlap the
+    /// group total; the last stage includes obtaining every output NDArray.
+    public private(set) var externalCallMillisecondsByStage: [String: Double] = [:]
     public private(set) var lastForwardMilliseconds = 0.0
     public var totalPredictionMilliseconds: Double { predictionMillisecondsByGroup.values.reduce(0, +) }
 
     private let embedding: Functions
     private let head: Functions
     private let layers: [LoadedLayer]
+    private let computeStream = ComputeStream()
     private let snapshotOwner = UUID()
     private let gate = NSLock()
     private var operationInProgress = false
@@ -136,7 +145,9 @@ public final class CoreAIPhaseModel {
         let tailChunks = manifest.tailChunks ?? []
         let allowedPrimary: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
         let allowedTails: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
-        guard manifest.version == 1, manifest.backend == "native-coreai-pd", manifest.status == "complete",
+        let sharedGraphs = manifest.version == 2 && manifest.backend == "native-coreai-pd-shared"
+        let constantGraphs = manifest.version == 1 && manifest.backend == "native-coreai-pd"
+        guard sharedGraphs || constantGraphs, manifest.status == "complete",
               manifest.completeModelLayerSet, manifest.layers.count == 48,
               Set(manifest.layers.map(\.index)) == Set(0..<48),
               allowedPrimary.contains(manifest.tokenChunk),
@@ -168,8 +179,18 @@ public final class CoreAIPhaseModel {
         }
         let specs = Array(manifest.assets.values) + manifest.layers.map(\.asset)
         guard specs.allSatisfy({ !$0.path.isEmpty && $0.function == "main" && $0.prefillFunction == "prefill" }),
-              Set(specs.map { assetURL($0).path }).count == 50 else {
-            throw CoreAIBlockRunnerError.invalidModel("CoreAI phase assets require distinct paths and main/prefill functions")
+              manifest.layers.allSatisfy({ ($0.weights != nil) == sharedGraphs }),
+              sharedGraphs || Set(specs.map { assetURL($0).path }).count == 50 else {
+            throw CoreAIBlockRunnerError.invalidModel("CoreAI phase assets require main/prefill functions and a consistent weight ownership format")
+        }
+        if sharedGraphs {
+            let groups = Dictionary(grouping: manifest.layers) { "\($0.kind)-ple\($0.hasPLE)" }
+            guard groups.count == 3, groups.values.allSatisfy({ Set($0.map { assetURL($0.asset).path }).count == 1 }),
+                  Set(specs.map { assetURL($0).path }).count == 5,
+                  Set(manifest.layers.map { base.appendingPathComponent($0.weights!.path)
+                      .standardizedFileURL.resolvingSymlinksInPath().path }).count == 48 else {
+                throw CoreAIBlockRunnerError.invalidModel("Shared CoreAI phase assets require separate GDN, GDN+PLE, QSA, embedding and head graphs")
+            }
         }
         for spec in manifest.layers {
             guard spec.kind == (config.layerTypes[spec.index] == "linear_attention" ? "gdn" : "qsa"),
@@ -180,22 +201,34 @@ public final class CoreAIPhaseModel {
             try Self.validateStateMetadata(spec, capacity: manifest.capacity)
         }
         var completed = 0
-        func load(_ spec: PhaseAsset) async throws -> Functions {
+        var sharedFunctions: [String: Functions] = [:]
+        func load(_ spec: PhaseAsset, weightNames: Set<String> = []) async throws -> Functions {
             try Task.checkCancellation()
+            let key = assetURL(spec).path
+            if sharedGraphs, let functions = sharedFunctions[key] {
+                for count in supportedCounts {
+                    try Self.validateFeatures(functions.runner(count: count), spec: spec, weightNames: weightNames)
+                }
+                completed += 1
+                progress?(completed, 50)
+                return functions
+            }
             let decode = try await CoreAIBlockRunner(modelURL: assetURL(spec), functionName: spec.function,
                                                     computeUnits: computeUnits)
-            try Self.validateFeatures(decode, spec: spec)
+            try Self.validateFeatures(decode, spec: spec, weightNames: weightNames)
             var countFunctions: [Int: CoreAIBlockRunner] = [:]
             for count in supportedCounts where count > 1 {
                 try Task.checkCancellation()
                 let name = count == manifest.tokenChunk ? spec.prefillFunction : "prefill_s\(count)"
                 let runner = try CoreAIBlockRunner(sharing: decode, functionName: name)
-                try Self.validateFeatures(runner, spec: spec)
+                try Self.validateFeatures(runner, spec: spec, weightNames: weightNames)
                 countFunctions[count] = runner
             }
             completed += 1
             progress?(completed, 50)
-            return Functions(decode: decode, countFunctions: countFunctions)
+            let functions = Functions(decode: decode, countFunctions: countFunctions)
+            if sharedGraphs { sharedFunctions[key] = functions }
+            return functions
         }
         let embedding = try await load(manifest.assets["embedding"]!)
         let head = try await load(manifest.assets["head"]!)
@@ -212,10 +245,16 @@ public final class CoreAIPhaseModel {
             try Self.require(head.runner(count: count), output: "logits", shape: [1, 1, 248320], type: .float32)
         }
         var loaded: [LoadedLayer] = []
+        let weightDevice = sharedGraphs ? MTLCreateSystemDefaultDevice() : nil
+        guard !sharedGraphs || weightDevice != nil else {
+            throw CoreAIBlockRunnerError.invalidModel("Shared CoreAI phase execution requires a Metal device")
+        }
         for spec in manifest.layers.sorted(by: { $0.index < $1.index }) {
-            let functions = try await load(spec.asset)
+            let weights = try spec.weights.map { try CoreAIExternalWeights(spec: $0, baseURL: base, device: weightDevice!) }
+            let functions = try await load(spec.asset, weightNames: weights?.inputNames ?? [])
             for count in supportedCounts {
                 let runner = try functions.runner(count: count)
+                try weights?.validateInputs(for: runner.function.descriptor)
                 try Self.require(runner, input: "stream", shape: [1, count, 10240], type: .float16)
                 try Self.require(runner, output: "stream_out", shape: [1, count, 10240], type: .float16)
                 if spec.hasPLE {
@@ -227,7 +266,7 @@ public final class CoreAIPhaseModel {
                     try Self.require(runner, output: spec.stateBindings[name]!, shape: state.shape, type: type)
                 }
             }
-            loaded.append(LoadedLayer(spec: spec, functions: functions, states: try Self.zeroStates(spec)))
+            loaded.append(LoadedLayer(spec: spec, functions: functions, weights: weights, states: try Self.zeroStates(spec)))
         }
         self.embedding = embedding
         self.head = head
@@ -281,7 +320,7 @@ public final class CoreAIPhaseModel {
                 inputs["stream"] = stream
                 if layer.spec.hasPLE { inputs["ple_embedding"] = rows }
                 let output = try await call(layer.functions.runner(count: count), inputs: inputs,
-                                            group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
+                                            weights: layer.weights, group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
                 var nextStates: [String: NDArray] = [:]
                 for (name, outputName) in layer.spec.stateBindings {
                     nextStates[name] = try Self.required(output, outputName)
@@ -385,32 +424,66 @@ public final class CoreAIPhaseModel {
         callCounts = [:]
         predictionMillisecondsByGroup = [:]
         predictionMillisecondsByLayer = [:]
+        externalCallMillisecondsByStage = [:]
         lastForwardMilliseconds = 0
     }
 
-    private func call(_ runner: CoreAIBlockRunner, inputs: [String: NDArray], group: String,
+    private func call(_ runner: CoreAIBlockRunner, inputs: [String: NDArray], weights: CoreAIExternalWeights? = nil, group: String,
                       layerIndex: Int? = nil) async throws -> [String: NDArray] {
         try Task.checkCancellation()
-        let validated = try runner.makeInputs([:], retainedInputs: inputs)
-        let started = DispatchTime.now().uptimeNanoseconds
-        var prediction = try await runner.function.run(inputs: validated)
-        let duration = CoreAIBlockRunner.milliseconds(since: started)
         let descriptor = runner.function.descriptor
-        guard Set(prediction.names) == Set(descriptor.outputNames) else {
-            throw CoreAIBlockRunnerError.invalidFixture("\(group): output names differ from the phase function descriptor")
-        }
+        let externalInputs = try weights?.merging(activations: inputs, for: descriptor)
+        let validated = externalInputs == nil ? try runner.makeInputs([:], retainedInputs: inputs) : [:]
+        var externalStages: (encode: Double, wait: Double, materialization: Double)? = nil
+        let started = DispatchTime.now().uptimeNanoseconds
         var output: [String: NDArray] = [:]
+        if let externalInputs {
+            let encodeStarted = DispatchTime.now().uptimeNanoseconds
+            let pending = try runner.function.encode(inputs: externalInputs, to: computeStream)
+            let encoded = DispatchTime.now().uptimeNanoseconds
+            await computeStream.currentWorkCompleted()
+            let completed = DispatchTime.now().uptimeNanoseconds
+            guard Set(pending.keys) == Set(descriptor.outputNames) else {
+                throw CoreAIBlockRunnerError.invalidFixture("\(group): output names differ from the shared phase function descriptor")
+            }
+            for name in descriptor.outputNames {
+                guard let array = try await pending[name]?.ndArray else {
+                    throw CoreAIBlockRunnerError.invalidFixture("\(group): missing shared tensor output \(name)")
+                }
+                output[name] = array
+            }
+            let materialized = DispatchTime.now().uptimeNanoseconds
+            externalStages = (Double(encoded - encodeStarted) / 1_000_000,
+                              Double(completed - encoded) / 1_000_000,
+                              Double(materialized - completed) / 1_000_000)
+        } else {
+            var prediction = try await runner.function.run(inputs: validated)
+            guard Set(prediction.names) == Set(descriptor.outputNames) else {
+                throw CoreAIBlockRunnerError.invalidFixture("\(group): output names differ from the phase function descriptor")
+            }
+            for name in descriptor.outputNames {
+                guard let array = prediction.remove(name)?.ndArray else {
+                    throw CoreAIBlockRunnerError.invalidFixture("\(group): missing tensor output \(name)")
+                }
+                output[name] = array
+            }
+        }
+        let duration = CoreAIBlockRunner.milliseconds(since: started)
         for name in descriptor.outputNames {
-            guard let array = prediction.remove(name)?.ndArray,
+            guard let array = output[name],
                   case .ndArray(let declared) = descriptor.outputDescriptor(of: name) else {
                 throw CoreAIBlockRunnerError.invalidFixture("\(group): missing tensor output \(name)")
             }
             try CoreAIBlockRunner.validate(array, descriptor: declared, name: name)
-            output[name] = array
         }
         successfulCalls += 1
         callCounts[group, default: 0] += 1
         predictionMillisecondsByGroup[group, default: 0] += duration
+        if let externalStages {
+            externalCallMillisecondsByStage["\(group).encode", default: 0] += externalStages.encode
+            externalCallMillisecondsByStage["\(group).wait", default: 0] += externalStages.wait
+            externalCallMillisecondsByStage["\(group).materialization", default: 0] += externalStages.materialization
+        }
         if let layerIndex {
             predictionMillisecondsByLayer["\(group).layer\(layerIndex)", default: 0] += duration
         }
@@ -433,7 +506,7 @@ public final class CoreAIPhaseModel {
         }
     }
 
-    private static func validateFeatures(_ runner: CoreAIBlockRunner, spec: PhaseAsset) throws {
+    private static func validateFeatures(_ runner: CoreAIBlockRunner, spec: PhaseAsset, weightNames: Set<String> = []) throws {
         let descriptor = runner.function.descriptor
         guard descriptor.stateNames.isEmpty,
               Set(spec.inputNames).count == spec.inputNames.count,
@@ -447,7 +520,9 @@ public final class CoreAIPhaseModel {
                   tensor.interleaveLayout == nil, !tensor.hasDynamicShape else {
                 throw CoreAIBlockRunnerError.invalidModel("\(name): phase inputs require fixed non-interleaved tensors")
             }
-            _ = try CoreAIBlockRunner.dtype(tensor.scalarType, name: name)
+            if !weightNames.contains(name) {
+                _ = try CoreAIBlockRunner.dtype(tensor.scalarType, name: name)
+            }
         }
         for name in descriptor.outputNames {
             guard case .ndArray(let tensor) = descriptor.outputDescriptor(of: name),
@@ -483,10 +558,12 @@ public final class CoreAIPhaseModel {
         }
         if spec.hasPLE { expected["ple_state"] = ([1, 9, 10240], .float16, "next_ple_state") }
         let activationNames: Set<String> = spec.hasPLE ? ["stream", "ple_embedding"] : ["stream"]
+        let weightNames = Set(spec.weights?.buffers.map(\.inputName) ?? [])
         guard Set(spec.initialState.keys) == Set(expected.keys),
               Set(spec.stateBindings.keys) == Set(expected.keys),
               Set(spec.stateBindings.values).count == expected.count,
-              Set(spec.inputNames) == Set(expected.keys).union(activationNames),
+              weightNames.isDisjoint(with: Set(expected.keys).union(activationNames)),
+              Set(spec.inputNames) == Set(expected.keys).union(activationNames).union(weightNames),
               Set(spec.outputNames) == Set(expected.values.map { $0.2 }).union(["stream_out"]) else {
             throw CoreAIBlockRunnerError.invalidModel("Layer \(spec.index): incomplete explicit phase state interface")
         }

@@ -196,6 +196,7 @@ struct CoreAIRunnerCLI {
                 let captureProfile = profilePrefill && chunkProfiles.count < 4096
                 let groupsBefore = captureProfile ? model.predictionMillisecondsByGroup : [:]
                 let layersBefore = captureProfile ? model.predictionMillisecondsByLayer : [:]
+                let externalStagesBefore = captureProfile ? model.externalCallMillisecondsByStage : [:]
                 let readSecondsBefore = readSeconds
                 let chunkStart = DispatchTime.now().uptimeNanoseconds
                 let batch = Array(tokens[position..<position + count])
@@ -211,6 +212,7 @@ struct CoreAIRunnerCLI {
                         "function_await_seconds": functionSeconds,
                         "wall_minus_function_and_ssd_seconds": chunkSeconds - functionSeconds - ssdSeconds,
                         "group_milliseconds": groups,
+                        "external_call_stage_milliseconds": timingDelta(model.externalCallMillisecondsByStage, since: externalStagesBefore),
                         "layer_milliseconds": timingDelta(model.predictionMillisecondsByLayer, since: layersBefore)]
                     chunkProfiles.append(chunkProfile)
                     // Keep completed measurements even if a later chunk fails
@@ -228,6 +230,7 @@ struct CoreAIRunnerCLI {
             let prefillSeconds = seconds(start), prefillCalls = model.successfulCalls - initialCalls
             let prefillGroups = model.predictionMillisecondsByGroup
             let prefillLayers = model.predictionMillisecondsByLayer
+            let prefillExternalStages = model.externalCallMillisecondsByStage
             let prefillSSDSeconds = readSeconds
             if run == 0 { firstLogits = logits }
             var errorSquared = 0.0, referenceSquared = 0.0, maximumError = 0.0
@@ -259,6 +262,8 @@ struct CoreAIRunnerCLI {
                 "prefill_logits_max_abs": maximumError,
                 "prefill_group_milliseconds": prefillGroups,
                 "decode_group_milliseconds": Dictionary(uniqueKeysWithValues: decodeGroups),
+                "prefill_external_call_stage_milliseconds": prefillExternalStages,
+                "decode_external_call_stage_milliseconds": timingDelta(model.externalCallMillisecondsByStage, since: prefillExternalStages),
                 "prefill_ssd_read_seconds": prefillSSDSeconds, "decode_ssd_read_seconds": readSeconds - prefillSSDSeconds,
                 "decode_forward_steps": decodeDurations.count, "decode_forward_seconds": decodeDurations.reduce(0, +),
                 "decode_step_seconds": decodeDurations, "total_coreai_calls": model.successfulCalls - initialCalls,

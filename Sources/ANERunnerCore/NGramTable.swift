@@ -20,6 +20,8 @@
 import Foundation
 import CoreFoundation
 import Darwin
+import Dispatch
+import Synchronization
 
 public enum NGramTableError: Error, Equatable, Sendable {
     case invalidFormat(String)
@@ -99,8 +101,85 @@ public final class NGramTable: Sendable {
             throw NGramTableError.sizeOverflow
         }
         for row in rowIDs where row < 0 || row >= rowCount { throw NGramTableError.rowOutOfBounds(row) }
+        // S1 needs only 16 rows. Keep small reads allocation-light; large
+        // prefill batches amortize dispatch and can overlap independent preads.
+        guard rowIDs.count >= 256 else {
+            return try readRowsSerial(rowIDs, roundToBFloat16: roundToBFloat16)
+        }
+
+        // Preserve first-occurrence order so both output and error ordering
+        // match the serial reader, while repeated n-grams perform just one IO.
+        var indices: [Int: Int] = [:]
+        indices.reserveCapacity(rowIDs.count)
+        var orderedRows: [Int] = []
+        orderedRows.reserveCapacity(rowIDs.count)
+        var positions: [Int] = []
+        positions.reserveCapacity(rowIDs.count)
+        for row in rowIDs {
+            if let index = indices[row] { positions.append(index) }
+            else {
+                let index = orderedRows.count
+                indices[row] = index
+                orderedRows.append(row)
+                positions.append(index)
+            }
+        }
+        let uniqueRows = orderedRows
+        // Bound concurrency per readRows call, with at least 32 rows per worker
+        // to avoid waking many threads for a heavily duplicated request.
+        let degree = min(8, max(1, uniqueRows.count / 32))
+        let ranges: [Range<Int>] = (0..<degree).map { worker in
+            let base = uniqueRows.count / degree, remainder = uniqueRows.count % degree
+            let start = worker * base + min(worker, remainder)
+            return start..<(start + base + (worker < remainder ? 1 : 0))
+        }
+        let storage = RowReadResults(count: degree)
+        if degree == 1 {
+            let values = try readRowsSerial(uniqueRows, roundToBFloat16: roundToBFloat16)
+            storage.values.withLock { $0[0] = .success(values) }
+        } else {
+            DispatchQueue.concurrentPerform(iterations: degree) { worker in
+                let outcome = Result {
+                    try self.readRowsSerial(Array(uniqueRows[ranges[worker]]), roundToBFloat16: roundToBFloat16)
+                }
+                storage.values.withLock { $0[worker] = outcome }
+            }
+        }
+        // Joining all workers prevents a failed call leaving reads in flight.
+        // Inspect in request order, never completion order, before returning
+        // any data. Every worker owns its output; shared arrays are not mutated.
+        let outcomes = storage.values.withLock { $0 }
+        var chunks: [[Float]] = []
+        chunks.reserveCapacity(degree)
+        for outcome in outcomes {
+            guard let outcome else {
+                throw NGramTableError.fileIO(operation: "parallel pread result", code: EIO)
+            }
+            chunks.append(try outcome.get())
+        }
+        var workerForRow = [Int](repeating: 0, count: uniqueRows.count)
+        for (worker, range) in ranges.enumerated() {
+            for index in range { workerForRow[index] = worker }
+        }
         var output: [Float] = []
         output.reserveCapacity(outputCount)
+        for index in positions {
+            let worker = workerForRow[index]
+            let start = (index - ranges[worker].lowerBound) * dimension
+            output.append(contentsOf: chunks[worker][start..<(start + dimension)])
+        }
+        return output
+    }
+
+    private final class RowReadResults: Sendable {
+        let values: Mutex<[Result<[Float], any Error>?]>
+        init(count: Int) { values = Mutex(Array(repeating: nil, count: count)) }
+    }
+
+    /// The caller validates all row IDs and total sizes before starting IO.
+    private func readRowsSerial(_ rowIDs: [Int], roundToBFloat16: Bool) throws -> [Float] {
+        var output: [Float] = []
+        output.reserveCapacity(rowIDs.count * dimension)
         for row in rowIDs {
             let bytes = try Self.readExactly(descriptor, offset: dataOffset + row * dimension, count: dimension)
             for (column, code) in bytes.enumerated() {

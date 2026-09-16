@@ -72,6 +72,7 @@ class ChunkQ4MoE(torch.nn.Module):
         self.experts, self.hidden, self.top_k = original.experts, original.hidden, original.top_k
         self.block, self.columns, self.inner = block, columns, inner
         self.fuse_gateup = fuse_gateup
+        self.flat_weights = False
         get_plan_kernel(self.experts, block)
         get_grouped_kernel(block, columns, inner)
         if fuse_gateup:
@@ -83,6 +84,9 @@ class ChunkQ4MoE(torch.nn.Module):
         self.decode = original
 
     def custom_kernels(self):
+        if self.flat_weights:
+            from coreai_q4_flat import flat_moe_kernels
+            return [get_plan_kernel(self.experts, self.block), get_tensor_kernel(), *flat_moe_kernels(self)]
         kernels = [get_plan_kernel(self.experts, self.block),
                 get_grouped_kernel(self.block, self.columns, self.inner),
                 get_tensor_kernel(), get_q4_kernel()]
@@ -109,6 +113,9 @@ class ChunkQ4MoE(torch.nn.Module):
 
     def grouped(self, name, x, plan):
         projection = getattr(self.decode, name)
+        if self.flat_weights:
+            from coreai_q4_flat import flat_grouped_linear
+            return flat_grouped_linear(x, plan, projection, self.block, self.columns, self.inner)
         return grouped_linear(x, plan, projection.packed, projection.scales, projection.biases,
                               self.block, self.columns, self.inner)
 
@@ -130,8 +137,12 @@ class ChunkQ4MoE(torch.nn.Module):
         plan = make_plan(sorted_ids, self.experts, self.block)
         if self.fuse_gateup:
             gate, up = self.decode.gate_proj, self.decode.up_proj
-            active = fused_grouped_gateup(ordered_x, plan, gate.packed, gate.scales, gate.biases,
-                up.packed, up.scales, up.biases, self.block, self.columns, self.inner)
+            if self.flat_weights:
+                from coreai_q4_flat import flat_grouped_gateup
+                active = flat_grouped_gateup(ordered_x, plan, gate, up, self.block, self.columns, self.inner)
+            else:
+                active = fused_grouped_gateup(ordered_x, plan, gate.packed, gate.scales, gate.biases,
+                    up.packed, up.scales, up.biases, self.block, self.columns, self.inner)
         else:
             gate = self.grouped('gate_proj', ordered_x, plan)
             up = self.grouped('up_proj', ordered_x, plan)

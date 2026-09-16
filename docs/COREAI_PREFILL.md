@@ -56,3 +56,19 @@ GDN小尺寸状态连续/重置/恢复检查通过；QSA真实offset8192的chunk
 五种小尺寸设备场景均通过；真实S512孤立算子relative L2为0.00008285、maxAbs为0.001953，整层状态连续、重置、checkpoint恢复检查通过。7项CPU测试包含新增整层封装测试，覆盖早期稠密、稀疏、尾块、未来位置、选择顺序和S1保持。实际层输入重放来自既有layer0 MoE捕获，不能称为原生layer3整模型轨迹。证据为`qsa-sparse-smoke-summary.json`、`qsa-sparse-real-s512-device.json`、`qsa-sparse-full-real-s512-device.json`及`qsa-sparse-synthetic-s2048-device.json`；均位于上述results目录。这里没有整模型质量或吞吐验收。
 
 完整11,057-token测试在观测到10,752个token后停止：进程physical footprint达到139.3GB，未取得完整prefill结果。单层仅加载的对照中，包含10个函数的资产graphics footprint约2.36GB；只保留main为0.211GB、只保留prefill为1.067GB、两者共存为1.278GB。权重文件映射规模基本相同，说明保留的函数执行资源/工作区是更强的排查方向，**尚未证明运行时重复了整份权重，也未定位到具体内存arena**。当前优先研究共享通用图与外部权重的所有权和约束，再恢复整模型测量。证据见`full-agent-11k-v1-stopped.json`、`layer0-constant-memory-diagnosis.md`和`footprint-main-prefill.json`。
+
+
+## 共享图与显式常驻权重
+
+`export_coreai_pd_shared.py --baseline-pd <完整v1目录> --output <新目录>`导出v2格式：48份原量化权重、3份通用decoder图（GDN、含PLE的GDN、QSA），各层保持独立状态。Swift同时支持v1/v2；每份v2权重由长期持有的shared MTLBuffer拥有，加载时直接pread，不在每个token重读文件。权重格式检查覆盖路径、文件大小、dtype、offset、溢出和重叠；显式完整性验证可检查文件及分片哈希。几何常量仍留在图内，学习权重全部成为命名输入。
+
+首个完整11,057-token v2测试完成两轮：prefill分别129.79s/85.19token/s及121.25s/91.19token/s，加载16.34s，采样physical footprint峰值109.72GiB。没有prefix命中或MTP；第二轮仅OS文件缓存变热。两轮重置后logits一致、两token输出一致，但这不是源模型质量验收。该版本仍未达到1000token/s。
+
+后续独立定位得到两个可重复结果：
+
+- `--flat-q4`将九个专家权重输入改为rank1，Metal显式按原行序寻址；名字、dtype、字节及存储顺序不变。相同S2048量化投影由12.74ms降到7.01ms；完整layer0由约74.7ms降到45.5ms，输出和两项状态逐值一致。这是常驻外部权重场景的收益，不能与之前常量权重寻址实验混为一谈。
+- `coreai_head_metal.py`及独立导出器保持HC与LastHead，使用FP16权重、FP32累加/输出的GEMV，避免整份输出权重转换成FP32。十入口head仅加载的graphics footprint由25.56GB降到0.132GB；同输入单次head由12.8ms降到3.75ms。设备logits对原head relative L2约0.000170，首选token相同，尚需区分HC与归约次序误差，不宣称逐值等价。
+
+`external_call_stage_milliseconds`进一步拆分共享图的提交、等待计算及提取NDArray时间，按prefill/decode分别汇总并记录逐块差值。它们是宿主阶段耗时，不是GPU硬件计数器。
+
+PLE大批量SSD读取对重复行去重，并以最多8个worker执行pread；S1维持串行小请求路径。结果和错误顺序保持原请求语义，14项小文件测试覆盖FP8/BF16、重复行、边界、截断及失败恢复。尚不把读取实现变化视为端到端性能达标。

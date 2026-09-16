@@ -123,6 +123,15 @@ public final class CoreAITextRuntime {
         }
     }
 
+    /// Encode/wait/output materialization within external-weight phase calls.
+    /// Entries overlap predictionMillisecondsByGroup rather than adding to it.
+    public var externalCallMillisecondsByStage: [String: Double] {
+        switch backend {
+        case .token: return [:]
+        case .phase(let model): return model.externalCallMillisecondsByStage
+        }
+    }
+
     public var prefillChunkSize: Int {
         switch backend {
         case .token: return 1
