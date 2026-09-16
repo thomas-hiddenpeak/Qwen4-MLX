@@ -74,6 +74,8 @@ struct RunnerCLI {
                 try await probeCoreAI(arguments)
             case "probe-coreai-sequence":
                 try await probeCoreAISequence(arguments)
+            case "generate-coreai-hybrid":
+                try await generateCoreAIHybrid(arguments)
             case "probe-moe", "route-moe":
                 try probeMoE(arguments)
             case "probe-gpu-moe":
@@ -464,6 +466,11 @@ struct RunnerCLI {
         Compute n-gram row IDs with the model's EOS and token-history semantics.
     probe-coreml --model PATH --fixture PATH [--output report.json]
         Execute a Core ML block with CPU + Neural Engine allowed; CPU fallback is possible.
+    generate-coreai-hybrid --model-dir PATH --manifest PATH --prompt TEXT
+      [--max-tokens 32] [--raw-prompt false] [--repeat 1]
+      [--compare-reference false] [--output report.json]
+      Experimental full-model generation: CoreAI attention + MLX Q4/PLE, tokenwise prefill.
+
     probe-coreai --model PATH --fixture PATH [--function main] [--output report.json]
         Execute a stateless system CoreAI function on macOS 27; reuses Core ML JSON fixtures.
         Options: --compute-units cpuOnly|default|gpu|neuralEngine --warmups 3 --runs 5

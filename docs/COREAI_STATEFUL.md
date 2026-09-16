@@ -2,7 +2,7 @@
 
 2026-09-17，独立 Swift runner 已在系统 CoreAI 上执行真实权重的完整 GDN 子层和 Attention/QSA 子层，跨 prefill/decode 保持状态，并验证重置、检查点恢复后继续执行。使用 macOS 27.0 / SDK 27、GPU 偏好；没有设备执行 trace，不声明全部运算的硬件驻留。
 
-这一步补齐的是**子层之间连续调用所需的状态能力**。完整 decoder 层、48 层生成、Q4 MoE 驻留与服务尚未迁入 CoreAI；现有 MLX 服务路径和缓存格式保持独立。原作者 mlx-serve 按需关闭，本轮没有加载完整参考模型。
+这一步补齐的是**子层之间连续调用所需的状态能力**。本次子层验证尚未包含完整 decoder 层或48层生成；随后新增的[完整混合生成](COREAI_HYBRID.md)已把所有 GDN/QSA 接入真实文本链路，Q4 MoE 等部分仍用MLX。纯 CoreAI 与服务迁移尚未完成；现有 MLX 服务路径和缓存格式保持独立。原作者 mlx-serve 按需关闭，本次子层验证没有加载完整参考模型。
 
 ## 实测范围
 
@@ -67,4 +67,4 @@ xcrun swift build -c release
 
 独立 Swift 调用另通过 7 项状态检查：非连续布局复制后独立存储、外部 session 快照拒绝、状态输入覆盖拒绝、错误 dtype 拒绝、错误后正常执行、reset 全输出一致、预先取消后状态不推进且操作锁释放。CLI 的两个负例也按预期失败：夹具注入参考状态在加载模型前被拒；只篡改一个整数 mask 值时，数值验收返回失败。记录在 `session-guards/` 与 `negative-cases/`。未在正在执行的 GPU 调用中注入故障或取消，也未完成服务长稳验证。
 
-下一步连接完整 decoder 层的归一化、GDN/QSA、MoE、Hyper Connection/残差与 PLE 接口，并处理原始 Q4 专家压缩驻留。之后才将 CoreAI 状态接入现有 prefill/decode 调度和前缀/SSD 缓存；不直接混读 MLX 缓存归档。
+后续的完整连接进展见[混合生成](COREAI_HYBRID.md)。CoreAI 内原始 Q4 专家压缩驻留、prefill/decode 调度和前缀/SSD 缓存仍需逐步迁移；不直接混读 MLX 缓存归档。

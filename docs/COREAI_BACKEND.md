@@ -1,6 +1,6 @@
 # Core AI 后端：首批真实权重子图
 
-2026-09-17 起在 macOS 27 系统 Core AI 上开发。独立 Swift runner 的 `probe-coreai` 直接加载 `.aimodel`、执行函数并读取输出；后续新增 `probe-coreai-sequence`，已完成真实权重 GDN/QSA 的[连续状态验证](COREAI_STATEFUL.md)。**完整 48 层生成和 HTTP 服务仍使用 MLX，尚未切换为 Core AI。** 以下保留首批 MoE 子图结果。
+2026-09-17 起在 macOS 27 系统 Core AI 上开发。独立 Swift runner 的 `probe-coreai` 直接加载 `.aimodel`、执行函数并读取输出；后续新增 `probe-coreai-sequence`，完成真实权重 GDN/QSA 的[连续状态验证](COREAI_STATEFUL.md)，并跑通[完整48层混合生成](COREAI_HYBRID.md)。混合入口以 CoreAI 执行所有 GDN/QSA，Q4 MoE 等模块仍使用 MLX；HTTP 服务尚未切换。以下保留首批 MoE 子图结果。
 
 ## 本轮实测
 

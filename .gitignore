@@ -18,6 +18,7 @@ __pycache__/
 *.mlpackage/
 *.mlmodel
 *.mlmodelc/
+*.aimodel/
 *.dylib
 *.metallib
 *.air
