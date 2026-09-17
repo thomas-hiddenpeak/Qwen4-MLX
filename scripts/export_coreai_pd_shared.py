@@ -35,7 +35,7 @@ def authoring_source_hashes():
     """Record the optional flat implementation alongside the original math."""
     hashes = _pd_authoring_source_hashes()
     for name in ('coreai_q4_flat', 'coreai_expert_grouping', 'coreai_head_metal', 'export_coreai_top_chunks',
-                 'coreai_qsa_working_set', 'coreai_moe_transfers', 'coreai_gdn_ilp_probe'):
+                 'coreai_qsa_working_set', 'coreai_moe_transfers', 'coreai_moe_inverse_copy', 'coreai_gdn_ilp_probe'):
         hashes[name] = sha256_file(Path(__file__).with_name(name + '.py'))
     return hashes
 
@@ -134,7 +134,7 @@ def validate_contiguous_affine(*, flat_q4, moe_tile, contiguous_affine):
 
 def resolve_moe_transfers(enabled=False, tail_precision=None):
     """Pin the optional numerical boundary; omitted options preserve old graphs."""
-    if tail_precision not in (None, 'float16', 'float32', 'native'):
+    if tail_precision not in (None, 'float16', 'float32', 'native', 'native-copy'):
         raise ValueError('Unsupported MoE tail precision')
     if not enabled and tail_precision is not None:
         raise ValueError('--moe-tail-precision requires --moe-direct-transfers')
@@ -384,8 +384,8 @@ def main(argv=None):
                         help='GDN value rows per SIMD during prefill; default1 preserves original kernel;2/4 opt into ILP; S1 unchanged')
     parser.add_argument('--moe-direct-transfers', action='store_true',
                         help='Optional direct ordered gather and fused routed tail; S1 decode unchanged')
-    parser.add_argument('--moe-tail-precision', choices=('float16', 'float32', 'native'),
-                        help='Requires --moe-direct-transfers; default float32 products, float16 rounds products, native keeps original tail graph')
+    parser.add_argument('--moe-tail-precision', choices=('float16', 'float32', 'native', 'native-copy'),
+                        help='Requires --moe-direct-transfers; default float32 products, float16 rounds products, native keeps original tail graph, native-copy replaces inverse copying and preserves native weighted math')
     parser.add_argument('--chunk', type=int, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
                         help='Override primary chunk while inheriting v1 capacity/geometry and smaller phases')
     parser.add_argument('--metal-head', type=_boolean_option, nargs='?', const=True, default=False,
@@ -441,6 +441,7 @@ def main(argv=None):
         moeTransferNumerics=('Original gather and tail graph; S1 decode unchanged' if not moe_transfers['enabled'] else
             'Direct FP16 gather; S1 decode unchanged; ' + {
                 'native': 'original native inverse/weight/reduce graph',
+                'native-copy': 'direct inverse FP16 row copy; original native scores/products/reduction/casts/shared addition',
                 'float16': 'products rounded FP16 then slot-order FP32 sum and FP16 output',
                 'float32': 'FP32 products and slot-order FP32 sum then FP16 output; intentionally no eager per-product FP16 boundary'
             }[moe_transfers['tailPrecision']]),

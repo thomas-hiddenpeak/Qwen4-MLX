@@ -170,44 +170,73 @@ def _get_kernel(experts, outputs, inputs, simdgroups, pointers):
                       MetalParameter('thread_id', 'uint', 'thread_index_in_threadgroup')])
 
 
-def nax_grouped_linear(x, plan, projection, simdgroups=1):
+def _linear_kernel(geometry, simdgroups, block):
+    if block == 32:
+        if simdgroups != 1:
+            raise ValueError('BM32 NAX currently requires one SIMD group')
+        from coreai_q4_nax_m32_probe import get_kernel as get_m32_kernel
+        return get_m32_kernel(*geometry)
+    if block != 16:
+        raise ValueError('NAX linear requires BM16 or BM32')
+    return get_kernel(*geometry, simdgroups, True)
+
+
+def nax_grouped_linear(x, plan, projection, simdgroups=1, block=16):
     _validate(x, projection.packed, projection.scales, projection.biases, *projection.geometry)
     columns = threads = 32*simdgroups
-    return get_kernel(*projection.geometry, simdgroups, True)(x, plan,
+    return _linear_kernel(projection.geometry, simdgroups, block)(x, plan,
         projection.packed, projection.scales, projection.biases,
         threads_per_grid=(((projection.output_size+columns-1)//columns)*threads, plan.shape[0]-1, 1),
         threads_per_thread_group=(threads, 1, 1), result_shapes=[[x.shape[0], projection.output_size]])
 
 
-def nax_grouped_gateup(x, plan, gate, up, simdgroups=1):
+def _gateup_kernel(geometry, simdgroups, policy):
+    if policy == 'native-parity-v2':
+        if simdgroups != 1:
+            raise ValueError('Native-parity gate/up currently requires one SIMD group')
+        from coreai_q4_nax_gateup_parity import get_kernel as get_gateup_kernel
+        return get_gateup_kernel(*geometry)
+    if policy != 'experimental-v1':
+        raise ValueError('NAX gate/up policy must be native-parity-v2 or experimental-v1')
     from coreai_q4_nax_gateup import get_kernel as get_gateup_kernel
+    return get_gateup_kernel(*geometry, simdgroups)
+
+
+def nax_grouped_gateup(x, plan, gate, up, simdgroups=1, policy='native-parity-v2'):
     if gate.geometry != up.geometry:
         raise ValueError('NAX gate/up geometry must match')
     for projection in (gate, up):
         _validate(x, projection.packed, projection.scales, projection.biases, *projection.geometry)
     columns = threads = 32*simdgroups
-    return get_gateup_kernel(*gate.geometry, simdgroups)(x, plan,
+    return _gateup_kernel(gate.geometry, simdgroups, policy)(x, plan,
         gate.packed, gate.scales, gate.biases, up.packed, up.scales, up.biases,
         threads_per_grid=(((gate.output_size+columns-1)//columns)*threads, plan.shape[0]-1, 1),
         threads_per_thread_group=(threads, 1, 1), result_shapes=[[x.shape[0], gate.output_size]])
 
 
 def nax_moe_kernels(moe):
-    from coreai_q4_nax_gateup import get_kernel as get_gateup_kernel
     fused_gateup = moe.fuse_gateup and 'gate_proj' in moe.nax_projections
     names = tuple(name for name in moe.nax_projections
                   if not (fused_gateup and name in ('gate_proj', 'up_proj')))
-    kernels = [get_kernel(*getattr(moe.decode, name).geometry, moe.nax_simdgroups, True) for name in names]
+    kernels = [_linear_kernel(getattr(moe.decode, name).geometry, moe.nax_simdgroups,
+               moe.nax_down_block if name == 'down_proj' else 16) for name in names]
+    if 'down_proj' in names and moe.nax_down_block != moe.block:
+        kernels.append(get_plan_kernel(moe.experts, moe.nax_down_block))
     if fused_gateup:
-        kernels.append(get_gateup_kernel(*moe.decode.gate_proj.geometry, moe.nax_simdgroups))
+        kernels.append(_gateup_kernel(moe.decode.gate_proj.geometry, moe.nax_simdgroups, moe.nax_gateup_policy))
     return list(dict.fromkeys(kernels))
 
 
-def install_nax_moe(module, *, projections='down', simdgroups=1):
+def install_nax_moe(module, *, projections='down', simdgroups=1, down_block=16,
+                    gateup_policy='native-parity-v2'):
     """Opt in only routed prefill projections; no tensor storage or S1 changes.
 
     The default selects only GPU-validated bitwise-exact down projections.
-    projections='all' also selects the experimental gate/up implementation.
+    projections='all' also selects native-parity-v2 gate/up. Its CPU callback
+    expresses the measured native GPU reassociation, so it deliberately differs
+    from the original source's half-SiLU/up-half intermediate policy. The older
+    experimental-v1 gate/up remains selectable for diagnostics.
+    down_block=32 creates a separate down-only BM32 plan; gate/up keep BM16.
     Install after flatten_moe_weights. Requires the existing BM16 plan contract;
     NAX supersedes other flat grouped-loader choices. The returned kernels are
     additions to existing registrations; custom_kernels() also includes them.
@@ -220,12 +249,20 @@ def install_nax_moe(module, *, projections='down', simdgroups=1):
         raise ValueError('NAX requires1/2/4SIMD groups')
     if projections not in ('down', 'all'):
         raise ValueError('NAX projections must be down or all')
+    if down_block not in (16, 32) or (down_block == 32 and simdgroups != 1):
+        raise ValueError('NAX down_block must be16/32; BM32 requires one SIMD group')
+    if gateup_policy not in ('native-parity-v2', 'experimental-v1'):
+        raise ValueError('NAX gate/up policy must be native-parity-v2 or experimental-v1')
+    if projections == 'all' and any(moe.fuse_gateup for moe in chunks) and gateup_policy == 'native-parity-v2' and simdgroups != 1:
+        raise ValueError('Native-parity gate/up currently requires one SIMD group')
     if any((moe.block, moe.columns, moe.inner) != (16, 32, 64) for moe in chunks):
         raise ValueError('NAX installation currently requires existing16/32/64tile and BM16 plan')
     before = [(name, value.dtype, tuple(value.shape), value.data_ptr()) for name, value in module.named_buffers()]
     kernels = []
     for moe in chunks:
         moe.nax_simdgroups = simdgroups
+        moe.nax_down_block = down_block
+        moe.nax_gateup_policy = gateup_policy
         moe.nax_projections = ('down_proj',) if projections == 'down' else ('gate_proj', 'up_proj', 'down_proj')
         kernels += nax_moe_kernels(moe)
     for moe in chunks:

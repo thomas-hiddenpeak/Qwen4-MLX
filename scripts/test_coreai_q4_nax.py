@@ -10,6 +10,8 @@ from coreai_moe_chunk import ChunkQ4MoE, make_synthetic
 from coreai_q4_flat import flatten_moe_weights
 from coreai_q4_nax import check_fragment_mapping, get_kernel, install_nax_moe
 from coreai_q4_nax_gateup import get_kernel as get_gateup_kernel
+from coreai_q4_nax_m32_probe import get_kernel as get_m32_kernel
+from coreai_q4_grouped import get_plan_kernel
 from export_coreai_pd_shared import buffer_signature, externalizable_buffers, export_generic
 
 
@@ -31,18 +33,24 @@ class NAXTests(unittest.TestCase):
         generator = torch.Generator().manual_seed(32181)
         inputs = [(torch.randn(1, count, 64, generator=generator)*.125).half() for count in (1, 4, 17)]
         inputs[-1][:, 0] = 0
-        for fused, projections in itertools.product((False, True), ('down', 'all')):
-            with self.subTest(fused=fused, projections=projections), torch.inference_mode():
+        for fused, projections, down_block in itertools.product((False, True), ('down', 'all'), (16, 32)):
+            with self.subTest(fused=fused, projections=projections, down_block=down_block), torch.inference_mode():
                 model = self.model(fused)
                 self.assertFalse(model.nax_moe)
                 flatten_moe_weights(model)
                 before = [(n, v.dtype, tuple(v.shape), v.data_ptr()) for n, v in model.named_buffers()]
                 expected = [model(x) for x in inputs]
-                kernels = install_nax_moe(model, projections=projections)
-                self.assertEqual(kernels, install_nax_moe(model, projections=projections))
+                # Native-parity-v2 deliberately models the measured GPU product
+                # reassociation. Use the legacy policy for source CPU equality.
+                options = dict(projections=projections, down_block=down_block, gateup_policy='experimental-v1')
+                kernels = install_nax_moe(model, **options)
+                self.assertEqual(kernels, install_nax_moe(model, **options))
                 if projections == 'down':
-                    self.assertEqual(len(kernels), 1)
-                    self.assertIs(kernels[0], get_kernel(*model.decode.down_proj.geometry, 1, True))
+                    if down_block == 16:
+                        self.assertEqual(kernels, [get_kernel(*model.decode.down_proj.geometry, 1, True)])
+                    else:
+                        self.assertEqual(kernels, [get_m32_kernel(*model.decode.down_proj.geometry),
+                                                  get_plan_kernel(model.experts, 32)])
                 self.assertTrue(set(kernels) <= set(model.custom_kernels()))
                 after = [(n, v.dtype, tuple(v.shape), v.data_ptr()) for n, v in model.named_buffers()]
                 self.assertEqual(before, after)
@@ -59,6 +67,12 @@ class NAXTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'projections'):
             install_nax_moe(model, projections='gate')
         self.assertFalse(model.nax_moe)
+        with self.assertRaisesRegex(ValueError, 'BM32'):
+            install_nax_moe(model, down_block=32, simdgroups=2)
+        self.assertFalse(model.nax_moe)
+        with self.assertRaisesRegex(ValueError, 'policy'):
+            install_nax_moe(model, gateup_policy='unknown')
+        self.assertFalse(model.nax_moe)
         model.block = 32
         with self.assertRaisesRegex(ValueError, 'BM16'):
             install_nax_moe(model)
@@ -68,7 +82,7 @@ class NAXTests(unittest.TestCase):
         from unittest.mock import patch
         model = self.model()
         flatten_moe_weights(model)
-        install_nax_moe(model)
+        install_nax_moe(model, down_block=32)
         with patch('coreai_q4_nax.nax_grouped_gateup', side_effect=AssertionError('gate/up must stay original')):
             model(torch.zeros(1, 4, 64).half())
         with patch('coreai_q4_nax.nax_grouped_linear', side_effect=AssertionError('decode must stay original')):
@@ -79,7 +93,7 @@ class NAXTests(unittest.TestCase):
         flatten_moe_weights(model)
         named, geometry = externalizable_buffers(model, {'decode.expert_ids'})
         signature = buffer_signature(named)
-        install_nax_moe(model)
+        install_nax_moe(model, projections='all', down_block=32, gateup_policy='native-parity-v2')
         examples = {name: {'x': torch.zeros(1, count, 64).half()}
                     for name, count in (('main', 1), ('prefill', 4))}
         with tempfile.TemporaryDirectory() as directory:

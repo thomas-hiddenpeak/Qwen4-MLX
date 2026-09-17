@@ -127,9 +127,11 @@ def install_moe_transfers(module,*,tail_precision='float16'):
     S1 still takes the original decode branch. Indices are internal trusted
     grouping results; these kernels do not validate permutation values on GPU.
     tail_precision=None enables only gather and retains the original tail graph.
+    'native-copy' also replaces inverse row copying, retaining the original
+    native scores, weighted products, reductions, casts and shared addition.
     """
     from coreai_moe_chunk import ChunkQ4MoE
-    if tail_precision not in ('float16','float32',None):raise ValueError('Unsupported tail product precision')
+    if tail_precision not in ('float16','float32','native-copy',None):raise ValueError('Unsupported tail product precision')
     children=[child for child in module.modules() if isinstance(child,ChunkQ4MoE)]
     if not children:raise ValueError('No ChunkQ4MoE found for direct transfers')
     for child in children:
@@ -139,5 +141,8 @@ def install_moe_transfers(module,*,tail_precision='float16'):
         child.direct_transfers=True
         child.direct_transfer_tail_precision=tail_precision
     kernels=[get_ordered_gather_kernel()]
-    if tail_precision is not None:kernels.append(get_inverse_reduce_kernel(tail_precision))
+    if tail_precision=='native-copy':
+        from coreai_moe_inverse_copy import get_inverse_copy_kernel
+        kernels.append(get_inverse_copy_kernel())
+    elif tail_precision is not None:kernels.append(get_inverse_reduce_kernel(tail_precision))
     return kernels

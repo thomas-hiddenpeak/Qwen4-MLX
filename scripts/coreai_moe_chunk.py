@@ -77,6 +77,8 @@ class ChunkQ4MoE(torch.nn.Module):
         self.nax_moe = False
         self.nax_simdgroups = 1
         self.nax_projections = ('down_proj',)
+        self.nax_down_block = 16
+        self.nax_gateup_policy = 'native-parity-v2'
         self.integer_grouping = False
         self.direct_transfers = False
         self.direct_transfer_tail_precision = 'float16'
@@ -95,7 +97,10 @@ class ChunkQ4MoE(torch.nn.Module):
         if self.direct_transfers:
             from coreai_moe_transfers import get_ordered_gather_kernel, get_inverse_reduce_kernel
             grouping_kernels.append(get_ordered_gather_kernel())
-            if self.direct_transfer_tail_precision is not None:
+            if self.direct_transfer_tail_precision == 'native-copy':
+                from coreai_moe_inverse_copy import get_inverse_copy_kernel
+                grouping_kernels.append(get_inverse_copy_kernel())
+            elif self.direct_transfer_tail_precision is not None:
                 grouping_kernels.append(get_inverse_reduce_kernel(self.direct_transfer_tail_precision))
         if self.integer_grouping:
             from coreai_expert_grouping import get_integer_grouping_kernels
@@ -134,7 +139,8 @@ class ChunkQ4MoE(torch.nn.Module):
         projection = getattr(self.decode, name)
         if self.nax_moe and name in self.nax_projections:
             from coreai_q4_nax import nax_grouped_linear
-            return nax_grouped_linear(x, plan, projection, self.nax_simdgroups)
+            return nax_grouped_linear(x, plan, projection, self.nax_simdgroups,
+                                     self.nax_down_block if name == 'down_proj' else 16)
         if self.flat_weights:
             from coreai_q4_flat import flat_grouped_linear
             return flat_grouped_linear(x, plan, projection, self.block, self.columns, self.inner,
@@ -151,11 +157,15 @@ class ChunkQ4MoE(torch.nn.Module):
 
     def reduce_routed(self, ordered_down, inverse, scores):
         count = scores.shape[0]
-        if self.direct_transfers and self.direct_transfer_tail_precision is not None:
+        if self.direct_transfers and self.direct_transfer_tail_precision == 'native-copy':
+            from coreai_moe_inverse_copy import inverse_copy
+            down = inverse_copy(ordered_down, inverse.int()).reshape(count, self.top_k, self.hidden)
+        elif self.direct_transfers and self.direct_transfer_tail_precision is not None:
             from coreai_moe_transfers import inverse_weight_sum
             return inverse_weight_sum(ordered_down, inverse.int(), scores.reshape(1, count, self.top_k),
                                       product_precision=self.direct_transfer_tail_precision)
-        down = torch.index_select(ordered_down, 0, inverse.long()).reshape(count, self.top_k, self.hidden)
+        else:
+            down = torch.index_select(ordered_down, 0, inverse.long()).reshape(count, self.top_k, self.hidden)
         return (down * scores[:, :, None]).half().float().sum(1).half().reshape(1, count, self.hidden)
 
     def forward(self, x):
@@ -184,7 +194,8 @@ class ChunkQ4MoE(torch.nn.Module):
             gate, up = self.decode.gate_proj, self.decode.up_proj
             if self.nax_moe and 'gate_proj' in self.nax_projections:
                 from coreai_q4_nax import nax_grouped_gateup
-                active = nax_grouped_gateup(ordered_x, plan, gate, up, self.nax_simdgroups)
+                active = nax_grouped_gateup(ordered_x, plan, gate, up, self.nax_simdgroups,
+                                           self.nax_gateup_policy)
             elif self.flat_weights:
                 from coreai_q4_flat import flat_grouped_gateup
                 active = flat_grouped_gateup(ordered_x, plan, gate, up, self.block, self.columns, self.inner,
@@ -196,7 +207,11 @@ class ChunkQ4MoE(torch.nn.Module):
             gate = self.grouped('gate_proj', ordered_x, plan)
             up = self.grouped('up_proj', ordered_x, plan)
             active = ((gate * gate.sigmoid()).half() * up).half()
-        ordered_down = self.grouped('down_proj', active, plan)
+        # Sorted assignments are unchanged, but BM32 down reuses each weight
+        # tile across two M16 fragments. Gate/up retain their original BM16 plan.
+        down_plan = make_plan(sorted_ids, self.experts, self.nax_down_block) if (
+            self.nax_moe and 'down_proj' in self.nax_projections and self.nax_down_block != self.block) else plan
+        ordered_down = self.grouped('down_proj', active, down_plan)
         routed = self.reduce_routed(ordered_down, inverse, scores)
         shared_gate = tensor_linear(x, self.decode.shared_gate_proj)
         shared_up = tensor_linear(x, self.decode.shared_up_proj)

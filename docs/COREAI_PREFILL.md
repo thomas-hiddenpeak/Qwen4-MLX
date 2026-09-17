@@ -118,6 +118,8 @@ Release 构建通过；Swift工作集选择及非法metadata检查通过直接�
 
 `--moe-direct-transfers` 默认关闭。`--moe-tail-precision native`只换exact gather；`float16`保留显式half-product候选；`float32`指FP32 products、opaque FP16 routed输出，**不等于**独立实验中的FP32 routed输出策略。原生图在实际设备上会消除一些中间half边界，不能用PyTorch源码上的`.half()`推断其融合后的精确算术。暴露routed/shared为图输出会改变最终结果，诊断图必须与未拆图比较。
 
+可选 `--moe-direct-transfers --moe-tail-precision native-copy` 同时将输入重排和inverse重排改为纯FP16数据复制，保留原生scores、加权乘积、求和、类型转换及shared相加表达式。它不采用融合尾部的自定义浮点求和；S1、权重名称与字节不变。manifest记录`moeTailPrecision="native-copy"`及`coreai_moe_inverse_copy.py`源码哈希。该模式仍须显式开启，未改变原选项的默认值或既有`native`含义。
+
 完整11K的direct transfers候选热态15.085s/733.0token/s，FP32 routed输出候选14.939s/740.2token/s；同期原配置17.979s/615.0token/s。两候选对原配置最终logits relative L2分别0.0954/0.1115，虽首token和两token文本一致，**尚未通过质量验收，不设为默认**。仅QSA工作集版本的全11K logits则逐bit一致。单独第0层FP32 routed输出候选误差降到4.68e-7，仅83/20,971,520个stream元素不同，仍可能在深层MoE路由中放大。
 
 树形FP32-output尾部是另一个独立候选：pad16后stride8/4/2/1，whole MoE S2048只有21/5,242,880元素不同、relative L2 7.98e-7；完整模型还要单独验证。默认导出不会隐式选它。对应证据：`moe-transfer-s8192/*/device-summary.json`、`layer0-transfer-comparison/device-summary.json`、`full-agent-11k-transfers*-logits-comparison.json`、`full-prefill-distribution-comparison.json`。
@@ -129,3 +131,28 @@ Release 构建通过；Swift工作集选择及非法metadata检查通过直接�
 可选NAX down移植使用MLX的MIT许可寄存器fragment结构、权重stride72和公开MPP每SIMD16×32×16操作，未链接MLX runtime。真实同输入S2048 down为8.170→5.574ms，output/plan逐bit一致。gate/up版本为12.859→10.030ms但存在约4.12e-4输出差异，仍单独调查。`install_nax_moe(..., projections='down')`只启用已验证down，普通构造默认不启用。整模型达到1K与数值验收均仍待完成。
 
 本阶段root复跑7项transfer CPU检查、4项NAX CPU检查、14项共享导出检查，均通过。所有吞吐仍是完整prompt重算，未用MTP或KV/prefix命中；独立算子速度不可直接当作整模型速度。
+
+
+### 组合优化继续逼近1K
+
+同一11,057-token提示词，tree FP32 routed输出、NAX down、GDN ILP4、整数分组及QSA有效历史组合，首轮17.915s/617.2token/s，第二轮13.611s/**812.3token/s**。第二轮仍完整重算prompt，无KV/prefix命中或MTP；采样physical峰值82.81GiB。对原配置最终logits relative L2为0.1074、maxAbs1.3898，因此这是实验吞吐，不是质量验收或默认配置。原始记录`full-agent-11k-optimized-v1.json`及对应memory/logits文件。
+
+独立NAX寄存器BM32 down通过复用同一权重片段处理两组16行：真实S2048输入的BM16 5.377ms→BM32 4.251ms，输出逐bit一致；各自plan均匹配独立预期。1/16/17/32/33专家行数与N67尾列小测试一致。该真实fixture每专家40行，BM32在减少解包的同时增加填充计算；不能直接把21%算子收益当成整模型收益。证据`nax-m32-down-{tiny,real-s2048}/device-summary.json`。
+
+NAX gate/up诊断中FP32累加、half投影、sigmoid、SiLU和最终输出均与原诊断核逐bit一致，分离投影也一致；未暴露中间值的原候选仍有差异。增加诊断输出会改变编译优化，后续需在不暴露中间值的生产形态下验证舍入策略。
+
+
+4096主块的optimized-v1组合完整11K两轮为19.216s/575.4token/s和13.046s/**847.5token/s**，采样峰值93.82GiB；logits relative L2 0.1138，仍非质量验收。8192组合首轮16.913s，第二轮前physical footprint达到110.67GiB，110GiB内存保护主动停止进程；未取得该配置热态完整结果，不继续原样重试。证据`full-agent-11k-optimized-v1-s4096.json`与`full-agent-11k-optimized-v1-s8192-memory.json`。
+
+GDN/NAX独立核继续验证：gate/up通过CPU重放定位原GPU真实舍入表达式，再用独立volatile half边界实现parity-v2。真实S2048原12.900ms→新10.047ms，全部13,107,200输出逐bit一致，tiny也一致。可选组合API `install_nax_moe(..., projections="all", down_block=32, gateup_policy="native-parity-v2")`；BM32 down独立生成plan，gate/up仍用BM16。5项CPU集成测试通过，普通导出仍默认关闭NAX。
+
+`CoreAITextRuntime.prefill`现在显式传递业务阶段：最后一个token即使使用S1 kernel，统计也归入prefill；生成阶段才归decode。Release构建通过，4096整模型两轮确认两阶段正耗时分离（delta字典仍可含其他阶段的零值键）。这只修正阶段归属，不改变总prefill时间或计算。
+
+
+### 保留原生加权图的精确搬运路径
+
+`--moe-direct-transfers --moe-tail-precision native-copy`仅用两个copy kernel替换输入gather和输出inverse gather，保留原生scores→products→sum→shared图，避免在opaque kernel边界强制物化FP16分数。S2048完整MoE为29.056→22.144ms，S8192为197.213→79.378ms，输出/IDs/scores均逐bit一致；S8192独立尾部89.386→3.357ms也完全一致。
+
+完整11K的copy-only配置为19.306s/572.7token/s和15.118s/**731.4token/s**，最终248320个FP32 logits对原配置**逐bit一致**，采样峰值83.87GiB。这保留了此前融合尾部的几乎全部收益而没有其整模型数值差异。证据`full-agent-11k-inverse-copy.json`及`.f32`、`moe-transfer-s8192/*inverse-copy/device-summary.json`；formal exporter14项及inverse-copy3项CPU检查通过。普通导出仍默认关闭direct transfers。
+
+NAX parity-v2 + BM32 down加入S4096 optimized-v2后，全模型logits与optimized-v1逐bit一致；热态13.180s/838.9token/s，未优于v1的13.046s/847.5token/s。单核加速未在该次整模型对照转化为显著收益，保留这个负结果；整模型性能目标依然未达到。

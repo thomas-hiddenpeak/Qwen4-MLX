@@ -100,7 +100,7 @@ class SharedExportTests(unittest.TestCase):
         from coreai_q4_flat import flatten_moe_weights
         self.assertEqual(resolve_moe_transfers(), {'enabled': False, 'tailPrecision': 'native'})
         self.assertEqual(resolve_moe_transfers(True), {'enabled': True, 'tailPrecision': 'float32'})
-        for precision in ('float16', 'float32', 'native'):
+        for precision in ('float16', 'float32', 'native', 'native-copy'):
             self.assertEqual(resolve_moe_transfers(True, precision)['tailPrecision'], precision)
             with self.assertRaisesRegex(ValueError, 'requires --moe-direct-transfers'):
                 resolve_moe_transfers(False, precision)
@@ -122,12 +122,14 @@ class SharedExportTests(unittest.TestCase):
         self.assertEqual([(name, value.data_ptr()) for name, value in module.named_buffers()], original_owners)
         examples = {name: {'x': torch.zeros(1, count, 64).half()} for name, count in [('main', 1), ('prefill', 4)]}
         with tempfile.TemporaryDirectory() as directory:
-            result = export_generic(module, after, {'decode.expert_ids'}, examples, ('output', 'ids', 'scores'),
-                Path(directory)/'moe.aimodel', module.custom_kernels())
-            self.assertEqual(result['weightSignature'], original_signature)
-            self.assertTrue(all(set(item['usedCapturedBuffers']) <= {'base.decode.expert_ids'}
-                                for item in result['torchExport'].values()))
-            self.assertTrue(all(item['userInputCount'] == len(after)+1 for item in result['torchExport'].values()))
+            for precision in ('float32', 'native-copy'):
+                install_moe_transfers(module, tail_precision=precision)
+                result = export_generic(module, after, {'decode.expert_ids'}, examples, ('output', 'ids', 'scores'),
+                    Path(directory)/f'moe-{precision}.aimodel', module.custom_kernels())
+                self.assertEqual(result['weightSignature'], original_signature)
+                self.assertTrue(all(set(item['usedCapturedBuffers']) <= {'base.decode.expert_ids'}
+                                    for item in result['torchExport'].values()))
+                self.assertTrue(all(item['userInputCount'] == len(after)+1 for item in result['torchExport'].values()))
 
     def test_qsa_working_set_limits_and_shared_tensor_ownership(self):
         from coreai_qsa_chunk import QwenQSAChunk, make_tiny
@@ -221,7 +223,8 @@ class SharedExportTests(unittest.TestCase):
                     mock.patch.object(exporter.shutil, 'disk_usage', return_value=mock.Mock(free=10**12)):
                 source.return_value.directory = model_dir
                 cases = [(False, False, None), (True, False, None), (False, True, None),
-                         (True, True, 'float16'), (False, True, 'float32'), (False, True, 'native')]
+                         (True, True, 'float16'), (False, True, 'float32'), (False, True, 'native'),
+                         (False, True, 'native-copy')]
                 for index, (enabled, direct, precision) in enumerate(cases):
                     output = root/f'case-{index}'
                     arguments = ['--baseline-pd', str(baseline_dir), '--output', str(output),
@@ -241,6 +244,7 @@ class SharedExportTests(unittest.TestCase):
                     self.assertTrue(saved['flatQ4'])
                     self.assertIn('coreai_q4_flat', saved['authoringSourceSHA256'])
                     self.assertIn('coreai_moe_transfers', saved['authoringSourceSHA256'])
+                    self.assertIn('coreai_moe_inverse_copy', saved['authoringSourceSHA256'])
                     self.assertIn('coreai_gdn_ilp_probe', saved['authoringSourceSHA256'])
                     self.assertEqual(saved['gdnPrefillRows'], rows)
                     self.assertIn('S1', saved['gdnPrefillNumerics'])
