@@ -193,6 +193,42 @@ final class CoreAIExternalWeights {
         return merged
     }
 
+    /// Pending activations come only from a previously validated function
+    /// signature on the same stream. AsyncValue exposes kind, but not shape;
+    /// callers must validate its actual NDArray after the bounded batch drains.
+    func merging(activations: [String: NDArray], pending: [String: InferenceFunction.AsyncValue],
+                 pendingDescriptors: [String: NDArrayDescriptor], for descriptor: InferenceFunctionDescriptor) throws
+        -> [String: InferenceFunction.AsyncValue] {
+        try validateInputs(for: descriptor)
+        let activationNames = Set(activations.keys)
+        let pendingNames = Set(pending.keys)
+        guard pendingNames == Set(pendingDescriptors.keys),
+              inputNames.isDisjoint(with: activationNames.union(pendingNames)),
+              activationNames.isDisjoint(with: pendingNames),
+              Set(descriptor.inputNames) == inputNames.union(activationNames).union(pendingNames) else {
+            throw Self.invalid("Pending weight/activation inputs overlap or leave an incomplete function input set")
+        }
+        var merged = values
+        for (name, array) in activations {
+            guard array.interleaveLayout == nil,
+                  case .ndArray(let declared) = descriptor.inputDescriptor(of: name) else {
+                throw Self.invalid("\(name): unsupported activation tensor input")
+            }
+            try Self.validate(shape: array.shape, type: array.scalarType, declared: declared, name: name)
+            merged[name] = InferenceFunction.AsyncValue(array)
+        }
+        for (name, value) in pending {
+            guard value.kind == .ndArray, let source = pendingDescriptors[name],
+                  !source.hasDynamicShape, source.interleaveLayout == nil,
+                  case .ndArray(let declared) = descriptor.inputDescriptor(of: name) else {
+                throw Self.invalid("\(name): unsupported pending activation tensor input")
+            }
+            try Self.validate(shape: source.shape, type: source.scalarType, declared: declared, name: name)
+            merged[name] = value
+        }
+        return merged
+    }
+
     private static func validateMetadata(_ spec: CoreAIExternalWeightsSpec) throws -> Int {
         guard spec.alignment >= 4, spec.alignment & (spec.alignment - 1) == 0,
               spec.byteLength > 0, spec.byteLength.isMultiple(of: spec.alignment),

@@ -77,7 +77,8 @@ public struct CoreAIPhaseSnapshot: Sendable {
 /// Complete CoreAI execution with fixed token/chunk functions sharing each asset's
 /// AIModel owner. Both phases use the same explicit state tensors. Intermediate
 /// activations remain NDArrays; only logits and QSA counters reach the CPU.
-/// Operations are serial and fail closed after a partially completed forward.
+/// Model operations are exclusive and fail closed after partial execution.
+/// Multi-token prefill may opt into bounded AsyncValue layer pipelines.
 @available(macOS 27.0, *)
 public final class CoreAIPhaseModel {
     private struct Functions {
@@ -110,9 +111,19 @@ public final class CoreAIPhaseModel {
         }
     }
 
+    private struct PendingLayerCall {
+        let layer: LoadedLayer
+        let runner: CoreAIBlockRunner
+        let outputs: [String: InferenceFunction.AsyncValue]
+        let encodeMilliseconds: Double
+    }
+
     public let capacity: Int
     public let vocabularySize: Int
     public let tokenChunk: Int
+    /// Opt-in bound on in-flight fused layers during multi-token prefill.
+    /// S1, decode, embedding and head retain the serial execution path.
+    public let prefillPipelineDepth: Int
     /// Descending static chunk sizes, including S1 for every unpadded tail.
     public let supportedPrefillChunks: [Int]
     public let manifestModelDirectory: URL
@@ -124,13 +135,18 @@ public final class CoreAIPhaseModel {
     public private(set) var successfulCalls = 0
     public private(set) var callCounts: [String: Int] = [:]
     public private(set) var predictionMillisecondsByGroup: [String: Double] = [:]
-    /// The same awaited call durations broken down by fused layer. These are a
-    /// separate view of group times, not additional time to sum with them.
+    /// Serial awaited call durations broken down by fused layer. Pipelined
+    /// layers intentionally have no per-layer wall duration here. These overlap
+    /// group times and must not be added to them.
     public private(set) var predictionMillisecondsByLayer: [String: Double] = [:]
     /// External-weight calls only: `<group>.encode`, `.wait`, and
     /// `.materialization` partition the timed runtime work. These overlap the
     /// group total; the last stage includes obtaining every output NDArray.
+    /// Pipelined batches use prefill.pipeline stages, with validation included
+    /// in materialization_and_validation; input preparation remains in batch wall.
     public private(set) var externalCallMillisecondsByStage: [String: Double] = [:]
+    /// Host encode duration only, never a GPU or end-to-end layer duration.
+    public private(set) var prefillPipelineEncodeMillisecondsByLayer: [String: Double] = [:]
     public private(set) var lastForwardMilliseconds = 0.0
     public var totalPredictionMilliseconds: Double { predictionMillisecondsByGroup.values.reduce(0, +) }
 
@@ -142,18 +158,24 @@ public final class CoreAIPhaseModel {
     private let gate = NSLock()
     private var operationInProgress = false
 
-    public init(manifestURL: URL, computeUnits: CoreAIComputeUnits = .gpu,
+    public init(manifestURL: URL, computeUnits: CoreAIComputeUnits = .gpu, prefillPipelineDepth: Int = 1,
                 progress: ((Int, Int) -> Void)? = nil) async throws {
         let started = DispatchTime.now().uptimeNanoseconds
+        guard [1, 2, 4, 8].contains(prefillPipelineDepth) else {
+            throw CoreAIBlockRunnerError.invalidModel("Prefill pipeline depth must be 1, 2, 4 or 8")
+        }
         guard manifestURL.isFileURL else {
             throw CoreAIBlockRunnerError.invalidModel("CoreAI phase manifest must be a local file")
         }
         let manifest = try JSONDecoder().decode(PhaseManifest.self, from: Data(contentsOf: manifestURL))
         let tailChunks = manifest.tailChunks ?? []
         let allowedPrimary: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        let allowedTails: Set<Int> = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        let allowedTails: Set<Int> = [4, 8, 16, 32, 48, 64, 128, 192, 256, 512, 768, 1024, 2048, 4096]
         let sharedGraphs = manifest.version == 2 && manifest.backend == "native-coreai-pd-shared"
         let constantGraphs = manifest.version == 1 && manifest.backend == "native-coreai-pd"
+        guard prefillPipelineDepth == 1 || sharedGraphs else {
+            throw CoreAIBlockRunnerError.invalidModel("Prefill pipelining requires a shared-weight PD manifest")
+        }
         guard sharedGraphs || constantGraphs, manifest.status == "complete",
               manifest.completeModelLayerSet, manifest.layers.count == 48,
               Set(manifest.layers.map(\.index)) == Set(0..<48),
@@ -188,7 +210,10 @@ public final class CoreAIPhaseModel {
             URL(fileURLWithPath: spec.path, relativeTo: base).standardizedFileURL.resolvingSymlinksInPath()
         }
         let specs = Array(manifest.assets.values) + manifest.layers.map(\.asset)
-        guard specs.allSatisfy({ !$0.path.isEmpty && $0.function == "main" && $0.prefillFunction == "prefill" }),
+        // A shared asset may expose this manifest's primary chunk through an
+        // existing tail entrypoint. Every tensor shape is still checked below.
+        let primaryFunctionNames: Set<String> = ["prefill", "prefill_s\(manifest.tokenChunk)"]
+        guard specs.allSatisfy({ !$0.path.isEmpty && $0.function == "main" && primaryFunctionNames.contains($0.prefillFunction) }),
               manifest.layers.allSatisfy({ ($0.weights != nil) == sharedGraphs }),
               sharedGraphs || Set(specs.map { assetURL($0).path }).count == 50 else {
             throw CoreAIBlockRunnerError.invalidModel("CoreAI phase assets require main/prefill functions and a consistent weight ownership format")
@@ -297,6 +322,7 @@ public final class CoreAIPhaseModel {
         self.layers = loaded
         self.capacity = manifest.capacity
         self.tokenChunk = manifest.tokenChunk
+        self.prefillPipelineDepth = prefillPipelineDepth
         self.supportedPrefillChunks = supportedCounts
         self.vocabularySize = manifest.vocabularySize
         self.manifestModelDirectory = source
@@ -341,21 +367,29 @@ public final class CoreAIPhaseModel {
                 values: pleEmbedding.map(Double.init)), name: "ple_embedding")
             var stream = try Self.required(await call(embedding.runner(count: count), inputs: ["token": ids],
                                                      group: "\(phase).embedding"), "stream")
-            for layer in layers {
-                var inputs = layer.states
-                inputs["stream"] = stream
-                if layer.spec.hasPLE { inputs["ple_embedding"] = rows }
-                let output = try await call(layer.functions.runner(count: count, endOffset: nextOffset), inputs: inputs,
-                                            weights: layer.weights, group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
-                var nextStates: [String: NDArray] = [:]
-                for (name, outputName) in layer.spec.stateBindings {
-                    nextStates[name] = try Self.required(output, outputName)
+            if phase == "prefill", count > 1, prefillPipelineDepth > 1 {
+                for start in stride(from: 0, to: layers.count, by: prefillPipelineDepth) {
+                    let end = min(start + prefillPipelineDepth, layers.count)
+                    stream = try await callPrefillBatch(layers[start..<end], stream: stream, rows: rows,
+                                                      count: count, nextOffset: nextOffset)
                 }
-                try Self.validateStates(nextStates, layer: layer, at: nextOffset)
-                let nextStream = try Self.required(output, "stream_out")
-                layer.states = nextStates
-                layer.nextOffset = nextOffset
-                stream = nextStream
+            } else {
+                for layer in layers {
+                    var inputs = layer.states
+                    inputs["stream"] = stream
+                    if layer.spec.hasPLE { inputs["ple_embedding"] = rows }
+                    let output = try await call(layer.functions.runner(count: count, endOffset: nextOffset), inputs: inputs,
+                                                weights: layer.weights, group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
+                    var nextStates: [String: NDArray] = [:]
+                    for (name, outputName) in layer.spec.stateBindings {
+                        nextStates[name] = try Self.required(output, outputName)
+                    }
+                    try Self.validateStates(nextStates, layer: layer, at: nextOffset)
+                    let nextStream = try Self.required(output, "stream_out")
+                    layer.states = nextStates
+                    layer.nextOffset = nextOffset
+                    stream = nextStream
+                }
             }
             let output = try await call(head.runner(count: count), inputs: ["stream": stream], group: "\(phase).head")
             let logits = try CoreAIBlockRunner.read(Self.required(output, "logits"), name: "logits")
@@ -451,7 +485,116 @@ public final class CoreAIPhaseModel {
         predictionMillisecondsByGroup = [:]
         predictionMillisecondsByLayer = [:]
         externalCallMillisecondsByStage = [:]
+        prefillPipelineEncodeMillisecondsByLayer = [:]
         lastForwardMilliseconds = 0
+    }
+
+    /// Encode only a bounded layer window. All graph outputs stay retained until
+    /// the window has drained and every output/state has passed validation.
+    /// No state is published within a window, and cancellation drains the GPU
+    /// before the outer operation guard can release/reset any live storage.
+    private func callPrefillBatch(_ batch: ArraySlice<LoadedLayer>, stream: NDArray, rows: NDArray,
+                                  count: Int, nextOffset: Int) async throws -> NDArray {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var pendingCalls: [PendingLayerCall] = []
+        do {
+            guard let first = batch.first, !batch.isEmpty, batch.count <= prefillPipelineDepth else {
+                throw CoreAIBlockRunnerError.invalidFixture("Invalid bounded prefill layer batch")
+            }
+            let firstRunner = try first.functions.runner(count: count, endOffset: nextOffset)
+            guard case .ndArray(let firstDescriptor) = firstRunner.function.descriptor.inputDescriptor(of: "stream") else {
+                throw CoreAIBlockRunnerError.invalidFixture("Prefill batch is missing its stream input descriptor")
+            }
+            try CoreAIBlockRunner.validate(stream, descriptor: firstDescriptor, name: "stream")
+            var streamValue = InferenceFunction.AsyncValue(stream)
+            var streamDescriptor = firstDescriptor
+            for layer in batch {
+                try Task.checkCancellation()
+                let runner = try layer.functions.runner(count: count, endOffset: nextOffset)
+                let descriptor = runner.function.descriptor
+                guard let weights = layer.weights else {
+                    throw CoreAIBlockRunnerError.invalidFixture("Prefill pipeline requires retained external weights")
+                }
+                var activations = layer.states
+                if layer.spec.hasPLE { activations["ple_embedding"] = rows }
+                let inputs = try weights.merging(activations: activations, pending: ["stream": streamValue],
+                    pendingDescriptors: ["stream": streamDescriptor], for: descriptor)
+                let encodeStarted = DispatchTime.now().uptimeNanoseconds
+                let output = try runner.function.encode(inputs: inputs, to: computeStream)
+                let encodeMilliseconds = CoreAIBlockRunner.milliseconds(since: encodeStarted)
+                pendingCalls.append(PendingLayerCall(layer: layer, runner: runner, outputs: output,
+                                                     encodeMilliseconds: encodeMilliseconds))
+                guard Set(output.keys) == Set(descriptor.outputNames),
+                      output.values.allSatisfy({ $0.kind == .ndArray }),
+                      let nextStream = output["stream_out"],
+                      case .ndArray(let nextDescriptor) = descriptor.outputDescriptor(of: "stream_out") else {
+                    throw CoreAIBlockRunnerError.invalidFixture("Layer \(layer.spec.index): invalid pending prefill outputs")
+                }
+                streamValue = nextStream
+                streamDescriptor = nextDescriptor
+            }
+            let waitStarted = DispatchTime.now().uptimeNanoseconds
+            await computeStream.currentWorkCompleted()
+            let completed = DispatchTime.now().uptimeNanoseconds
+            try Task.checkCancellation()
+            var stagedStates: [[String: NDArray]] = []
+            var finalStream: NDArray?
+            for pending in pendingCalls {
+                try Task.checkCancellation()
+                let descriptor = pending.runner.function.descriptor
+                var outputs: [String: NDArray] = [:]
+                for name in descriptor.outputNames {
+                    guard let value = pending.outputs[name], let array = try await value.ndArray,
+                          case .ndArray(let declared) = descriptor.outputDescriptor(of: name) else {
+                        throw CoreAIBlockRunnerError.invalidFixture("Layer \(pending.layer.spec.index): missing completed output \(name)")
+                    }
+                    try CoreAIBlockRunner.validate(array, descriptor: declared, name: name)
+                    outputs[name] = array
+                }
+                var nextStates: [String: NDArray] = [:]
+                for (name, outputName) in pending.layer.spec.stateBindings {
+                    nextStates[name] = try Self.required(outputs, outputName)
+                }
+                try Self.validateStates(nextStates, layer: pending.layer, at: nextOffset)
+                stagedStates.append(nextStates)
+                finalStream = try Self.required(outputs, "stream_out")
+            }
+            guard pendingCalls.count == batch.count, stagedStates.count == batch.count, let finalStream else {
+                throw CoreAIBlockRunnerError.invalidFixture("Incomplete bounded prefill execution")
+            }
+            try Task.checkCancellation()
+            let materialized = DispatchTime.now().uptimeNanoseconds
+            // Commit only after the entire batch is complete and validated.
+            for (pending, states) in zip(pendingCalls, stagedStates) {
+                pending.layer.states = states
+                pending.layer.nextOffset = nextOffset
+                successfulCalls += 1
+                let group = "prefill.\(pending.layer.spec.kind)"
+                callCounts[group, default: 0] += 1
+                prefillPipelineEncodeMillisecondsByLayer["\(group).layer\(pending.layer.spec.index).encode", default: 0]
+                    += pending.encodeMilliseconds
+            }
+            // This is one batch's host wall time including enqueue, drain and
+            // validation, not a sum of per-layer GPU durations. Serial embedding
+            // and head retain their existing groups; business call counts above
+            // still record every actual successful layer function.
+            predictionMillisecondsByGroup["prefill.pipeline", default: 0]
+                += CoreAIBlockRunner.milliseconds(since: started)
+            externalCallMillisecondsByStage["prefill.pipeline.encode", default: 0]
+                += pendingCalls.reduce(0) { $0 + $1.encodeMilliseconds }
+            externalCallMillisecondsByStage["prefill.pipeline.wait", default: 0]
+                += Double(completed - waitStarted) / 1_000_000
+            externalCallMillisecondsByStage["prefill.pipeline.materialization_and_validation", default: 0]
+                += Double(materialized - completed) / 1_000_000
+            return finalStream
+        } catch {
+            valid = false
+            // encode itself can throw after partial submission. Drain even if
+            // no result dictionary was returned, retaining pendingCalls/self.
+            await computeStream.currentWorkCompleted()
+            withExtendedLifetime(pendingCalls) {}
+            throw error
+        }
     }
 
     private func call(_ runner: CoreAIBlockRunner, inputs: [String: NDArray], weights: CoreAIExternalWeights? = nil, group: String,
@@ -465,7 +608,16 @@ public final class CoreAIPhaseModel {
         var output: [String: NDArray] = [:]
         if let externalInputs {
             let encodeStarted = DispatchTime.now().uptimeNanoseconds
-            let pending = try runner.function.encode(inputs: externalInputs, to: computeStream)
+            let pending: [String: InferenceFunction.AsyncValue]
+            do {
+                pending = try runner.function.encode(inputs: externalInputs, to: computeStream)
+            } catch {
+                // Submission can fail after scheduling work. Keep its inputs
+                // alive until drained before reset/restore can acquire the gate.
+                await computeStream.currentWorkCompleted()
+                withExtendedLifetime(externalInputs) {}
+                throw error
+            }
             let encoded = DispatchTime.now().uptimeNanoseconds
             await computeStream.currentWorkCompleted()
             let completed = DispatchTime.now().uptimeNanoseconds

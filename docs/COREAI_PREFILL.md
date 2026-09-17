@@ -128,7 +128,7 @@ Release 构建通过；Swift工作集选择及非法metadata检查通过直接�
 
 `--gdn-prefill-rows 1|2|4`默认1。每SIMD同时维护4个独立value rows、复用q/k/gates，真实预处理的H48/V128/T2048 recurrence为5.872→3.630ms。最终FP32 recurrent state逐bit一致；y最大差1.91e-6、relative L2 1.28e-6。V7尾行/零decay/零beta的小图输出与state均exact。S1仍使用原kernel。
 
-可选NAX down移植使用MLX的MIT许可寄存器fragment结构、权重stride72和公开MPP每SIMD16×32×16操作，未链接MLX runtime。真实同输入S2048 down为8.170→5.574ms，output/plan逐bit一致。gate/up版本为12.859→10.030ms但存在约4.12e-4输出差异，仍单独调查。`install_nax_moe(..., projections='down')`只启用已验证down，普通构造默认不启用。整模型达到1K与数值验收均仍待完成。
+可选NAX down移植使用MLX的MIT许可寄存器fragment结构、权重stride72和公开MPP每SIMD16×32×16操作，未链接MLX runtime。S2048相同合成激活、原权重的down为8.170→5.574ms，output/plan逐bit一致。gate/up版本为12.859→10.030ms但存在约4.12e-4输出差异，仍单独调查。`install_nax_moe(..., projections='down')`只启用已验证down，普通构造默认不启用。整模型达到1K与数值验收均仍待完成。
 
 本阶段root复跑7项transfer CPU检查、4项NAX CPU检查、14项共享导出检查，均通过。所有吞吐仍是完整prompt重算，未用MTP或KV/prefix命中；独立算子速度不可直接当作整模型速度。
 
@@ -137,14 +137,14 @@ Release 构建通过；Swift工作集选择及非法metadata检查通过直接�
 
 同一11,057-token提示词，tree FP32 routed输出、NAX down、GDN ILP4、整数分组及QSA有效历史组合，首轮17.915s/617.2token/s，第二轮13.611s/**812.3token/s**。第二轮仍完整重算prompt，无KV/prefix命中或MTP；采样physical峰值82.81GiB。对原配置最终logits relative L2为0.1074、maxAbs1.3898，因此这是实验吞吐，不是质量验收或默认配置。原始记录`full-agent-11k-optimized-v1.json`及对应memory/logits文件。
 
-独立NAX寄存器BM32 down通过复用同一权重片段处理两组16行：真实S2048输入的BM16 5.377ms→BM32 4.251ms，输出逐bit一致；各自plan均匹配独立预期。1/16/17/32/33专家行数与N67尾列小测试一致。该真实fixture每专家40行，BM32在减少解包的同时增加填充计算；不能直接把21%算子收益当成整模型收益。证据`nax-m32-down-{tiny,real-s2048}/device-summary.json`。
+独立NAX寄存器BM32 down通过复用同一权重片段处理两组16行：S2048原权重和合成激活输入的BM16 5.377ms→BM32 4.251ms，输出逐bit一致；各自plan均匹配独立预期。1/16/17/32/33专家行数与N67尾列小测试一致。该真实fixture每专家40行，BM32在减少解包的同时增加填充计算；不能直接把21%算子收益当成整模型收益。证据`nax-m32-down-{tiny,real-s2048}/device-summary.json`。
 
 NAX gate/up诊断中FP32累加、half投影、sigmoid、SiLU和最终输出均与原诊断核逐bit一致，分离投影也一致；未暴露中间值的原候选仍有差异。增加诊断输出会改变编译优化，后续需在不暴露中间值的生产形态下验证舍入策略。
 
 
 4096主块的optimized-v1组合完整11K两轮为19.216s/575.4token/s和13.046s/**847.5token/s**，采样峰值93.82GiB；logits relative L2 0.1138，仍非质量验收。8192组合首轮16.913s，第二轮前physical footprint达到110.67GiB，110GiB内存保护主动停止进程；未取得该配置热态完整结果，不继续原样重试。证据`full-agent-11k-optimized-v1-s4096.json`与`full-agent-11k-optimized-v1-s8192-memory.json`。
 
-GDN/NAX独立核继续验证：gate/up通过CPU重放定位原GPU真实舍入表达式，再用独立volatile half边界实现parity-v2。真实S2048原12.900ms→新10.047ms，全部13,107,200输出逐bit一致，tiny也一致。可选组合API `install_nax_moe(..., projections="all", down_block=32, gateup_policy="native-parity-v2")`；BM32 down独立生成plan，gate/up仍用BM16。5项CPU集成测试通过，普通导出仍默认关闭NAX。
+GDN/NAX独立核继续验证：gate/up通过CPU重放定位原GPU真实舍入表达式，再用独立volatile half边界实现parity-v2。原权重与合成激活的S2048原12.900ms→新10.047ms，全部13,107,200输出逐bit一致，tiny也一致。可选组合API `install_nax_moe(..., projections="all", down_block=32, gateup_policy="native-parity-v2")`；BM32 down独立生成plan，gate/up仍用BM16。5项CPU集成测试通过，普通导出仍默认关闭NAX。
 
 `CoreAITextRuntime.prefill`现在显式传递业务阶段：最后一个token即使使用S1 kernel，统计也归入prefill；生成阶段才归decode。Release构建通过，4096整模型两轮确认两阶段正耗时分离（delta字典仍可含其他阶段的零值键）。这只修正阶段归属，不改变总prefill时间或计算。
 
@@ -156,3 +156,22 @@ GDN/NAX独立核继续验证：gate/up通过CPU重放定位原GPU真实舍入表
 完整11K的copy-only配置为19.306s/572.7token/s和15.118s/**731.4token/s**，最终248320个FP32 logits对原配置**逐bit一致**，采样峰值83.87GiB。这保留了此前融合尾部的几乎全部收益而没有其整模型数值差异。证据`full-agent-11k-inverse-copy.json`及`.f32`、`moe-transfer-s8192/*inverse-copy/device-summary.json`；formal exporter14项及inverse-copy3项CPU检查通过。普通导出仍默认关闭direct transfers。
 
 NAX parity-v2 + BM32 down加入S4096 optimized-v2后，全模型logits与optimized-v1逐bit一致；热态13.180s/838.9token/s，未优于v1的13.046s/847.5token/s。单核加速未在该次整模型对照转化为显著收益，保留这个负结果；整模型性能目标依然未达到。
+
+
+### Native-copy组合及有界提交实验
+
+S4096 optimized-v2-native-tail组合热态11.903s/**928.9token/s**，首轮18.537s，峰值96.56GiB。原S4096基线对原S2048基线自身存在0.1021的最终logits relative L2；同S4096对照下新组合对原配置为0.0630（softmax KL0.00525），因此不能把不同chunk间差异全归因于新kernel。同一组合强制S2048仍有0.1094差异，额外因素正在按整数分组/ILP/NAX逐项隔离，不能据此宣称质量通过。copy-only的S2048完整logits仍是已验证的exact控制。
+
+`generate --prefill-pipeline-depth 1|2|4|8`为独立可选实验，默认1；只对多token prefill连续编码有限层，再一次等待并验证整批输出、显式状态和offset后提交。失败或取消先drain已提交工作，再使模型失效；S1和生成阶段保持串行。深度2完整11K及两次reset结果与串行逐bit一致，峰值96.71GiB，但热态12.185s/907.4token/s，未优于串行，故没有提升为默认。Release构建通过，非法depth/缺PD/服务命令使用该flag均正确拒绝。
+
+流水线统计只报告`prefill.pipeline`批次墙钟和单独的host encode时间；不伪造逐层GPU耗时。原始证据为`full-agent-11k-optimized-v2-native-tail-s4096*.json`、`native-tail-full-distribution-controls.json`与`build-pipeline.log`。
+
+NAX gate/up进一步BM32和SG2/4均为负结果，未接入：同原权重与合成激活，BM16 SG1约10.035ms，SG2约11.113ms、SG4约12.499ms、BM32约12.734ms；全部输出/各自plan逐bit一致。保留独立探针供复现，不把tile加大当作必然收益。
+
+### 整模型数值隔离与尾块实验
+
+固定S2048、相同11,057-token输入，在exact native-copy控制上分别只加入整数分组、NAX all/parity-v2 + down BM32、旧GDN ILP4。前两项最终248320个FP32 logits均与原基线逐bit一致；旧ILP4单项则完整复现组合配置的差异（relative L2 0.10938）。这把该固定chunk组合的数值问题定位到旧ILP4；其孤立最终state一致不足以证明每个token的y一致。单轮隔离测试期间存在CPU导出工作，结果仅用于数值判断，不用于性能排序。证据`full-agent-11k-isolate-{a-integer,b-ilp4,c-nax}.json`及各自`.f32`。
+
+可选`--radix4-tails`增加48/192/768三个通用尾块，不填充prompt，默认关闭。Swift按manifest与完整函数输入/输出形状检查允许这些入口，并允许primary指向已经导出的`prefill_sN`别名。817-token余量从512+256+32+16+1变为768+48+1。所有原权重文件复用，新top资产约2.56GB；各AIModel仍可能为全部函数保留arena，函数选择不等于内存释放。
+
+原GDN ILP1加radix4的完整S4096测试热态12.442s/888.7token/s，采样峰值97.37GiB；S2048控制对原基线logits relative L2 0.05009，仅保留S768的控制为0.02035，均不视为质量通过。第0层S768与3×S256的输出和state逐bit一致，但不能外推整模型；S48与3×S16已出现约0.000202的stream相对差异。尾块选项保留为实验，不改变默认行为。证据`full-agent-11k-radix4-ilp1-s4096.json`、`full-agent-11k-radix*-ilp1-s2048-control-prefill.f32`及`radix4-layer-device.json`。

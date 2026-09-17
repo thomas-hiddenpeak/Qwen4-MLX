@@ -35,9 +35,14 @@ public final class CoreAITextRuntime {
     private let backend: Backend
 
     public init(attentionManifest: URL, denseManifest: URL, moeManifest: URL,
-                pdManifest: URL? = nil, computeUnits: CoreAIComputeUnits = .gpu) async throws {
+                pdManifest: URL? = nil, computeUnits: CoreAIComputeUnits = .gpu,
+                prefillPipelineDepth: Int = 1) async throws {
+        guard [1, 2, 4, 8].contains(prefillPipelineDepth), pdManifest != nil || prefillPipelineDepth == 1 else {
+            throw CoreAIBlockRunnerError.invalidFixture("Prefill pipeline depth must be 1, 2, 4 or 8; depths above 1 require a PD manifest")
+        }
         if let pdManifest {
-            backend = .phase(try await CoreAIPhaseModel(manifestURL: pdManifest, computeUnits: computeUnits))
+            backend = .phase(try await CoreAIPhaseModel(manifestURL: pdManifest, computeUnits: computeUnits,
+                                                       prefillPipelineDepth: prefillPipelineDepth))
         } else {
             backend = .token(try await CoreAINativeModel(attentionManifest: attentionManifest,
                 denseManifest: denseManifest, moeManifest: moeManifest, computeUnits: computeUnits))
@@ -114,8 +119,9 @@ public final class CoreAITextRuntime {
         }
     }
 
-    /// Fused-layer attribution is available for the phase backend. These times
-    /// overlap the group totals and must not be added to them.
+    /// Serial fused-layer attribution is available for the phase backend.
+    /// Pipelined layers have no individual wall-time attribution here. These
+    /// times overlap group totals and must not be added to them.
     public var predictionMillisecondsByLayer: [String: Double] {
         switch backend {
         case .token: return [:]
@@ -129,6 +135,22 @@ public final class CoreAITextRuntime {
         switch backend {
         case .token: return [:]
         case .phase(let model): return model.externalCallMillisecondsByStage
+        }
+    }
+
+    /// Pure host enqueue duration for pipelined layers, separate from serial
+    /// awaited layer wall time and from batch wall time in prefill.pipeline.
+    public var prefillPipelineEncodeMillisecondsByLayer: [String: Double] {
+        switch backend {
+        case .token: return [:]
+        case .phase(let model): return model.prefillPipelineEncodeMillisecondsByLayer
+        }
+    }
+
+    public var prefillPipelineDepth: Int {
+        switch backend {
+        case .token: return 1
+        case .phase(let model): return model.prefillPipelineDepth
         }
     }
 

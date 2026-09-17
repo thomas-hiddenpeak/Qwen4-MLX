@@ -22,6 +22,7 @@ struct CoreAIRunnerCLI {
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
                   [--pd-manifest PATH] [--prefill-chunk 0|EXPORTED_SIZE] [--compare-prefill true]
                   [--profile-prefill true] [--prefill-logits-output PATH.f32]
+                  [--prefill-pipeline-depth 1|2|4|8]
                 coreai-runner serve --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
                   [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
@@ -32,6 +33,7 @@ struct CoreAIRunnerCLI {
                 generate accepts --prompt-file instead of --prompt. Chunk 0 selects the manifest primary.
                 Any exported chunk may be the limit; smaller functions handle tails. Compare runs S1/primary/primary/S1.
                 profile-prefill adds per-chunk timing to the report (first 4096 chunks; full layer totals retained).
+                Pipeline depth defaults to 1. Larger depths are an experimental generate-only shared-PD prefill option.
                 """)
                 return
             }
@@ -39,7 +41,7 @@ struct CoreAIRunnerCLI {
                 throw NativeCLIError.invalid("Use generate or serve followed by unique --option value pairs")
             }
             var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest", "--pd-manifest", "--prefill-chunk"]
-            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill", "--profile-prefill", "--prefill-logits-output"] :
+            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill", "--profile-prefill", "--prefill-logits-output", "--prefill-pipeline-depth"] :
                 ["--host", "--port", "--prefix-cache-bytes", "--prefix-cache-entries", "--request-timeout-seconds",
                  "--max-pending-requests", "--max-connections", "--max-body-bytes", "--max-output-bytes"])
             var options: [String: String] = [:]
@@ -67,8 +69,8 @@ struct CoreAIRunnerCLI {
     #if canImport(CoreAI)
     private static func prefillChunkOption(_ options: [String: String]) throws -> Int {
         guard let value = Int(options["--prefill-chunk"] ?? "0"),
-              [0, 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192].contains(value) else {
-            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic) or an exported size: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, or 8192")
+              [0, 1, 4, 8, 16, 32, 48, 64, 128, 192, 256, 512, 768, 1024, 2048, 4096, 8192].contains(value) else {
+            throw NativeCLIError.invalid("prefill-chunk must be 0 (automatic) or an exported size: 1, 4, 8, 16, 32, 48, 64, 128, 192, 256, 512, 768, 1024, 2048, 4096, or 8192")
         }
         guard value <= 1 || options["--pd-manifest"]?.isEmpty == false else {
             throw NativeCLIError.invalid("Chunked prefill requires a PD manifest")
@@ -128,6 +130,11 @@ struct CoreAIRunnerCLI {
             throw NativeCLIError.invalid("max-tokens must be 1...256, repeat 1...4; raw-prompt, compare-prefill and profile-prefill must be true/false")
         }
         let profilePrefill = options["--profile-prefill"] == "true"
+        guard let pipelineDepth = Int(options["--prefill-pipeline-depth"] ?? "1"),
+              [1, 2, 4, 8].contains(pipelineDepth),
+              pipelineDepth == 1 || options["--pd-manifest"]?.isEmpty == false else {
+            throw NativeCLIError.invalid("prefill-pipeline-depth must be 1, 2, 4 or 8; depths above 1 require a shared-weight PD manifest")
+        }
         let requestedChunk = try prefillChunkOption(options)
         guard options["--compare-prefill"] != "true" || options["--pd-manifest"]?.isEmpty == false else {
             throw NativeCLIError.invalid("compare-prefill requires a PD manifest")
@@ -162,7 +169,7 @@ struct CoreAIRunnerCLI {
             denseManifest: URL(fileURLWithPath: require("--dense-manifest")),
             moeManifest: URL(fileURLWithPath: require("--moe-manifest")),
             pdManifest: options["--pd-manifest"].map { URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath() },
-            computeUnits: .gpu)
+            computeUnits: .gpu, prefillPipelineDepth: pipelineDepth)
         let configSHA = SHA256.hash(data: try Data(contentsOf: directory.appendingPathComponent("config.json")))
             .map { String(format: "%02x", $0) }.joined()
         guard model.manifestModelDirectory == directory, model.sourceConfigSHA256 == configSHA,
@@ -197,6 +204,7 @@ struct CoreAIRunnerCLI {
                 let groupsBefore = captureProfile ? model.predictionMillisecondsByGroup : [:]
                 let layersBefore = captureProfile ? model.predictionMillisecondsByLayer : [:]
                 let externalStagesBefore = captureProfile ? model.externalCallMillisecondsByStage : [:]
+                let pipelineEncodesBefore = captureProfile ? model.prefillPipelineEncodeMillisecondsByLayer : [:]
                 let readSecondsBefore = readSeconds
                 let chunkStart = DispatchTime.now().uptimeNanoseconds
                 let batch = Array(tokens[position..<position + count])
@@ -208,11 +216,13 @@ struct CoreAIRunnerCLI {
                     let functionSeconds = groups.values.reduce(0, +) * 0.001
                     let chunkProfile: [String: Any] = [
                         "tokens": count, "offset_before": position, "offset_after": model.offset,
+                        "prefill_pipeline_depth": count > 1 ? model.prefillPipelineDepth : 1,
                         "wall_seconds": chunkSeconds, "ssd_read_seconds": ssdSeconds,
                         "function_await_seconds": functionSeconds,
                         "wall_minus_function_and_ssd_seconds": chunkSeconds - functionSeconds - ssdSeconds,
                         "group_milliseconds": groups,
                         "external_call_stage_milliseconds": timingDelta(model.externalCallMillisecondsByStage, since: externalStagesBefore),
+                        "pipeline_layer_encode_milliseconds": timingDelta(model.prefillPipelineEncodeMillisecondsByLayer, since: pipelineEncodesBefore),
                         "layer_milliseconds": timingDelta(model.predictionMillisecondsByLayer, since: layersBefore)]
                     chunkProfiles.append(chunkProfile)
                     // Keep completed measurements even if a later chunk fails
@@ -231,6 +241,7 @@ struct CoreAIRunnerCLI {
             let prefillGroups = model.predictionMillisecondsByGroup
             let prefillLayers = model.predictionMillisecondsByLayer
             let prefillExternalStages = model.externalCallMillisecondsByStage
+            let prefillPipelineEncodes = model.prefillPipelineEncodeMillisecondsByLayer
             let prefillSSDSeconds = readSeconds
             if run == 0 {
                 firstLogits = logits
@@ -267,11 +278,13 @@ struct CoreAIRunnerCLI {
                 "generated_token_ids": output, "stop_reason": stop, "reset_tokens_match": output == first,
                 "prefill_tokens": tokens.count, "prefill_seconds": prefillSeconds, "prefill_coreai_calls": prefillCalls,
                 "prefill_chunk_size": chunks[run], "prefill_chunks": chunkCount,
+                "prefill_pipeline_depth": model.prefillPipelineDepth,
                 "prefill_logits_relative_l2": sqrt(errorSquared / max(referenceSquared, 1e-30)),
                 "prefill_logits_max_abs": maximumError,
                 "prefill_group_milliseconds": prefillGroups,
                 "decode_group_milliseconds": Dictionary(uniqueKeysWithValues: decodeGroups),
                 "prefill_external_call_stage_milliseconds": prefillExternalStages,
+                "prefill_pipeline_layer_encode_milliseconds": prefillPipelineEncodes,
                 "decode_external_call_stage_milliseconds": timingDelta(model.externalCallMillisecondsByStage, since: prefillExternalStages),
                 "prefill_ssd_read_seconds": prefillSSDSeconds, "decode_ssd_read_seconds": readSeconds - prefillSSDSeconds,
                 "decode_forward_steps": decodeDurations.count, "decode_forward_seconds": decodeDurations.reduce(0, +),
@@ -299,7 +312,8 @@ struct CoreAIRunnerCLI {
             "prefill_chunk_size": model.prefillChunkSize, "independent_pd_functions": model.usesIndependentPhases,
             "supported_prefill_chunks": model.supportedPrefillChunks,
             "prefill_profile_enabled": profilePrefill,
-            "limitations": "Explicit serial phase execution; group times are awaited function wall time, not device kernel profiling. Source BF16 quality equivalence remains unverified."]
+            "prefill_pipeline_depth": model.prefillPipelineDepth,
+            "limitations": "Group times are host function wall time, not GPU profiling. With pipeline depth above1, prefill.pipeline is bounded-batch wall time including enqueue, drain and validation; individual layer wall times are unavailable for those batches, and pipeline_layer_encode_milliseconds is host enqueue time only. S1/decode remain serial. Source BF16 quality equivalence remains unverified."]
         var data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         data.append(0x0a)
         if let path = options["--output"] {
