@@ -101,3 +101,31 @@ PLE大批量SSD读取对重复行去重，并以最多8个worker执行pread；S1
 公开 MPP `half × uint4b_format` 小图已在本机编译运行；原生 uint4 grouped 全 K 候选仍比原 packed-half 慢：同 S2048 合成几何输入 8.402ms vs 7.093ms。该方案使用分组 affine 后校正，省略了原逐权重 FP16 舍入，输出 relative L2 为 0.000312，因此保留为独立实验，不进入生产默认。原生路径边界 CPU 测试通过，GPU 小图对其独立新公式 oracle 逐 bit 一致；这不等于原模型数学等价。
 
 原始证据位于 `results/coreai-prefill-1k/` 下 `q4-loader-down-s2048`、`q4-loader-down-s8192`、`q4-loader-gateup-s2048/device-summary.json`、`full-agent-11k-contiguous.json`、`q4-native-grouped-smoke/device-large-summary.json`。这些结果均未使用 MTP 或 KV/prefix 命中。
+
+
+### 按有效历史选择 QSA 工作视图
+
+可选 `--qsa-working-sets 2048 4096 6144 8192 10240 12288 14336` 为主 prefill 块增加静态有效 KV 上界。运行时按真实 `offset + count` 选择覆盖全部历史的最小上界；没有合适入口时回到完整容量，S1 仍走原 decode。六个缓存状态始终保持完整容量，快照和 offset 约束不变。
+
+独立真实 QSA S2048 冷前缀为31.200→9.674ms，offset8192为31.361→22.516ms，输出、六状态和可见数均逐 bit 一致；补充非零随机状态、offset8191/pooled_count2047的部分块对照也一致。完整11K两轮为23.140/17.551s，热态约630token/s；QSA累计5.288→4.589s，但GDN计时波动抵消整轮收益，不能据此宣称显著整模型加速。采样峰值约87.11GiB；多函数的额外工作空间需继续控制。
+
+Release 构建通过；Swift工作集选择及非法metadata检查通过直接编译的fixture执行。`swift test`被本机Command Line Tools缺少XCTest阻断，未报告整套Swift测试通过。共享导出与工作集CPU检查16项通过，真实全模型执行完成两轮。证据：`qsa-working-set-s2048/device-*-summary.json`、`full-agent-11k-qsa-workingset.json`。新增 `generate --prefill-logits-output PATH.f32` 在计时区间外保存首轮preﬁll的248320个Float32 logits，供不同候选完整比较；它不改变正常输出路径。
+
+
+### MoE 数据搬运与融合边界
+
+实际S8192几何下，原生ordered gather为34.426ms，直接索引kernel为1.464ms且逐bit一致；原inverse/weight/reduce图为88.516ms，融合尾部约1.3–2.5ms。原图广播的索引/加权中间态是已通过设备对照确认的重要成本。完整packed MoE S2048为29.205→22.013ms，S8192为196.800→77.247ms，路由IDs/scores一致。
+
+`--moe-direct-transfers` 默认关闭。`--moe-tail-precision native`只换exact gather；`float16`保留显式half-product候选；`float32`指FP32 products、opaque FP16 routed输出，**不等于**独立实验中的FP32 routed输出策略。原生图在实际设备上会消除一些中间half边界，不能用PyTorch源码上的`.half()`推断其融合后的精确算术。暴露routed/shared为图输出会改变最终结果，诊断图必须与未拆图比较。
+
+完整11K的direct transfers候选热态15.085s/733.0token/s，FP32 routed输出候选14.939s/740.2token/s；同期原配置17.979s/615.0token/s。两候选对原配置最终logits relative L2分别0.0954/0.1115，虽首token和两token文本一致，**尚未通过质量验收，不设为默认**。仅QSA工作集版本的全11K logits则逐bit一致。单独第0层FP32 routed输出候选误差降到4.68e-7，仅83/20,971,520个stream元素不同，仍可能在深层MoE路由中放大。
+
+树形FP32-output尾部是另一个独立候选：pad16后stride8/4/2/1，whole MoE S2048只有21/5,242,880元素不同、relative L2 7.98e-7；完整模型还要单独验证。默认导出不会隐式选它。对应证据：`moe-transfer-s8192/*/device-summary.json`、`layer0-transfer-comparison/device-summary.json`、`full-agent-11k-transfers*-logits-comparison.json`、`full-prefill-distribution-comparison.json`。
+
+### 可选GDN ILP与NAX矩阵核
+
+`--gdn-prefill-rows 1|2|4`默认1。每SIMD同时维护4个独立value rows、复用q/k/gates，真实预处理的H48/V128/T2048 recurrence为5.872→3.630ms。最终FP32 recurrent state逐bit一致；y最大差1.91e-6、relative L2 1.28e-6。V7尾行/零decay/零beta的小图输出与state均exact。S1仍使用原kernel。
+
+可选NAX down移植使用MLX的MIT许可寄存器fragment结构、权重stride72和公开MPP每SIMD16×32×16操作，未链接MLX runtime。真实同输入S2048 down为8.170→5.574ms，output/plan逐bit一致。gate/up版本为12.859→10.030ms但存在约4.12e-4输出差异，仍单独调查。`install_nax_moe(..., projections='down')`只启用已验证down，普通构造默认不启用。整模型达到1K与数值验收均仍待完成。
+
+本阶段root复跑7项transfer CPU检查、4项NAX CPU检查、14项共享导出检查，均通过。所有吞吐仍是完整prompt重算，未用MTP或KV/prefix命中；独立算子速度不可直接当作整模型速度。

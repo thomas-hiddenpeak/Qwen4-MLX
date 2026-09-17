@@ -21,7 +21,7 @@ struct CoreAIRunnerCLI {
                   --dense-manifest PATH --moe-manifest PATH --prompt TEXT \
                   [--max-tokens 32] [--repeat 1] [--raw-prompt false] [--output report.json]
                   [--pd-manifest PATH] [--prefill-chunk 0|EXPORTED_SIZE] [--compare-prefill true]
-                  [--profile-prefill true]
+                  [--profile-prefill true] [--prefill-logits-output PATH.f32]
                 coreai-runner serve --model-dir PATH --attention-manifest PATH \
                   --dense-manifest PATH --moe-manifest PATH [--host 127.0.0.1] [--port 11236]
                   [--prefix-cache-bytes 536870912] [--prefix-cache-entries 2]
@@ -39,7 +39,7 @@ struct CoreAIRunnerCLI {
                 throw NativeCLIError.invalid("Use generate or serve followed by unique --option value pairs")
             }
             var allowed: Set<String> = ["--model-dir", "--attention-manifest", "--dense-manifest", "--moe-manifest", "--pd-manifest", "--prefill-chunk"]
-            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill", "--profile-prefill"] :
+            allowed.formUnion(command == "generate" ? ["--prompt", "--prompt-file", "--max-tokens", "--repeat", "--raw-prompt", "--output", "--compare-prefill", "--profile-prefill", "--prefill-logits-output"] :
                 ["--host", "--port", "--prefix-cache-bytes", "--prefix-cache-entries", "--request-timeout-seconds",
                  "--max-pending-requests", "--max-connections", "--max-body-bytes", "--max-output-bytes"])
             var options: [String: String] = [:]
@@ -232,7 +232,16 @@ struct CoreAIRunnerCLI {
             let prefillLayers = model.predictionMillisecondsByLayer
             let prefillExternalStages = model.externalCallMillisecondsByStage
             let prefillSSDSeconds = readSeconds
-            if run == 0 { firstLogits = logits }
+            if run == 0 {
+                firstLogits = logits
+                // Diagnostic copy is outside the measured prefill interval.
+                // One little-endian Float32 per vocabulary ID, first run only.
+                if let path = options["--prefill-logits-output"] {
+                    let url = URL(fileURLWithPath: path)
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try logits.withUnsafeBytes { try Data($0).write(to: url, options: .atomic) }
+                }
+            }
             var errorSquared = 0.0, referenceSquared = 0.0, maximumError = 0.0
             for (a, b) in zip(logits, firstLogits) {
                 let delta = Double(a) - Double(b)

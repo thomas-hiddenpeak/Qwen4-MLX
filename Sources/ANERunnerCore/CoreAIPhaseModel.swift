@@ -50,6 +50,7 @@ private struct PhaseManifest: Decodable {
     let tokenChunk: Int
     let tailChunks: [Int]?
     let integerExpertGrouping: Bool?
+    let qsaWorkingSets: [CoreAIQSAWorkingSet]?
     let hiddenSize: Int
     let streamCount: Int
     let vocabularySize: Int
@@ -82,8 +83,13 @@ public final class CoreAIPhaseModel {
     private struct Functions {
         let decode: CoreAIBlockRunner
         let countFunctions: [Int: CoreAIBlockRunner]
-        func runner(count: Int) throws -> CoreAIBlockRunner {
+        let workingSetEntries: [CoreAIQSAWorkingSet]
+        let workingSetFunctions: [String: CoreAIBlockRunner]
+        func runner(count: Int, endOffset: Int? = nil) throws -> CoreAIBlockRunner {
             if count == 1 { return decode }
+            if let endOffset,
+               let selected = CoreAIQSAWorkingSet.select(workingSetEntries, count: count, endOffset: endOffset),
+               let runner = workingSetFunctions[selected.function] { return runner }
             guard let runner = countFunctions[count] else {
                 throw CoreAIBlockRunnerError.invalidFixture("No CoreAI phase function for \(count) tokens")
             }
@@ -165,6 +171,8 @@ public final class CoreAIPhaseModel {
             throw CoreAIBlockRunnerError.invalidModel("CoreAI phase execution requires complete supported token/chunk assets for all 48 layers")
         }
         let supportedCounts = ([1, manifest.tokenChunk] + tailChunks).sorted(by: >)
+        let qsaWorkingSets = manifest.qsaWorkingSets ?? []
+        try CoreAIQSAWorkingSet.validate(qsaWorkingSets, counts: supportedCounts, capacity: manifest.capacity)
         let source = URL(fileURLWithPath: manifest.modelDirectory).standardizedFileURL.resolvingSymlinksInPath()
         let configData = try Data(contentsOf: source.appendingPathComponent("config.json"))
         let digest = SHA256.hash(data: configData).map { String(format: "%02x", $0) }.joined()
@@ -204,10 +212,14 @@ public final class CoreAIPhaseModel {
         }
         var completed = 0
         var sharedFunctions: [String: Functions] = [:]
-        func load(_ spec: PhaseAsset, weightNames: Set<String> = []) async throws -> Functions {
+        func load(_ spec: PhaseAsset, weightNames: Set<String> = [],
+                  workingSets: [CoreAIQSAWorkingSet] = []) async throws -> Functions {
             try Task.checkCancellation()
             let key = assetURL(spec).path
             if sharedGraphs, let functions = sharedFunctions[key] {
+                guard functions.workingSetEntries == workingSets else {
+                    throw CoreAIBlockRunnerError.invalidModel("Shared phase working-set functions disagree")
+                }
                 for count in supportedCounts {
                     try Self.validateFeatures(functions.runner(count: count), spec: spec, weightNames: weightNames)
                 }
@@ -226,9 +238,17 @@ public final class CoreAIPhaseModel {
                 try Self.validateFeatures(runner, spec: spec, weightNames: weightNames)
                 countFunctions[count] = runner
             }
+            var workingSetFunctions: [String: CoreAIBlockRunner] = [:]
+            for entry in workingSets {
+                try Task.checkCancellation()
+                let runner = try CoreAIBlockRunner(sharing: decode, functionName: entry.function)
+                try Self.validateFeatures(runner, spec: spec, weightNames: weightNames)
+                workingSetFunctions[entry.function] = runner
+            }
             completed += 1
             progress?(completed, 50)
-            let functions = Functions(decode: decode, countFunctions: countFunctions)
+            let functions = Functions(decode: decode, countFunctions: countFunctions,
+                                      workingSetEntries: workingSets, workingSetFunctions: workingSetFunctions)
             if sharedGraphs { sharedFunctions[key] = functions }
             return functions
         }
@@ -253,9 +273,11 @@ public final class CoreAIPhaseModel {
         }
         for spec in manifest.layers.sorted(by: { $0.index < $1.index }) {
             let weights = try spec.weights.map { try CoreAIExternalWeights(spec: $0, baseURL: base, device: weightDevice!) }
-            let functions = try await load(spec.asset, weightNames: weights?.inputNames ?? [])
-            for count in supportedCounts {
-                let runner = try functions.runner(count: count)
+            let functions = try await load(spec.asset, weightNames: weights?.inputNames ?? [],
+                                           workingSets: spec.kind == "qsa" ? qsaWorkingSets : [])
+            let runners = try supportedCounts.map { ($0, try functions.runner(count: $0)) }
+                + functions.workingSetEntries.map { ($0.tokenCount, functions.workingSetFunctions[$0.function]!) }
+            for (count, runner) in runners {
                 try weights?.validateInputs(for: runner.function.descriptor)
                 try Self.require(runner, input: "stream", shape: [1, count, 10240], type: .float16)
                 try Self.require(runner, output: "stream_out", shape: [1, count, 10240], type: .float16)
@@ -321,7 +343,7 @@ public final class CoreAIPhaseModel {
                 var inputs = layer.states
                 inputs["stream"] = stream
                 if layer.spec.hasPLE { inputs["ple_embedding"] = rows }
-                let output = try await call(layer.functions.runner(count: count), inputs: inputs,
+                let output = try await call(layer.functions.runner(count: count, endOffset: nextOffset), inputs: inputs,
                                             weights: layer.weights, group: "\(phase).\(layer.spec.kind)", layerIndex: layer.spec.index)
                 var nextStates: [String: NDArray] = [:]
                 for (name, outputName) in layer.spec.stateBindings {

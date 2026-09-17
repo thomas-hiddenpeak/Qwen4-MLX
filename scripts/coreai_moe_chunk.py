@@ -74,7 +74,12 @@ class ChunkQ4MoE(torch.nn.Module):
         self.fuse_gateup = fuse_gateup
         self.flat_weights = False
         self.contiguous_affine = False
+        self.nax_moe = False
+        self.nax_simdgroups = 1
+        self.nax_projections = ('down_proj',)
         self.integer_grouping = False
+        self.direct_transfers = False
+        self.direct_transfer_tail_precision = 'float16'
         get_plan_kernel(self.experts, block)
         get_grouped_kernel(block, columns, inner)
         if fuse_gateup:
@@ -87,11 +92,19 @@ class ChunkQ4MoE(torch.nn.Module):
 
     def custom_kernels(self):
         grouping_kernels = []
+        if self.direct_transfers:
+            from coreai_moe_transfers import get_ordered_gather_kernel, get_inverse_reduce_kernel
+            grouping_kernels.append(get_ordered_gather_kernel())
+            if self.direct_transfer_tail_precision is not None:
+                grouping_kernels.append(get_inverse_reduce_kernel(self.direct_transfer_tail_precision))
         if self.integer_grouping:
             from coreai_expert_grouping import get_integer_grouping_kernels
-            grouping_kernels = list(get_integer_grouping_kernels(self.experts))
+            grouping_kernels += list(get_integer_grouping_kernels(self.experts))
         if self.flat_weights:
             from coreai_q4_flat import flat_moe_kernels
+            if self.nax_moe:
+                from coreai_q4_nax import nax_moe_kernels
+                grouping_kernels += nax_moe_kernels(self)
             return [get_plan_kernel(self.experts, self.block), get_tensor_kernel(), *flat_moe_kernels(self), *grouping_kernels]
         kernels = [get_plan_kernel(self.experts, self.block),
                 get_grouped_kernel(self.block, self.columns, self.inner),
@@ -119,12 +132,31 @@ class ChunkQ4MoE(torch.nn.Module):
 
     def grouped(self, name, x, plan):
         projection = getattr(self.decode, name)
+        if self.nax_moe and name in self.nax_projections:
+            from coreai_q4_nax import nax_grouped_linear
+            return nax_grouped_linear(x, plan, projection, self.nax_simdgroups)
         if self.flat_weights:
             from coreai_q4_flat import flat_grouped_linear
             return flat_grouped_linear(x, plan, projection, self.block, self.columns, self.inner,
                                        self.contiguous_affine)
         return grouped_linear(x, plan, projection.packed, projection.scales, projection.biases,
                               self.block, self.columns, self.inner)
+
+    def ordered_inputs(self, x, permutation):
+        if self.direct_transfers:
+            from coreai_moe_transfers import ordered_gather
+            return ordered_gather(x, permutation.int())
+        tokens = torch.div(permutation.long(), self.top_k, rounding_mode='floor')
+        return torch.index_select(x.reshape(x.shape[1], self.hidden), 0, tokens)
+
+    def reduce_routed(self, ordered_down, inverse, scores):
+        count = scores.shape[0]
+        if self.direct_transfers and self.direct_transfer_tail_precision is not None:
+            from coreai_moe_transfers import inverse_weight_sum
+            return inverse_weight_sum(ordered_down, inverse.int(), scores.reshape(1, count, self.top_k),
+                                      product_precision=self.direct_transfer_tail_precision)
+        down = torch.index_select(ordered_down, 0, inverse.long()).reshape(count, self.top_k, self.hidden)
+        return (down * scores[:, :, None]).half().float().sum(1).half().reshape(1, count, self.hidden)
 
     def forward(self, x):
         maximum = 8192 if self.integer_grouping else MAX_CHUNK
@@ -146,12 +178,14 @@ class ChunkQ4MoE(torch.nn.Module):
         else:
             permutation, inverse = grouping_permutations(flat_ids, self.experts)
             sorted_ids = torch.index_select(flat_ids, 0, permutation)
-        tokens = torch.div(permutation, self.top_k, rounding_mode='floor')
-        ordered_x = torch.index_select(x.reshape(count, self.hidden), 0, tokens)
+        ordered_x = self.ordered_inputs(x, permutation)
         plan = make_plan(sorted_ids, self.experts, self.block)
         if self.fuse_gateup:
             gate, up = self.decode.gate_proj, self.decode.up_proj
-            if self.flat_weights:
+            if self.nax_moe and 'gate_proj' in self.nax_projections:
+                from coreai_q4_nax import nax_grouped_gateup
+                active = nax_grouped_gateup(ordered_x, plan, gate, up, self.nax_simdgroups)
+            elif self.flat_weights:
                 from coreai_q4_flat import flat_grouped_gateup
                 active = flat_grouped_gateup(ordered_x, plan, gate, up, self.block, self.columns, self.inner,
                                              self.contiguous_affine)
@@ -163,8 +197,7 @@ class ChunkQ4MoE(torch.nn.Module):
             up = self.grouped('up_proj', ordered_x, plan)
             active = ((gate * gate.sigmoid()).half() * up).half()
         ordered_down = self.grouped('down_proj', active, plan)
-        down = torch.index_select(ordered_down, 0, inverse).reshape(count, self.top_k, self.hidden)
-        routed = (down * scores[:, :, None]).half().float().sum(1).half().reshape(1, count, self.hidden)
+        routed = self.reduce_routed(ordered_down, inverse, scores)
         shared_gate = tensor_linear(x, self.decode.shared_gate_proj)
         shared_up = tensor_linear(x, self.decode.shared_up_proj)
         shared_active = ((shared_gate * shared_gate.sigmoid()).half() * shared_up).half()

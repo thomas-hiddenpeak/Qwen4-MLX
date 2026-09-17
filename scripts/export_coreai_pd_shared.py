@@ -34,7 +34,8 @@ WEIGHT_DTYPES = {torch.float16, torch.float32, torch.int16, torch.int32}
 def authoring_source_hashes():
     """Record the optional flat implementation alongside the original math."""
     hashes = _pd_authoring_source_hashes()
-    for name in ('coreai_q4_flat', 'coreai_expert_grouping', 'coreai_head_metal', 'export_coreai_top_chunks'):
+    for name in ('coreai_q4_flat', 'coreai_expert_grouping', 'coreai_head_metal', 'export_coreai_top_chunks',
+                 'coreai_qsa_working_set', 'coreai_moe_transfers', 'coreai_gdn_ilp_probe'):
         hashes[name] = sha256_file(Path(__file__).with_name(name + '.py'))
     return hashes
 
@@ -131,12 +132,33 @@ def validate_contiguous_affine(*, flat_q4, moe_tile, contiguous_affine):
         raise ValueError('--contiguous-affine requires BM16/32, BN32/64 and BK=64')
 
 
+def resolve_moe_transfers(enabled=False, tail_precision=None):
+    """Pin the optional numerical boundary; omitted options preserve old graphs."""
+    if tail_precision not in (None, 'float16', 'float32', 'native'):
+        raise ValueError('Unsupported MoE tail precision')
+    if not enabled and tail_precision is not None:
+        raise ValueError('--moe-tail-precision requires --moe-direct-transfers')
+    return {'enabled': enabled, 'tailPrecision': (tail_precision or 'float32') if enabled else 'native'}
+
+
+def validate_gdn_prefill_rows(rows):
+    """Reject unsupported recurrence variants before reading model weights."""
+    if type(rows) is not int or rows not in (1, 2, 4):
+        raise ValueError('--gdn-prefill-rows must be 1, 2 or 4')
+
+
 def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gateup,
                         moe_tile=(16, 32, 64), flat_q4=False, integer_grouping=False,
-                        contiguous_affine=False):
+                        contiguous_affine=False, moe_direct_transfers=False, moe_tail_precision=None,
+                        gdn_prefill_rows=1):
     """Construct unchanged tensor-PD math; reusable by component diagnostics."""
+    validate_gdn_prefill_rows(gdn_prefill_rows)
     validate_contiguous_affine(flat_q4=flat_q4, moe_tile=moe_tile,
                                contiguous_affine=contiguous_affine)
+    transfers = resolve_moe_transfers(moe_direct_transfers, moe_tail_precision)
+    if transfers['enabled'] and (config.get('num_experts_per_tok') != 10 or
+                                config.get('hidden_size', 0) <= 0 or config['hidden_size'] % 4):
+        raise ValueError('Direct MoE transfers require top10 and hidden size divisible by4')
     from coreai_q4_metal import MetalPackedQ4, get_q4_kernel
     from coreai_moe_chunk import ChunkQ4MoE
     from coreai_gdn_chunk import GDNRegisterPrefill
@@ -177,6 +199,10 @@ def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gat
     if kind == 'gdn':
         attention.linear = phase_linear
         attention = GDNRegisterPrefill(attention)
+        if gdn_prefill_rows != 1:
+            from coreai_gdn_ilp_probe import install_gdn_ilp
+            kernels += [kernel for kernel in install_gdn_ilp(attention, rows=gdn_prefill_rows)
+                        if kernel not in kernels]
     else:
         attention = QwenQSAChunk(attention, prefill_sdpa_fp16=prefill_sdpa_fp16)
         kernels += attention.custom_kernels()[1:]
@@ -196,11 +222,15 @@ def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gat
     if integer_grouping:
         from coreai_expert_grouping import enable_integer_grouping
         kernels += enable_integer_grouping(module)
+    if transfers['enabled']:
+        from coreai_moe_transfers import install_moe_transfers
+        precision = transfers['tailPrecision']
+        kernels += install_moe_transfers(module, tail_precision=None if precision == 'native' else precision)
     return module, kind, states, bindings, geometry, kernels
 
 
 def export_generic(module, named, geometry_names, examples, output_names, path,
-                   custom_kernels, *, metal_weight_inputs=False):
+                   custom_kernels, *, metal_weight_inputs=False, entry_modules=None):
     """Export fixed phase entrypoints; verify learned buffers are never captured."""
     import coreai_torch
     from coreai_torch.composite_ops import SDPA
@@ -208,15 +238,28 @@ def export_generic(module, named, geometry_names, examples, output_names, path,
     standard_names = list(next(iter(examples.values())))
     metadata = buffer_signature(named)
     input_names = standard_names + [record['inputName'] for record in metadata]
-    wrapper = ExternalModule(module, [name for name, _ in named], len(standard_names)).eval()
+    entry_modules = {} if entry_modules is None else dict(entry_modules)
+    if set(entry_modules) - set(examples):
+        raise ValueError('Entry module override has no corresponding input example')
+    _, original_geometry = externalizable_buffers(module, geometry_names)
+    original_geometry_signature = geometry_signature(original_geometry)
+    for entry, alternate in entry_modules.items():
+        alternate_named, alternate_geometry = externalizable_buffers(alternate, geometry_names)
+        if (buffer_signature(alternate_named) != metadata or
+                geometry_signature(alternate_geometry) != original_geometry_signature):
+            raise ValueError(f'Entry {entry} changes the shared weight or geometry signature')
+    wrappers = {entry: ExternalModule(entry_modules.get(entry, module),
+        [name for name, _ in named], len(standard_names)).eval() for entry in examples}
     values = tuple(value for _, value in named)
     converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
     converter.register_custom_kernels(list(custom_kernels))
     externalize = [coreai_torch.ExternalizeSpec(target_class=SDPA,
         composite_op_name='scaled_dot_product_attention', composite_attrs=['scale', 'is_causal', 'window_size'])] \
-        if any(isinstance(child, SDPA) for child in module.modules()) else None
+        if any(isinstance(child, SDPA) for wrapper in wrappers.values() for child in wrapper.modules()) else None
     export_stats = {}
     for entry, inputs in examples.items():
+        if list(inputs) != standard_names:
+            raise ValueError(f'Entry {entry} changes the shared input-name contract')
         args = (*inputs.values(), *values)
         def export_fn(current, args=args, entry=entry):
             ep = torch.export.export(current, args=args).run_decompositions(coreai_torch.get_decomp_table())
@@ -229,7 +272,7 @@ def export_generic(module, named, geometry_names, examples, output_names, path,
             export_stats[entry] = {'usedCapturedBuffers': captured,
                                    'userInputCount': len(ep.graph_signature.user_inputs)}
             return ep
-        converter.add_pytorch_module(wrapper, entrypoint_name=entry, input_names=input_names,
+        converter.add_pytorch_module(wrappers[entry], entrypoint_name=entry, input_names=input_names,
             output_names=output_names, externalize_modules=externalize, export_fn=export_fn)
     program = converter.to_coreai()
     program.optimize()
@@ -291,6 +334,41 @@ def _boolean_option(value):
     return value.lower() == 'true'
 
 
+def resolve_qsa_working_sets(limits, token_count, capacity):
+    """Optional static views of the primary prefill chunk, never S1 overrides."""
+    from coreai_qsa_working_set import working_set_function
+    if limits is None:
+        return []
+    if (not limits or len(set(limits)) != len(limits) or token_count <= 1 or
+            any(not isinstance(limit, int) or not token_count <= limit < capacity or limit % 4 for limit in limits)):
+        raise ValueError('QSA working-set limits must be unique4-aligned values covering tokenChunk and below capacity')
+    return [{'tokenCount': token_count, 'kvLimit': limit, 'function': working_set_function(token_count, limit)}
+            for limit in sorted(limits)]
+
+
+def qsa_working_set_modules(module, entries):
+    """Share every learned tensor while replacing only attention working views."""
+    from coreai_qsa_chunk import QwenQSAChunk
+    from coreai_qsa_working_set import QwenQSAWorkingSet
+    if not entries:
+        return {}
+    if not isinstance(module.attention, QwenQSAChunk):
+        raise ValueError('QSA working-set overrides require QwenQSAChunk attention')
+    original = module.attention
+    result = {}
+    for entry in entries:
+        if entry['function'] in result:
+            raise ValueError('Duplicate QSA working-set entry')
+        validated = resolve_qsa_working_sets([entry['kvLimit']], entry['tokenCount'], original.capacity)[0]
+        if entry != validated:
+            raise ValueError('Invalid QSA working-set function name or metadata')
+        attention = QwenQSAWorkingSet(original.source, entry['kvLimit'],
+            prefill_sdpa_fp16=original.prefill_sdpa_fp16, tile_m=original.tile_m, tile_n=original.tile_n)
+        result[entry['function']] = DecoderLayer(attention, module.attention_read, module.moe,
+            module.moe_read, module.write, module.state_count, module.ple).eval()
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline-pd', type=Path, required=True, help='Completed v1 PD directory; numerical options are inherited')
@@ -302,17 +380,28 @@ def main(argv=None):
     parser.add_argument('--contiguous-affine', action='store_true',
                         help='Optional adjacent-word affine loader for routed prefill; requires --flat-q4 and baseline BK64; decode unchanged')
     parser.add_argument('--integer-grouping', action='store_true', help='Use stable I32 expert grouping; required for chunks above2048')
+    parser.add_argument('--gdn-prefill-rows', type=int, choices=(1, 2, 4), default=1,
+                        help='GDN value rows per SIMD during prefill; default1 preserves original kernel;2/4 opt into ILP; S1 unchanged')
+    parser.add_argument('--moe-direct-transfers', action='store_true',
+                        help='Optional direct ordered gather and fused routed tail; S1 decode unchanged')
+    parser.add_argument('--moe-tail-precision', choices=('float16', 'float32', 'native'),
+                        help='Requires --moe-direct-transfers; default float32 products, float16 rounds products, native keeps original tail graph')
     parser.add_argument('--chunk', type=int, choices=(4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
                         help='Override primary chunk while inheriting v1 capacity/geometry and smaller phases')
     parser.add_argument('--metal-head', type=_boolean_option, nargs='?', const=True, default=False,
                         help='Optional true/false FP32-output Metal head; omitted keeps original F.linear math')
+    parser.add_argument('--qsa-working-sets', type=int, nargs='+',
+                        help='Optional static KV limits for the primary prefill chunk;4-aligned and below capacity; states stay full capacity')
     args = parser.parse_args(argv)
+    validate_gdn_prefill_rows(args.gdn_prefill_rows)
+    moe_transfers = resolve_moe_transfers(args.moe_direct_transfers, args.moe_tail_precision)
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
     baseline_path = args.baseline_pd / 'manifest.json'
     baseline = json.loads(baseline_path.read_text())
     inherited_phases = validate_baseline(baseline)
     phases = resolve_phases(baseline, args.chunk, integer_grouping=args.integer_grouping)
+    qsa_working_sets = resolve_qsa_working_sets(args.qsa_working_sets, dict(phases)['prefill'], baseline['capacity'])
     validate_contiguous_affine(flat_q4=args.flat_q4, moe_tile=baseline['moeTile'],
                                contiguous_affine=args.contiguous_affine)
     layers = list(range(48)) if args.layers is None else [int(value) for value in args.layers.split(',')]
@@ -345,6 +434,17 @@ def main(argv=None):
         metalWeightInputs=args.metal_weight_inputs, flatQ4=args.flat_q4,
         contiguousAffine=args.contiguous_affine,
         integerExpertGrouping=args.integer_grouping,
+        gdnPrefillRows=args.gdn_prefill_rows,
+        gdnPrefillNumerics=('Original one-value-row SIMD recurrence; S1 decode unchanged' if args.gdn_prefill_rows == 1 else
+            f'GDN prefill only: {args.gdn_prefill_rows} independent value rows per SIMD; sequential FP32 state updates and per-row reduction order retained; S1 uses original kernel; compiler scheduling may affect FP16 outputs'),
+        moeDirectTransfers=moe_transfers['enabled'], moeTailPrecision=moe_transfers['tailPrecision'],
+        moeTransferNumerics=('Original gather and tail graph; S1 decode unchanged' if not moe_transfers['enabled'] else
+            'Direct FP16 gather; S1 decode unchanged; ' + {
+                'native': 'original native inverse/weight/reduce graph',
+                'float16': 'products rounded FP16 then slot-order FP32 sum and FP16 output',
+                'float32': 'FP32 products and slot-order FP32 sum then FP16 output; intentionally no eager per-product FP16 boundary'
+            }[moe_transfers['tailPrecision']]),
+        qsaWorkingSets=qsa_working_sets,
         tokenChunk=dict(phases)['prefill'], tailChunks=[count for name, count in phases if name.startswith('prefill_s')],
         headProjection=('metal-fp16-weights-fp32-logits' if args.metal_head
                         else 'original-linear' if phases != inherited_phases
@@ -367,7 +467,9 @@ def main(argv=None):
             module, kind, states, bindings, geometry_names, kernels = build_decoder_layer(source, config,
                 baseline['capacity'], prefill_sdpa_fp16=baseline['prefillSDPA'] == 'float16',
                 fuse_gateup=baseline['fusedGateUp'], moe_tile=tuple(baseline['moeTile']), flat_q4=args.flat_q4,
-                integer_grouping=args.integer_grouping, contiguous_affine=args.contiguous_affine)
+                integer_grouping=args.integer_grouping, contiguous_affine=args.contiguous_affine,
+                moe_direct_transfers=args.moe_direct_transfers, moe_tail_precision=args.moe_tail_precision,
+                gdn_prefill_rows=args.gdn_prefill_rows)
             named, geometry = externalizable_buffers(module, geometry_names)
             key = kind + ('-ple' if module.ple is not None else '')
             weights = write_aligned_weights(args.output / f'layer-{index:02d}.weights.bin', named)
@@ -380,13 +482,19 @@ def main(argv=None):
                     if module.ple is not None:
                         inputs['ple_embedding'] = torch.zeros(1, count, c.ple_dim, dtype=torch.float16)
                     examples[entry] = {**inputs, **states}
+                entry_modules = qsa_working_set_modules(module, qsa_working_sets) if kind == 'qsa' else {}
+                for entry in entry_modules:
+                    examples[entry] = dict(examples['prefill'])
                 asset = export_generic(module, named, geometry_names, examples, ('stream_out', *bindings.values()),
-                    args.output / f'shared-{key}.aimodel', kernels, metal_weight_inputs=args.metal_weight_inputs)
+                    args.output / f'shared-{key}.aimodel', kernels, metal_weight_inputs=args.metal_weight_inputs,
+                    entry_modules=entry_modules)
                 asset.update(geometrySignature=geo_signature, stateBindings=bindings,
                              initialState=state_metadata(states), kind=kind, hasPLE=module.ple is not None,
-                             exampleLayer=index, contiguousAffine=args.contiguous_affine)
+                             exampleLayer=index, contiguousAffine=args.contiguous_affine,
+                             moeDirectTransfers=moe_transfers['enabled'], moeTailPrecision=moe_transfers['tailPrecision'],
+                             gdnPrefillRows=args.gdn_prefill_rows if kind == 'gdn' else None)
                 manifest['sharedAssets'][key] = asset
-                del examples
+                del examples, entry_modules
             else:
                 asset = manifest['sharedAssets'][key]
                 if (asset['weightSignature'] != signature or asset['geometrySignature'] != geo_signature

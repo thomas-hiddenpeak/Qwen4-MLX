@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -12,7 +13,9 @@ import torch
 
 from export_coreai_pd_shared import (ALIGNMENT, ExternalModule, buffer_signature,
     export_generic, externalizable_buffers, geometry_signature, validate_baseline,
-    write_aligned_weights, validate_contiguous_affine, build_decoder_layer, main)
+    write_aligned_weights, validate_contiguous_affine, build_decoder_layer, main,
+    resolve_qsa_working_sets, qsa_working_set_modules, resolve_moe_transfers,
+    validate_gdn_prefill_rows)
 
 
 torch.set_num_threads(2)
@@ -32,6 +35,151 @@ class Tiny(torch.nn.Module):
 
 
 class SharedExportTests(unittest.TestCase):
+    def test_gdn_prefill_rows_validate_before_weight_reads(self):
+        for rows in (1, 2, 4):
+            validate_gdn_prefill_rows(rows)
+        for rows in (0, 3, 8, None, True, 2.0, '4'):
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, '--gdn-prefill-rows'):
+                build_decoder_layer(None, {}, 4096, prefill_sdpa_fp16=True,
+                    fuse_gateup=True, gdn_prefill_rows=rows)
+
+    def test_builder_gdn_ilp_preserves_external_weights_state_and_s1(self):
+        import export_coreai_pd_shared as exporter
+        from coreai_gdn_chunk_metal import FusedGDNRecurrence
+        from coreai_gdn_ilp_probe import PhaseILPRecurrence
+        from coreai_moe_chunk import make_synthetic
+        from export_coreai_gdn import GDN, GDNConfig, STATE_BINDINGS
+        from export_coreai_hybrid import state_metadata
+        config = {'hidden_size': 64, 'hc_count': 4, 'hc_lowrank': 8,
+                  'rms_norm_eps': 1e-6, 'vocab_size': 32, 'ple_embed_dim': 16,
+                  'ple_conv_kernel_size': 4, 'ngram_size': 3,
+                  'num_experts': 12, 'num_experts_per_tok': 10}
+        hc = {'input_mix_weight_down.weight': np.ones((8, 256), np.float32) * .01,
+              'input_mix_weight_up.weight': np.ones((256, 8), np.float32) * .01,
+              'hc_norm.weight': np.ones(256, np.float32),
+              'block_inject_weight.weight': np.ones((4, 256), np.float32) * .01}
+        def prepare(*_):
+            c = GDNConfig(64, 1, 2, 128, 7, 4, 1e-6)
+            rng = np.random.default_rng(2911)
+            weights = {name: (rng.standard_normal(shape) * .1).astype(np.float32)
+                       for name, shape in c.weight_shapes.items()}
+            states = {'conv_history': torch.zeros(1, 3, c.channels).half(),
+                      'recurrent_state': torch.zeros(1, 2, 7, 128)}
+            return 'gdn', GDN(c, weights), states, STATE_BINDINGS, 'hidden', 'output'
+        results = []
+        with mock.patch.object(exporter, 'load_layer', side_effect=lambda *_: make_synthetic()), \
+                mock.patch.object(exporter, 'prepare_layer', side_effect=prepare), \
+                mock.patch.object(exporter, 'read_hc', return_value=hc):
+            for rows in (1, 2, 4):
+                results.append(build_decoder_layer(SimpleNamespace(prefix='language_model.model.layers.0.mlp.'),
+                    config, 32, prefill_sdpa_fp16=True, fuse_gateup=True, gdn_prefill_rows=rows))
+        baseline, _, original_states, original_bindings, original_geometry, _ = results[0]
+        self.assertIsInstance(baseline.attention.recurrence, FusedGDNRecurrence)
+        original_named, _ = externalizable_buffers(baseline, original_geometry)
+        before_bytes = [(n, v.numpy().tobytes()) for n, v in original_named]
+        hidden = (torch.randn(1, 1, 64) * .1).half()
+        original_s1 = baseline.attention(hidden, *original_states.values())
+        for rows, (module, kind, states, bindings, geometry, kernels) in zip((2, 4), results[1:]):
+            self.assertEqual(kind, 'gdn')
+            self.assertIsInstance(module.attention.recurrence, PhaseILPRecurrence)
+            self.assertEqual(module.attention.recurrence.rows, rows)
+            self.assertIsInstance(module.attention.recurrence.decode, FusedGDNRecurrence)
+            self.assertEqual(len(kernels), len(set(kernels)))
+            named, _ = externalizable_buffers(module, geometry)
+            self.assertEqual(buffer_signature(named), buffer_signature(original_named))
+            self.assertEqual([(n, v.numpy().tobytes()) for n, v in named], before_bytes)
+            self.assertEqual(state_metadata(states), state_metadata(original_states))
+            self.assertEqual(bindings, original_bindings)
+            self.assertEqual(geometry, original_geometry)
+            for a, b in zip(module.attention(hidden, *states.values()), original_s1):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_moe_transfers_configuration_and_shared_weight_signature(self):
+        from coreai_moe_chunk import ChunkQ4MoE, make_synthetic
+        from coreai_moe_transfers import install_moe_transfers
+        from coreai_q4_flat import flatten_moe_weights
+        self.assertEqual(resolve_moe_transfers(), {'enabled': False, 'tailPrecision': 'native'})
+        self.assertEqual(resolve_moe_transfers(True), {'enabled': True, 'tailPrecision': 'float32'})
+        for precision in ('float16', 'float32', 'native'):
+            self.assertEqual(resolve_moe_transfers(True, precision)['tailPrecision'], precision)
+            with self.assertRaisesRegex(ValueError, 'requires --moe-direct-transfers'):
+                resolve_moe_transfers(False, precision)
+        with self.assertRaisesRegex(ValueError, 'Unsupported'):
+            resolve_moe_transfers(True, 'float64')
+        with self.assertRaisesRegex(ValueError, 'top10'):
+            build_decoder_layer(None, {'num_experts_per_tok': 8, 'hidden_size': 64}, 4096,
+                prefill_sdpa_fp16=True, fuse_gateup=True, moe_direct_transfers=True)
+        module = ChunkQ4MoE(make_synthetic(), block=16, columns=32, inner=64, fuse_gateup=True)
+        flatten_moe_weights(module)
+        before, geometry = externalizable_buffers(module, {'decode.expert_ids'})
+        original_signature = buffer_signature(before)
+        original_geometry = geometry_signature(geometry)
+        original_owners = [(name, value.data_ptr()) for name, value in module.named_buffers()]
+        install_moe_transfers(module, tail_precision='float32')
+        after, geometry = externalizable_buffers(module, {'decode.expert_ids'})
+        self.assertEqual(buffer_signature(after), original_signature)
+        self.assertEqual(geometry_signature(geometry), original_geometry)
+        self.assertEqual([(name, value.data_ptr()) for name, value in module.named_buffers()], original_owners)
+        examples = {name: {'x': torch.zeros(1, count, 64).half()} for name, count in [('main', 1), ('prefill', 4)]}
+        with tempfile.TemporaryDirectory() as directory:
+            result = export_generic(module, after, {'decode.expert_ids'}, examples, ('output', 'ids', 'scores'),
+                Path(directory)/'moe.aimodel', module.custom_kernels())
+            self.assertEqual(result['weightSignature'], original_signature)
+            self.assertTrue(all(set(item['usedCapturedBuffers']) <= {'base.decode.expert_ids'}
+                                for item in result['torchExport'].values()))
+            self.assertTrue(all(item['userInputCount'] == len(after)+1 for item in result['torchExport'].values()))
+
+    def test_qsa_working_set_limits_and_shared_tensor_ownership(self):
+        from coreai_qsa_chunk import QwenQSAChunk, make_tiny
+        from export_coreai_pd import DecoderLayer
+        self.assertEqual(resolve_qsa_working_sets(None, 2048, 16384), [])
+        entries = resolve_qsa_working_sets([32, 16], 8, 64)
+        self.assertEqual(entries, [
+            {'tokenCount': 8, 'kvLimit': 16, 'function': 'prefill_s8_kv16'},
+            {'tokenCount': 8, 'kvLimit': 32, 'function': 'prefill_s8_kv32'}])
+        for limits, count in (([], 8), ([8, 8], 8), ([4], 8), ([10], 8), ([64], 8), ([8], 1)):
+            with self.assertRaises(ValueError):resolve_qsa_working_sets(limits, count, 64)
+        original = DecoderLayer(QwenQSAChunk(make_tiny(64, 16), prefill_sdpa_fp16=True),
+            torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(), 6)
+        base_buffers = dict(original.named_buffers())
+        overrides = qsa_working_set_modules(original, entries)
+        self.assertEqual(list(overrides), ['prefill_s8_kv16', 'prefill_s8_kv32'])
+        for module in overrides.values():
+            buffers = dict(module.named_buffers())
+            self.assertEqual(list(buffers), list(base_buffers))
+            for name, value in buffers.items():
+                self.assertIs(value, base_buffers[name])
+        with self.assertRaises(ValueError):
+            qsa_working_set_modules(original, [{**entries[0], 'function': 'wrong_name'}])
+
+    def test_entry_override_exports_distinct_math_with_same_external_contract(self):
+        class ScaledTiny(Tiny):
+            def forward(self, stream, state):
+                output, next_state = super().forward(stream, state)
+                return output * 2, next_state
+        module, alternate = Tiny(), ScaledTiny()
+        named, geometry = externalizable_buffers(module, {'geometry'})
+        examples = {name: {'stream': torch.ones(1, 4, 4).half(), 'state': torch.zeros(1)}
+                    for name in ('main', 'specialized')}
+        weights = tuple(value for _, value in named)
+        base = ExternalModule(module, [name for name, _ in named], 2)(*examples['main'].values(), *weights)
+        specialized = ExternalModule(alternate, [name for name, _ in named], 2)(*examples['main'].values(), *weights)
+        torch.testing.assert_close(specialized[0], base[0] * 2, rtol=0, atol=0)
+        torch.testing.assert_close(specialized[1], base[1], rtol=0, atol=0)
+        with tempfile.TemporaryDirectory() as directory:
+            asset = export_generic(module, named, geometry, examples, ('output', 'state_out'),
+                Path(directory)/'overrides.aimodel', [], entry_modules={'specialized': alternate})
+            self.assertEqual(set(asset['torchExport']), {'main', 'specialized'})
+            self.assertTrue(all(item['usedCapturedBuffers'] == ['base.geometry']
+                                for item in asset['torchExport'].values()))
+            with self.assertRaisesRegex(ValueError, 'no corresponding'):
+                export_generic(module, named, geometry, examples, ('output', 'state_out'),
+                    Path(directory)/'unknown.aimodel', [], entry_modules={'unknown': alternate})
+            alternate.weight = alternate.weight.float()
+            with self.assertRaisesRegex(ValueError, 'signature'):
+                export_generic(module, named, geometry, examples, ('output', 'state_out'),
+                    Path(directory)/'bad-shape.aimodel', [], entry_modules={'specialized': alternate})
+
     def test_contiguous_affine_configuration_rejects_before_weight_reads(self):
         for flat in (False, True):
             validate_contiguous_affine(flat_q4=flat, moe_tile=(16, 64, 128), contiguous_affine=False)
@@ -72,22 +220,41 @@ class SharedExportTests(unittest.TestCase):
                     mock.patch.object(exporter.torch, 'set_num_interop_threads'), \
                     mock.patch.object(exporter.shutil, 'disk_usage', return_value=mock.Mock(free=10**12)):
                 source.return_value.directory = model_dir
-                for enabled in (False, True):
-                    output = root/('on' if enabled else 'off')
+                cases = [(False, False, None), (True, False, None), (False, True, None),
+                         (True, True, 'float16'), (False, True, 'float32'), (False, True, 'native')]
+                for index, (enabled, direct, precision) in enumerate(cases):
+                    output = root/f'case-{index}'
                     arguments = ['--baseline-pd', str(baseline_dir), '--output', str(output),
                                  '--components', 'embedding', '--flat-q4']
                     if enabled:
                         arguments += ['--contiguous-affine']
+                    if direct:
+                        arguments += ['--moe-direct-transfers']
+                    if precision is not None:
+                        arguments += ['--moe-tail-precision', precision]
+                    rows = (1, 2, 4)[index % 3]
+                    if index:
+                        arguments += ['--gdn-prefill-rows', str(rows)]
                     main(arguments)
                     saved = json.loads((output/'manifest.json').read_text())
                     self.assertEqual(saved['contiguousAffine'], enabled)
                     self.assertTrue(saved['flatQ4'])
                     self.assertIn('coreai_q4_flat', saved['authoringSourceSHA256'])
+                    self.assertIn('coreai_moe_transfers', saved['authoringSourceSHA256'])
+                    self.assertIn('coreai_gdn_ilp_probe', saved['authoringSourceSHA256'])
+                    self.assertEqual(saved['gdnPrefillRows'], rows)
+                    self.assertIn('S1', saved['gdnPrefillNumerics'])
+                    self.assertEqual(saved['moeDirectTransfers'], direct)
+                    self.assertEqual(saved['moeTailPrecision'], (precision or 'float32') if direct else 'native')
                     self.assertFalse(saved['completeModelLayerSet'])
                 source.reset_mock()
                 with self.assertRaisesRegex(ValueError, '--flat-q4'):
                     main(['--baseline-pd', str(baseline_dir), '--output', str(root/'invalid'),
                           '--contiguous-affine'])
+                source.assert_not_called()
+                with self.assertRaisesRegex(ValueError, 'requires --moe-direct-transfers'):
+                    main(['--baseline-pd', str(baseline_dir), '--output', str(root/'invalid-tail'),
+                          '--moe-tail-precision', 'float32'])
                 source.assert_not_called()
 
     def test_weight_binary_preserves_dtype_bytes_alignment_and_hashes(self):
