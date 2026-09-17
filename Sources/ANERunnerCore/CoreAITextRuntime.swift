@@ -178,7 +178,7 @@ public final class CoreAITextRuntime {
     public func forward(token: Int32, pleEmbedding: [Float]) async throws -> [Float] {
         switch backend {
         case .token(let model): return try await model.forward(token: token, pleEmbedding: pleEmbedding)
-        case .phase(let model): return try await model.forward(tokens: [token], pleEmbedding: pleEmbedding)
+        case .phase(let model): return try await model.forward(tokens: [token], pleEmbedding: pleEmbedding, isPrefill: false)
         }
     }
 
@@ -192,7 +192,7 @@ public final class CoreAITextRuntime {
         }
         switch backend {
         case .token(let model): return try await model.forward(token: tokens[0], pleEmbedding: pleEmbedding)
-        case .phase(let model): return try await model.forward(tokens: tokens, pleEmbedding: pleEmbedding)
+        case .phase(let model): return try await model.forward(tokens: tokens, pleEmbedding: pleEmbedding, isPrefill: true)
         }
     }
 

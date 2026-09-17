@@ -306,7 +306,7 @@ public final class CoreAIPhaseModel {
 
     /// PLE rows are token-major, 2560 values per token. Every call consumes one
     /// exported chunk exactly; S1 handles autoregressive decode and small tails.
-    public func forward(tokens: [Int32], pleEmbedding: [Float]) async throws -> [Float] {
+    public func forward(tokens: [Int32], pleEmbedding: [Float], isPrefill: Bool? = nil) async throws -> [Float] {
         try beginOperation()
         defer { endOperation() }
         guard valid else {
@@ -325,7 +325,9 @@ public final class CoreAIPhaseModel {
         let started = DispatchTime.now().uptimeNanoseconds
         let callsBefore = successfulCalls
         let nextOffset = offset + count
-        let phase = count == 1 ? "decode" : "prefill"
+        // Business phase belongs to the caller: a one-token prompt tail still
+        // uses the S1 kernel, but its work must not be counted as generation.
+        let phase = (isPrefill ?? (count > 1)) ? "prefill" : "decode"
         do {
             for layer in layers {
                 guard layer.nextOffset == offset else {
