@@ -35,7 +35,8 @@ def authoring_source_hashes():
     """Record the optional flat implementation alongside the original math."""
     hashes = _pd_authoring_source_hashes()
     for name in ('coreai_q4_flat', 'coreai_expert_grouping', 'coreai_head_metal', 'export_coreai_top_chunks',
-                 'coreai_qsa_working_set', 'coreai_moe_transfers', 'coreai_moe_inverse_copy', 'coreai_gdn_ilp_probe'):
+                 'coreai_qsa_working_set', 'coreai_moe_transfers', 'coreai_moe_inverse_copy',
+                 'coreai_gdn_ilp_probe', 'coreai_gdn_ilp_readout_probe'):
         hashes[name] = sha256_file(Path(__file__).with_name(name + '.py'))
     return hashes
 
@@ -147,12 +148,20 @@ def validate_gdn_prefill_rows(rows):
         raise ValueError('--gdn-prefill-rows must be 1, 2 or 4')
 
 
+def validate_gdn_prefill_policy(rows, policy):
+    validate_gdn_prefill_rows(rows)
+    if policy not in ('experimental-v1', 'readout-v2'):
+        raise ValueError('--gdn-prefill-policy must be experimental-v1 or readout-v2')
+    if policy == 'readout-v2' and rows != 4:
+        raise ValueError('--gdn-prefill-policy readout-v2 requires --gdn-prefill-rows 4')
+
+
 def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gateup,
                         moe_tile=(16, 32, 64), flat_q4=False, integer_grouping=False,
                         contiguous_affine=False, moe_direct_transfers=False, moe_tail_precision=None,
-                        gdn_prefill_rows=1):
+                        gdn_prefill_rows=1, gdn_prefill_policy='experimental-v1'):
     """Construct unchanged tensor-PD math; reusable by component diagnostics."""
-    validate_gdn_prefill_rows(gdn_prefill_rows)
+    validate_gdn_prefill_policy(gdn_prefill_rows, gdn_prefill_policy)
     validate_contiguous_affine(flat_q4=flat_q4, moe_tile=moe_tile,
                                contiguous_affine=contiguous_affine)
     transfers = resolve_moe_transfers(moe_direct_transfers, moe_tail_precision)
@@ -201,7 +210,8 @@ def build_decoder_layer(source, config, capacity, *, prefill_sdpa_fp16, fuse_gat
         attention = GDNRegisterPrefill(attention)
         if gdn_prefill_rows != 1:
             from coreai_gdn_ilp_probe import install_gdn_ilp
-            kernels += [kernel for kernel in install_gdn_ilp(attention, rows=gdn_prefill_rows)
+            kernels += [kernel for kernel in install_gdn_ilp(attention, rows=gdn_prefill_rows,
+                                                            policy=gdn_prefill_policy)
                         if kernel not in kernels]
     else:
         attention = QwenQSAChunk(attention, prefill_sdpa_fp16=prefill_sdpa_fp16)
@@ -310,11 +320,25 @@ def validate_baseline(manifest):
     return [('main', 1), ('prefill', chunk)] + [(f'prefill_s{size}', size) for size in sorted(tails)]
 
 
-def resolve_phases(baseline, chunk=None, *, integer_grouping=False):
+RADIX4_TAILS = (48, 192, 768)
+
+
+def radix4_tail_chunks(primary):
+    """Bounded 3*16*4**k family; no padding or prompt-dependent shapes."""
+    if type(primary) is not int or primary < 1:
+        raise ValueError('Expected a positive integer primary chunk')
+    return [size for size in RADIX4_TAILS if size < primary]
+
+
+def resolve_phases(baseline, chunk=None, *, integer_grouping=False, radix4_tails=False):
     """Inherit a verified v1 geometry while optionally enlarging v2 prefill."""
     inherited = validate_baseline(baseline)
-    if chunk is None:
+    if type(radix4_tails) is not bool:
+        raise ValueError('radix4_tails must be boolean')
+    if chunk is None and not radix4_tails:
         return inherited
+    if chunk is None:
+        chunk = baseline['tokenChunk']
     if chunk not in (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
         raise ValueError('Unsupported shared prefill chunk')
     if chunk > 2048 and not integer_grouping:
@@ -325,6 +349,8 @@ def resolve_phases(baseline, chunk=None, *, integer_grouping=False):
     # When8192 is primary,4096 is also useful as an exact unpadded tail.
     if chunk == 8192:
         tails.add(4096)
+    if radix4_tails:
+        tails.update(radix4_tail_chunks(chunk))
     return [('main', 1), ('prefill', chunk)] + [(f'prefill_s{size}', size) for size in sorted(tails)]
 
 
@@ -380,8 +406,12 @@ def main(argv=None):
     parser.add_argument('--contiguous-affine', action='store_true',
                         help='Optional adjacent-word affine loader for routed prefill; requires --flat-q4 and baseline BK64; decode unchanged')
     parser.add_argument('--integer-grouping', action='store_true', help='Use stable I32 expert grouping; required for chunks above2048')
+    parser.add_argument('--radix4-tails', action='store_true',
+                        help='Add optional unpadded S48/S192/S768 tail phases below the primary chunk; defaults unchanged')
     parser.add_argument('--gdn-prefill-rows', type=int, choices=(1, 2, 4), default=1,
                         help='GDN value rows per SIMD during prefill; default1 preserves original kernel;2/4 opt into ILP; S1 unchanged')
+    parser.add_argument('--gdn-prefill-policy', choices=('experimental-v1', 'readout-v2'), default='experimental-v1',
+                        help='Explicit ILP numerical policy; readout-v2 requires rows4 and restores the baseline scalar readout; default rows1 remains unchanged')
     parser.add_argument('--moe-direct-transfers', action='store_true',
                         help='Optional direct ordered gather and fused routed tail; S1 decode unchanged')
     parser.add_argument('--moe-tail-precision', choices=('float16', 'float32', 'native', 'native-copy'),
@@ -393,14 +423,15 @@ def main(argv=None):
     parser.add_argument('--qsa-working-sets', type=int, nargs='+',
                         help='Optional static KV limits for the primary prefill chunk;4-aligned and below capacity; states stay full capacity')
     args = parser.parse_args(argv)
-    validate_gdn_prefill_rows(args.gdn_prefill_rows)
+    validate_gdn_prefill_policy(args.gdn_prefill_rows, args.gdn_prefill_policy)
     moe_transfers = resolve_moe_transfers(args.moe_direct_transfers, args.moe_tail_precision)
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
     baseline_path = args.baseline_pd / 'manifest.json'
     baseline = json.loads(baseline_path.read_text())
     inherited_phases = validate_baseline(baseline)
-    phases = resolve_phases(baseline, args.chunk, integer_grouping=args.integer_grouping)
+    phases = resolve_phases(baseline, args.chunk, integer_grouping=args.integer_grouping,
+                            radix4_tails=args.radix4_tails)
     qsa_working_sets = resolve_qsa_working_sets(args.qsa_working_sets, dict(phases)['prefill'], baseline['capacity'])
     validate_contiguous_affine(flat_q4=args.flat_q4, moe_tile=baseline['moeTile'],
                                contiguous_affine=args.contiguous_affine)
@@ -434,9 +465,11 @@ def main(argv=None):
         metalWeightInputs=args.metal_weight_inputs, flatQ4=args.flat_q4,
         contiguousAffine=args.contiguous_affine,
         integerExpertGrouping=args.integer_grouping,
+        radix4Tails=args.radix4_tails,
         gdnPrefillRows=args.gdn_prefill_rows,
+        gdnPrefillPolicy=args.gdn_prefill_policy if args.gdn_prefill_rows > 1 else 'original',
         gdnPrefillNumerics=('Original one-value-row SIMD recurrence; S1 decode unchanged' if args.gdn_prefill_rows == 1 else
-            f'GDN prefill only: {args.gdn_prefill_rows} independent value rows per SIMD; sequential FP32 state updates and per-row reduction order retained; S1 uses original kernel; compiler scheduling may affect FP16 outputs'),
+            f'GDN prefill only: {args.gdn_prefill_rows} independent value rows per SIMD; policy={args.gdn_prefill_policy}; sequential FP32 state updates; S1 uses original kernel; full-model device validation remains separate'),
         moeDirectTransfers=moe_transfers['enabled'], moeTailPrecision=moe_transfers['tailPrecision'],
         moeTransferNumerics=('Original gather and tail graph; S1 decode unchanged' if not moe_transfers['enabled'] else
             'Direct FP16 gather; S1 decode unchanged; ' + {
@@ -470,7 +503,7 @@ def main(argv=None):
                 fuse_gateup=baseline['fusedGateUp'], moe_tile=tuple(baseline['moeTile']), flat_q4=args.flat_q4,
                 integer_grouping=args.integer_grouping, contiguous_affine=args.contiguous_affine,
                 moe_direct_transfers=args.moe_direct_transfers, moe_tail_precision=args.moe_tail_precision,
-                gdn_prefill_rows=args.gdn_prefill_rows)
+                gdn_prefill_rows=args.gdn_prefill_rows, gdn_prefill_policy=args.gdn_prefill_policy)
             named, geometry = externalizable_buffers(module, geometry_names)
             key = kind + ('-ple' if module.ple is not None else '')
             weights = write_aligned_weights(args.output / f'layer-{index:02d}.weights.bin', named)
@@ -493,7 +526,8 @@ def main(argv=None):
                              initialState=state_metadata(states), kind=kind, hasPLE=module.ple is not None,
                              exampleLayer=index, contiguousAffine=args.contiguous_affine,
                              moeDirectTransfers=moe_transfers['enabled'], moeTailPrecision=moe_transfers['tailPrecision'],
-                             gdnPrefillRows=args.gdn_prefill_rows if kind == 'gdn' else None)
+                             gdnPrefillRows=args.gdn_prefill_rows if kind == 'gdn' else None,
+                             gdnPrefillPolicy=(args.gdn_prefill_policy if args.gdn_prefill_rows > 1 else 'original') if kind == 'gdn' else None)
                 manifest['sharedAssets'][key] = asset
                 del examples, entry_modules
             else:

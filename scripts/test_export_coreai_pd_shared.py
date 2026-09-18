@@ -15,7 +15,7 @@ from export_coreai_pd_shared import (ALIGNMENT, ExternalModule, buffer_signature
     export_generic, externalizable_buffers, geometry_signature, validate_baseline,
     write_aligned_weights, validate_contiguous_affine, build_decoder_layer, main,
     resolve_qsa_working_sets, qsa_working_set_modules, resolve_moe_transfers,
-    validate_gdn_prefill_rows)
+    validate_gdn_prefill_rows, validate_gdn_prefill_policy, resolve_phases, radix4_tail_chunks)
 
 
 torch.set_num_threads(2)
@@ -35,6 +35,31 @@ class Tiny(torch.nn.Module):
 
 
 class SharedExportTests(unittest.TestCase):
+    def test_radix4_tail_family_is_optional_bounded_and_unpadded(self):
+        baseline = dict(version=1, backend='native-coreai-pd', status='complete',
+            completeModelLayerSet=True, prefillKernels='tensor', q4Kernel='metal',
+            stableProjections=False, layers=[{'index': i} for i in range(48)],
+            tokenChunk=2048, tailChunks=[4, 16, 32, 64, 128, 256, 512, 1024], capacity=16384)
+        self.assertEqual(resolve_phases(baseline), validate_baseline(baseline))
+        for primary in (32, 64, 256, 1024, 2048, 4096):
+            phases = dict(resolve_phases(baseline, primary, integer_grouping=True, radix4_tails=True))
+            self.assertEqual(phases['prefill'], primary)
+            for size in (48, 192, 768):
+                self.assertEqual(f'prefill_s{size}' in phases, size < primary)
+            self.assertEqual(len(phases), len(set(phases.values())))
+        phases = dict(resolve_phases(baseline, radix4_tails=True))
+        counts = sorted(phases.values(), reverse=True)
+        remaining, selected = 817, []
+        while remaining:
+            size = next(n for n in counts if n <= remaining)
+            selected.append(size)
+            remaining -= size
+        self.assertEqual(selected, [768, 48, 1])
+        self.assertEqual(radix4_tail_chunks(48), [])
+        for invalid in (True, 1.5, 0):
+            with self.assertRaises(ValueError): radix4_tail_chunks(invalid)
+        with self.assertRaises(ValueError): resolve_phases(baseline, radix4_tails=1)
+
     def test_gdn_prefill_rows_validate_before_weight_reads(self):
         for rows in (1, 2, 4):
             validate_gdn_prefill_rows(rows)
@@ -42,6 +67,15 @@ class SharedExportTests(unittest.TestCase):
             with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, '--gdn-prefill-rows'):
                 build_decoder_layer(None, {}, 4096, prefill_sdpa_fp16=True,
                     fuse_gateup=True, gdn_prefill_rows=rows)
+
+    def test_gdn_readout_policy_validate_before_weight_reads(self):
+        validate_gdn_prefill_policy(4, 'readout-v2')
+        for rows in (1, 2, 4):
+            validate_gdn_prefill_policy(rows, 'experimental-v1')
+        for rows, policy in ((1, 'readout-v2'), (2, 'readout-v2'), (4, 'unknown')):
+            with self.assertRaisesRegex(ValueError, '--gdn-prefill-policy'):
+                build_decoder_layer(None, {}, 4096, prefill_sdpa_fp16=True,
+                    fuse_gateup=True, gdn_prefill_rows=rows, gdn_prefill_policy=policy)
 
     def test_builder_gdn_ilp_preserves_external_weights_state_and_s1(self):
         import export_coreai_pd_shared as exporter

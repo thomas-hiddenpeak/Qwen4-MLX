@@ -47,6 +47,35 @@ class ILPInstallTests(unittest.TestCase):
                 self.assertEqual(sum(expected in name for name in names), 1)
                 self.assertEqual(sum('qwen_' in name for name in names), 1)
 
+    def test_repaired_policy_preserves_buffers_and_s1_and_export_boundary(self):
+        from coreai_gdn_ilp_readout_probe import ReadoutILPRecurrence
+        model = small_gdn()
+        old = model.recurrence
+        before = [(name, value.data_ptr(), value.shape) for name, value in model.named_buffers()]
+        kernels = install_gdn_ilp(model, policy='readout-v2')
+        self.assertIs(model.recurrence.decode, old)
+        self.assertIsInstance(model.recurrence.prefill, ReadoutILPRecurrence)
+        self.assertEqual(before, [(name, value.data_ptr(), value.shape) for name, value in model.named_buffers()])
+        self.assertEqual(install_gdn_ilp(model, policy='readout-v2'), kernels)
+        for count in (1, 11):
+            inputs = make_inputs(count, 2, 7)
+            program = torch.export.export(model.recurrence, inputs)
+            targets = [str(node.target) for node in program.graph.nodes if node.op == 'call_function']
+            expected = ('qwen_gdn_recurrence_k128_register_v1' if count == 1 else
+                        'qwen_experimental_gdn_recurrence_k128_ilp4_readout_v2')
+            self.assertEqual(sum(expected in name for name in targets), 1)
+            self.assertEqual(sum('qwen_' in name for name in targets), 1)
+            for actual, reference in zip(model.recurrence(*inputs), old(*inputs), strict=True):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        with self.assertRaises(ValueError):
+            install_gdn_ilp(model, policy='experimental-v1')
+        for rows, policy in ((2, 'readout-v2'), (4, 'unknown')):
+            other = small_gdn()
+            previous = other.recurrence
+            with self.assertRaises(ValueError):
+                install_gdn_ilp(other, rows, policy=policy)
+            self.assertIs(other.recurrence, previous)
+
     def test_full_attention_chunk_then_s1_matches_original_cpu(self):
         torch.manual_seed(1907)
         for rows in (2, 4):

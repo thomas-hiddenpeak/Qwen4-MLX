@@ -126,11 +126,17 @@ class ILPRecurrence(torch.nn.Module):
 class PhaseILPRecurrence(torch.nn.Module):
     """Opt-in prefill recurrence, retaining the existing S1 module verbatim."""
 
-    def __init__(self, decode, rows=4):
+    def __init__(self, decode, rows=4, policy='experimental-v1'):
         super().__init__()
+        validate_policy(rows, policy)
         self.decode = decode
-        self.prefill = ILPRecurrence(rows)
+        if policy == 'readout-v2':
+            from coreai_gdn_ilp_readout_probe import ReadoutILPRecurrence
+            self.prefill = ReadoutILPRecurrence()
+        else:
+            self.prefill = ILPRecurrence(rows)
         self.rows = rows
+        self.policy = policy
 
     def forward(self, q, k, v, decay, beta, state):
         if q.shape[1] == 1:
@@ -138,7 +144,16 @@ class PhaseILPRecurrence(torch.nn.Module):
         return self.prefill(q, k, v, decay, beta, state)
 
 
-def install_gdn_ilp(module, rows=4):
+def validate_policy(rows, policy):
+    if type(rows) is not int or rows not in (2, 4):
+        raise ValueError('GDN ILP supports 2 or 4 value rows per SIMD')
+    if policy not in ('experimental-v1', 'readout-v2'):
+        raise ValueError('GDN ILP policy must be experimental-v1 or readout-v2')
+    if policy == 'readout-v2' and rows != 4:
+        raise ValueError('GDN readout-v2 currently requires 4 value rows per SIMD')
+
+
+def install_gdn_ilp(module, rows=4, *, policy='experimental-v1'):
     """Install optional ILP prefill in existing GDNRegisterPrefill wrappers.
 
     No learned or geometry buffer is added, moved, renamed or replaced. S1 uses
@@ -147,8 +162,7 @@ def install_gdn_ilp(module, rows=4):
     Calling this helper is the only activation mechanism; imports change nothing.
     """
     from coreai_gdn_chunk import GDNRegisterPrefill
-    if rows not in (2, 4):
-        raise ValueError('GDN ILP supports 2 or 4 value rows per SIMD')
+    validate_policy(rows, policy)
     targets = [child for child in module.modules() if isinstance(child, GDNRegisterPrefill)]
     if not targets:
         raise ValueError('No GDNRegisterPrefill wrapper found')
@@ -156,13 +170,16 @@ def install_gdn_ilp(module, rows=4):
     for target in targets:
         recurrence = target.recurrence
         if isinstance(recurrence, PhaseILPRecurrence):
-            if recurrence.rows != rows:
-                raise ValueError('GDN ILP is already installed with a different row count')
+            if recurrence.rows != rows or recurrence.policy != policy:
+                raise ValueError('GDN ILP is already installed with a different row count or policy')
         elif not isinstance(recurrence, FusedGDNRecurrence):
             raise ValueError('Refusing to replace an unknown GDN recurrence')
     for target in targets:
         if not isinstance(target.recurrence, PhaseILPRecurrence):
-            target.recurrence = PhaseILPRecurrence(target.recurrence, rows)
+            target.recurrence = PhaseILPRecurrence(target.recurrence, rows, policy)
+    if policy == 'readout-v2':
+        from coreai_gdn_ilp_readout_probe import get_kernel as get_readout_kernel
+        return [get_gdn_recurrence_kernel(), get_readout_kernel()]
     return [get_gdn_recurrence_kernel(), get_kernel(rows)]
 
 
